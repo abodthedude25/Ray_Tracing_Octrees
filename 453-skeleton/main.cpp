@@ -242,7 +242,7 @@ int main() {
 	window.setCallbacks(a4);
 
 	bool useGDB = true;
-	std::string gdbPath = "./textures/Buildings_3D.gdb";
+	std::string gdbPath = "./gdb_folder/Buildings_3D.gdb";
 
 	VoxelGrid grid;
 	if (useGDB) {
