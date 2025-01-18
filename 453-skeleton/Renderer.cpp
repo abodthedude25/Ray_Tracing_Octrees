@@ -219,10 +219,11 @@ std::vector<MCTriangle> AdaptiveDualContouringRenderer::render(const OctreeNode*
 	return out;
 }
 
-// --------------------------------------------------------
-// 1) Uniform DC building
-// --------------------------------------------------------
-void AdaptiveDualContouringRenderer::buildUniformDCCells(const VoxelGrid& grid,
+// -----------------------------------------------------------------------------
+// 1) BUILD DC CELLS (Ensures each cell has one consistent vertex)
+// -----------------------------------------------------------------------------
+void AdaptiveDualContouringRenderer::buildUniformDCCells(
+	const VoxelGrid& grid,
 	int x0, int y0, int z0,
 	int size,
 	std::vector<DCCell>& dcCells,
@@ -230,10 +231,12 @@ void AdaptiveDualContouringRenderer::buildUniformDCCells(const VoxelGrid& grid,
 	int lodLevel)
 {
 	dcCells.resize(subDimX * subDimY * subDimZ);
-	auto cellIndex = [&](int x, int y, int z) {
-		return x + subDimX * (y + subDimY * z);
+
+	auto cellIndex = [&](int lx, int ly, int lz) {
+		return lx + subDimX * (ly + subDimY * lz);
 		};
 
+	// These define how we track corners in local sub-cell
 	static const int cornerBits[8][3] = {
 		{0,0,0},{1,0,0},{1,1,0},{0,1,0},
 		{0,0,1},{1,0,1},{1,1,1},{0,1,1}
@@ -245,83 +248,105 @@ void AdaptiveDualContouringRenderer::buildUniformDCCells(const VoxelGrid& grid,
 	};
 
 	float vx = grid.voxelSize;
-	for (int z = 0; z < subDimZ; z++) {
-		for (int y = 0; y < subDimY; y++) {
-			for (int x = 0; x < subDimX; x++) {
-				int idx = cellIndex(x, y, z);
+
+	for (int lz = 0; lz < subDimZ; ++lz) {
+		for (int ly = 0; ly < subDimY; ++ly) {
+			for (int lx = 0; lx < subDimX; ++lx) {
+				int idx = cellIndex(lx, ly, lz);
+				DCCell& cell = dcCells[idx];
+				cell.isMixed = false;
+
+				// Gather corner signs
 				float cornerVals[8];
 				bool allNeg = true, allPos = true;
-				for (int c = 0; c < 8; c++) {
-					int gx = x0 + x + cornerBits[c][0];
-					int gy = y0 + y + cornerBits[c][1];
-					int gz = z0 + z + cornerBits[c][2];
+				for (int c = 0; c < 8; ++c) {
+					int gx = x0 + lx + cornerBits[c][0];
+					int gy = y0 + ly + cornerBits[c][1];
+					int gz = z0 + lz + cornerBits[c][2];
+
 					float val = sampleVolume(grid, gx, gy, gz);
 					cornerVals[c] = val;
 					if (val < 0) allPos = false;
 					if (val > 0) allNeg = false;
 				}
 				if (allNeg || allPos) {
-					dcCells[idx].isMixed = false;
+					// uniform
+					cell.isMixed = false;
 					continue;
 				}
-				dcCells[idx].isMixed = true;
+				cell.isMixed = true;
 
-				// Possibly check globalCellMap for reuse:
-				// (lodLevel, x0+x, y0+y, z0+z)
-				DCCellKey key{ lodLevel, x0 + x, y0 + y, z0 + z };
+				// See if we already have a stored DC vertex from globalCellMap
+				DCCellKey key{ lodLevel, x0 + lx, y0 + ly, z0 + lz };
 				auto it = globalCellMap.find(key);
 				if (it != globalCellMap.end()) {
-					dcCells[idx] = it->second;
+					cell = it->second;  // reuse
 					continue;
 				}
 
-				// gather intersections => QEF
+				// Otherwise, compute intersections on edges -> QEF
 				std::vector<glm::vec3> pts, nrms;
-				for (int e = 0; e < 12; e++) {
-					int c1 = edgePairs[e][0], c2 = edgePairs[e][1];
-					float v1 = cornerVals[c1], v2 = cornerVals[c2];
-					if (v1 * v2 < 0.f) {
-						int gx1 = x0 + x + cornerBits[c1][0];
-						int gy1 = y0 + y + cornerBits[c1][1];
-						int gz1 = z0 + z + cornerBits[c1][2];
-						glm::vec3 p1(grid.minX + gx1 * vx,
-							grid.minY + gy1 * vx,
-							grid.minZ + gz1 * vx);
+				pts.reserve(12);
+				nrms.reserve(12);
 
-						int gx2 = x0 + x + cornerBits[c2][0];
-						int gy2 = y0 + y + cornerBits[c2][1];
-						int gz2 = z0 + z + cornerBits[c2][2];
-						glm::vec3 p2(grid.minX + gx2 * vx,
+				for (int e = 0; e < 12; e++) {
+					int c1 = edgePairs[e][0];
+					int c2 = edgePairs[e][1];
+					float v1 = cornerVals[c1];
+					float v2 = cornerVals[c2];
+					if (v1 * v2 < 0.f) {
+						// There's an intersection
+						int gx1 = x0 + lx + cornerBits[c1][0];
+						int gy1 = y0 + ly + cornerBits[c1][1];
+						int gz1 = z0 + lz + cornerBits[c1][2];
+						glm::vec3 p1(
+							grid.minX + gx1 * vx,
+							grid.minY + gy1 * vx,
+							grid.minZ + gz1 * vx
+						);
+
+						int gx2 = x0 + lx + cornerBits[c2][0];
+						int gy2 = y0 + ly + cornerBits[c2][1];
+						int gz2 = z0 + lz + cornerBits[c2][2];
+						glm::vec3 p2(
+							grid.minX + gx2 * vx,
 							grid.minY + gy2 * vx,
-							grid.minZ + gz2 * vx);
+							grid.minZ + gz2 * vx
+						);
 
 						glm::vec3 pi = intersectEdge(p1, p2, v1, v2);
+						// Use a normal from e.g. the midpoint or the first corner
 						glm::vec3 Ni = computeNormal(grid, gx1, gy1, gz1);
 						pts.push_back(pi);
 						nrms.push_back(Ni);
 					}
 				}
+
+				// Solve QEF
 				glm::vec3 cellVert = solveQEF(pts, nrms);
-				dcCells[idx].dcVertex = cellVert;
+				cell.dcVertex = cellVert;
 				if (!nrms.empty()) {
 					glm::vec3 N(0.f);
 					for (auto& nn : nrms) {
 						N += glm::normalize(nn);
 					}
-					dcCells[idx].dcNormal = glm::normalize(N);
+					cell.dcNormal = glm::normalize(N);
 				}
 				else {
-					dcCells[idx].dcNormal = glm::vec3(0, 1, 0);
+					cell.dcNormal = glm::vec3(0, 1, 0);
 				}
 
-				// store in global map
-				globalCellMap[key] = dcCells[idx];
+				globalCellMap[key] = cell;
 			}
 		}
 	}
 }
 
-std::vector<MCTriangle> AdaptiveDualContouringRenderer::buildUniformDCMesh(
+// -----------------------------------------------------------------------------
+// 2) BUILD MESH from DC cells (only +X, +Y, +Z to avoid double adjacency)
+// -----------------------------------------------------------------------------
+std::vector<MCTriangle>
+AdaptiveDualContouringRenderer::buildUniformDCMesh(
 	const VoxelGrid& grid,
 	int x0, int y0, int z0,
 	int subDimX, int subDimY, int subDimZ,
@@ -329,61 +354,79 @@ std::vector<MCTriangle> AdaptiveDualContouringRenderer::buildUniformDCMesh(
 	int lodLevel)
 {
 	std::vector<MCTriangle> out;
-	auto cellIndex = [&](int x, int y, int z) {
-		return x + subDimX * (y + subDimY * z);
+
+	auto cellIndex = [&](int lx, int ly, int lz) {
+		return lx + subDimX * (ly + subDimY * lz);
 		};
-	auto getCellPtr = [&](int x, int y, int z)->const DCCell* {
-		if (x < 0 || x >= subDimX || y < 0 || y >= subDimY || z < 0 || z >= subDimZ) return nullptr;
-		const DCCell& c = dcCells[cellIndex(x, y, z)];
+	auto getCellPtr = [&](int lx, int ly, int lz)-> const DCCell* {
+		if (lx < 0 || lx >= subDimX || ly < 0 || ly >= subDimY || lz < 0 || lz >= subDimZ) {
+			return nullptr;
+		}
+		const DCCell& c = dcCells[cellIndex(lx, ly, lz)];
 		return c.isMixed ? &c : nullptr;
 		};
 
-	for (int z = 0; z < subDimZ; z++) {
-		for (int y = 0; y < subDimY; y++) {
-			for (int x = 0; x < subDimX; x++) {
-				int idx = cellIndex(x, y, z);
-				if (!dcCells[idx].isMixed) continue;
-				const DCCell& c0 = dcCells[idx];
+	for (int lz = 0; lz < subDimZ; ++lz) {
+		for (int ly = 0; ly < subDimY; ++ly) {
+			for (int lx = 0; lx < subDimX; ++lx) {
+				const DCCell& c0 = dcCells[cellIndex(lx, ly, lz)];
+				if (!c0.isMixed) continue;
+
 				glm::vec3 v0 = c0.dcVertex;
 				glm::vec3 n0 = c0.dcNormal;
 
-				// +X +Y
-				if (x + 1 < subDimX && y + 1 < subDimY) {
-					auto cx = getCellPtr(x + 1, y, z);
-					auto cy = getCellPtr(x, y + 1, z);
-					auto cxy = getCellPtr(x + 1, y + 1, z);
-					if (cx && cy && cxy) {
-						addQuad(v0, cx->dcVertex,
-							cy->dcVertex, cxy->dcVertex,
-							n0, cx->dcNormal,
-							cy->dcNormal, cxy->dcNormal,
-							out);
+				// +X face
+				if (lx + 1 < subDimX) {
+					const DCCell* cx = getCellPtr(lx + 1, ly, lz);
+					if (cx) {
+						// +Y direction from c0, cx
+						if (ly + 1 < subDimY) {
+							auto cy = getCellPtr(lx, ly + 1, lz);
+							auto cxy = getCellPtr(lx + 1, ly + 1, lz);
+							if (cy && cxy) {
+								addQuad(
+									v0, cx->dcVertex,
+									cy->dcVertex, cxy->dcVertex,
+									n0, cx->dcNormal,
+									cy->dcNormal, cxy->dcNormal,
+									out
+								);
+							}
+						}
+						// +Z direction from c0, cx
+						if (lz + 1 < subDimZ) {
+							auto cz = getCellPtr(lx, ly, lz + 1);
+							auto cxz = getCellPtr(lx + 1, ly, lz + 1);
+							if (cz && cxz) {
+								addQuad(
+									v0, cx->dcVertex,
+									cz->dcVertex, cxz->dcVertex,
+									n0, cx->dcNormal,
+									cz->dcNormal, cxz->dcNormal,
+									out
+								);
+							}
+						}
 					}
 				}
-				// +X +Z
-				if (x + 1 < subDimX && z + 1 < subDimZ) {
-					auto cx = getCellPtr(x + 1, y, z);
-					auto cz = getCellPtr(x, y, z + 1);
-					auto cxz = getCellPtr(x + 1, y, z + 1);
-					if (cx && cz && cxz) {
-						addQuad(v0, cx->dcVertex,
-							cz->dcVertex, cxz->dcVertex,
-							n0, cx->dcNormal,
-							cz->dcNormal, cxz->dcNormal,
-							out);
-					}
-				}
-				// +Y +Z
-				if (y + 1 < subDimY && z + 1 < subDimZ) {
-					auto cy = getCellPtr(x, y + 1, z);
-					auto cz = getCellPtr(x, y, z + 1);
-					auto cyz = getCellPtr(x, y + 1, z + 1);
-					if (cy && cz && cyz) {
-						addQuad(v0, cy->dcVertex,
-							cz->dcVertex, cyz->dcVertex,
-							n0, cy->dcNormal,
-							cz->dcNormal, cyz->dcNormal,
-							out);
+
+				// If we skip +X, we still want to connect +Y, +Z
+				// +Y face
+				if (ly + 1 < subDimY) {
+					const DCCell* cy = getCellPtr(lx, ly + 1, lz);
+					if (cy && (lz + 1 < subDimZ)) {
+						// Connect +Z diagonal
+						auto cz = getCellPtr(lx, ly, lz + 1);
+						auto cyz = getCellPtr(lx, ly + 1, lz + 1);
+						if (cz && cyz) {
+							addQuad(
+								v0, cy->dcVertex,
+								cz->dcVertex, cyz->dcVertex,
+								n0, cy->dcNormal,
+								cz->dcNormal, cyz->dcNormal,
+								out
+							);
+						}
 					}
 				}
 			}
@@ -567,4 +610,138 @@ void AdaptiveDualContouringRenderer::addQuad(const glm::vec3& v0, const glm::vec
 {
 	addTriangle(v0, v1, v2, n0, n1, n2, out);
 	addTriangle(v2, v1, v3, n2, n1, n3, out);
+}
+
+
+// --------------------------------------------------------
+// NEW: VOXEL CUBE RENDERER (Block-based Voxel Geometry)
+// --------------------------------------------------------
+std::vector<MCTriangle> VoxelCubeRenderer::render(const OctreeNode* node,
+	const VoxelGrid& grid,
+	int x0, int y0, int z0, int size)
+{
+	std::vector<MCTriangle> out;
+	if (!node) return out;
+	if (node->isLeaf) {
+		if (node->isSolid) {
+			addBlockFaces(grid, x0, y0, z0, size, out);
+		}
+	}
+	else {
+		int half = size / 2;
+		for (int i = 0; i < 8; i++) {
+			int ox = x0 + ((i & 1) ? half : 0);
+			int oy = y0 + ((i & 2) ? half : 0);
+			int oz = z0 + ((i & 4) ? half : 0);
+			auto childTris = render(node->children[i], grid, ox, oy, oz, half);
+			out.insert(out.end(), childTris.begin(), childTris.end());
+		}
+	}
+	return out;
+}
+
+void VoxelCubeRenderer::addBlockFaces(const VoxelGrid& grid,
+	int x0, int y0, int z0, int size,
+	std::vector<MCTriangle>& out)
+{
+	float vx = grid.voxelSize;
+	glm::vec3 minCorner(grid.minX + x0 * vx,
+		grid.minY + y0 * vx,
+		grid.minZ + z0 * vx);
+	glm::vec3 ext(size * vx);
+	glm::vec3 maxCorner = minCorner + ext;
+
+	// A simple check at the center of each face is used to decide if the face is
+	// exposed. (More elaborate methods could check over the entire face.)
+	auto checkFace = [&](int testX, int testY, int testZ) -> bool {
+		if (testX < 0 || testY < 0 || testZ < 0 ||
+			testX >= grid.dimX || testY >= grid.dimY || testZ >= grid.dimZ)
+			return true;
+		return (grid.data[grid.index(testX, testY, testZ)] == VoxelState::EMPTY);
+		};
+
+	bool posXExposed = checkFace(x0 + size, y0 + size / 2, z0 + size / 2);
+	if (posXExposed) addFacePosX(minCorner, maxCorner, out);
+	bool negXExposed = checkFace(x0 - 1, y0 + size / 2, z0 + size / 2);
+	if (negXExposed) addFaceNegX(minCorner, maxCorner, out);
+
+	bool posYExposed = checkFace(x0 + size / 2, y0 + size, z0 + size / 2);
+	if (posYExposed) addFacePosY(minCorner, maxCorner, out);
+	bool negYExposed = checkFace(x0 + size / 2, y0 - 1, z0 + size / 2);
+	if (negYExposed) addFaceNegY(minCorner, maxCorner, out);
+
+	bool posZExposed = checkFace(x0 + size / 2, y0 + size / 2, z0 + size);
+	if (posZExposed) addFacePosZ(minCorner, maxCorner, out);
+	bool negZExposed = checkFace(x0 + size / 2, y0 + size / 2, z0 - 1);
+	if (negZExposed) addFaceNegZ(minCorner, maxCorner, out);
+}
+
+void VoxelCubeRenderer::addFacePosX(const glm::vec3& minC, const glm::vec3& maxC, std::vector<MCTriangle>& out)
+{
+	glm::vec3 v0(maxC.x, minC.y, minC.z);
+	glm::vec3 v1(maxC.x, maxC.y, minC.z);
+	glm::vec3 v2(maxC.x, maxC.y, maxC.z);
+	glm::vec3 v3(maxC.x, minC.y, maxC.z);
+	glm::vec3 normal(1, 0, 0);
+	addQuad(v0, v1, v3, v2, normal, out);
+}
+void VoxelCubeRenderer::addFaceNegX(const glm::vec3& minC, const glm::vec3& maxC, std::vector<MCTriangle>& out)
+{
+	glm::vec3 v0(minC.x, minC.y, minC.z);
+	glm::vec3 v1(minC.x, minC.y, maxC.z);
+	glm::vec3 v2(minC.x, maxC.y, maxC.z);
+	glm::vec3 v3(minC.x, maxC.y, minC.z);
+	glm::vec3 normal(-1, 0, 0);
+	addQuad(v0, v1, v3, v2, normal, out);
+}
+void VoxelCubeRenderer::addFacePosY(const glm::vec3& minC, const glm::vec3& maxC, std::vector<MCTriangle>& out)
+{
+	glm::vec3 v0(minC.x, maxC.y, minC.z);
+	glm::vec3 v1(minC.x, maxC.y, maxC.z);
+	glm::vec3 v2(maxC.x, maxC.y, maxC.z);
+	glm::vec3 v3(maxC.x, maxC.y, minC.z);
+	glm::vec3 normal(0, 1, 0);
+	addQuad(v0, v1, v3, v2, normal, out);
+}
+void VoxelCubeRenderer::addFaceNegY(const glm::vec3& minC, const glm::vec3& maxC, std::vector<MCTriangle>& out)
+{
+	glm::vec3 v0(minC.x, minC.y, minC.z);
+	glm::vec3 v1(maxC.x, minC.y, minC.z);
+	glm::vec3 v2(maxC.x, minC.y, maxC.z);
+	glm::vec3 v3(minC.x, minC.y, maxC.z);
+	glm::vec3 normal(0, -1, 0);
+	addQuad(v0, v1, v3, v2, normal, out);
+}
+void VoxelCubeRenderer::addFacePosZ(const glm::vec3& minC, const glm::vec3& maxC, std::vector<MCTriangle>& out)
+{
+	glm::vec3 v0(minC.x, minC.y, maxC.z);
+	glm::vec3 v1(minC.x, maxC.y, maxC.z);
+	glm::vec3 v2(maxC.x, maxC.y, maxC.z);
+	glm::vec3 v3(maxC.x, minC.y, maxC.z);
+	glm::vec3 normal(0, 0, 1);
+	addQuad(v0, v1, v3, v2, normal, out);
+}
+void VoxelCubeRenderer::addFaceNegZ(const glm::vec3& minC, const glm::vec3& maxC, std::vector<MCTriangle>& out)
+{
+	glm::vec3 v0(minC.x, minC.y, minC.z);
+	glm::vec3 v1(maxC.x, minC.y, minC.z);
+	glm::vec3 v2(maxC.x, maxC.y, minC.z);
+	glm::vec3 v3(minC.x, maxC.y, minC.z);
+	glm::vec3 normal(0, 0, -1);
+	addQuad(v0, v1, v3, v2, normal, out);
+}
+
+void VoxelCubeRenderer::addQuad(const glm::vec3& v0, const glm::vec3& v1,
+	const glm::vec3& v2, const glm::vec3& v3,
+	const glm::vec3& normal,
+	std::vector<MCTriangle>& out)
+{
+	MCTriangle tri1;
+	tri1.v[0] = v0; tri1.v[1] = v1; tri1.v[2] = v2;
+	tri1.normal[0] = normal; tri1.normal[1] = normal; tri1.normal[2] = normal;
+	out.push_back(tri1);
+	MCTriangle tri2;
+	tri2.v[0] = v2; tri2.v[1] = v1; tri2.v[2] = v3;
+	tri2.normal[0] = normal; tri2.normal[1] = normal; tri2.normal[2] = normal;
+	out.push_back(tri2);
 }

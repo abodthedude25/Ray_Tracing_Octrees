@@ -98,7 +98,7 @@ static void recenterFilledVoxels(VoxelGrid& grid) {
 	float centerY = 0.5f * (filledMinY + filledMaxY);
 	float centerZ = 0.5f * (filledMinZ + filledMaxZ);
 
-	// Shift min coords so the building's center is at world origin
+	// Shift min coords so the object's center is at world origin
 	grid.minX -= centerX;
 	grid.minY -= centerY;
 	grid.minZ -= centerZ;
@@ -159,16 +159,17 @@ static void generateOctreeWireframe(const VoxelGrid& grid,
 // We define our two modes
 enum class RenderMode {
 	MarchingCubes,
-	DualContouring
+	DualContouring,
+	VoxelBlocks
 };
-
-class Assignment4 : public CallbackInterface {
-public:
+struct Assignment4 : public CallbackInterface {
 	Assignment4()
-		: wireframeMode(false), showOctreeWire(false), rightMouseDown(false),
-		renderMode(RenderMode::MarchingCubes), aspect(1.f),
-		mouseOldX(0.0), mouseOldY(0.0),
-		camera(glm::radians(45.f), glm::radians(45.f), 3.f) {}
+		: wireframeMode(false), showOctreeWire(false),
+		currentMode(RenderMode::MarchingCubes),
+		aspect(1.f), rightMouseDown(false),
+		mouseOldX(0), mouseOldY(0),
+		camera(glm::radians(45.f), glm::radians(45.f), 3.f)
+	{}
 
 	void keyCallback(int key, int scancode, int action, int mods) override {
 		if (action == GLFW_PRESS) {
@@ -179,19 +180,20 @@ public:
 				showOctreeWire = !showOctreeWire;
 			}
 			if (key == GLFW_KEY_R) {
-				renderMode = (renderMode == RenderMode::MarchingCubes
-					? RenderMode::DualContouring
-					: RenderMode::MarchingCubes);
-				std::cout << "Switched to "
-					<< (renderMode == RenderMode::MarchingCubes ? "MC" : "DC")
-					<< std::endl;
+				// Cycle through the three modes
+				if (currentMode == RenderMode::MarchingCubes) {
+					currentMode = RenderMode::VoxelBlocks;
+					std::cout << "Switched to Dual Contouring\n";
+				}
+				else if (currentMode == RenderMode::VoxelBlocks) {
+					currentMode = RenderMode::DualContouring;
+					std::cout << "Switched to Voxel Blocks\n";
+				}
+				else {
+					currentMode = RenderMode::MarchingCubes;
+					std::cout << "Switched to Marching Cubes\n";
+				}
 			}
-		}
-	}
-
-	void mouseButtonCallback(int button, int action, int mods) override {
-		if (button == GLFW_MOUSE_BUTTON_RIGHT) {
-			rightMouseDown = (action == GLFW_PRESS);
 		}
 	}
 	void cursorPosCallback(double xpos, double ypos) override {
@@ -201,6 +203,11 @@ public:
 		}
 		mouseOldX = xpos;
 		mouseOldY = ypos;
+	}
+	void mouseButtonCallback(int button, int action, int mods) override {
+		if (button == GLFW_MOUSE_BUTTON_RIGHT) {
+			rightMouseDown = (action == GLFW_PRESS);
+		}
 	}
 	void scrollCallback(double xoffset, double yoffset) override {
 		camera.incrementR(yoffset);
@@ -212,9 +219,7 @@ public:
 	void viewPipeline(ShaderProgram& sp) {
 		glm::mat4 M(1.f);
 		glm::mat4 V = camera.getView();
-		glm::mat4 P = glm::perspective(glm::radians(45.f),
-			aspect, 0.01f, 1000.f);
-
+		glm::mat4 P = glm::perspective(glm::radians(45.f), aspect, 0.01f, 1000.f);
 		GLint uM = glGetUniformLocation(sp, "M");
 		glUniformMatrix4fv(uM, 1, GL_FALSE, &M[0][0]);
 		GLint uV = glGetUniformLocation(sp, "V");
@@ -223,25 +228,22 @@ public:
 		glUniformMatrix4fv(uP, 1, GL_FALSE, &P[0][0]);
 	}
 
-public:
 	bool wireframeMode;
 	bool showOctreeWire;
-	RenderMode renderMode;
+	RenderMode currentMode;
 	Camera camera;
-
-private:
-	bool rightMouseDown;
 	float aspect;
+	bool rightMouseDown;
 	double mouseOldX, mouseOldY;
 };
 
 int main() {
 	glfwInit();
-	Window window(800, 800, "Octree + GDB + Wireframe fix");
-	auto a4 = std::make_shared<Assignment4>();
-	window.setCallbacks(a4);
+	Window window(800, 800, "Octree + DC Without Holes");
+	auto app = std::make_shared<Assignment4>();
+	window.setCallbacks(app);
 
-	bool useGDB = true;
+	bool useGDB = false;
 	std::string gdbPath = "./gdb_folder/Buildings_3D.gdb";
 
 	VoxelGrid grid;
@@ -250,7 +252,7 @@ int main() {
 		std::vector<int> targetIDs = { };
 		grid = loadBuildingsFromGDB(gdbPath, 1.0f, targetIDs);
 
-		// (CHANGED!) Re-center after load, *before* building the octree
+		// Re-center after load, *before* building the octree
 		recenterFilledVoxels(grid);
 
 		if (grid.data.empty()) {
@@ -266,113 +268,166 @@ int main() {
 		grid.minX = -0.5f; grid.minY = -0.5f; grid.minZ = -0.5f;
 		grid.voxelSize = 1.f / dim;
 		grid.data.resize(dim * dim * dim, VoxelState::EMPTY);
+
+		// *** ADDED an epsilon to ensure borderline volumes classify consistently
+		const float EPS = 1e-7f;
 		for (int z = 0; z < dim; z++) {
 			for (int y = 0; y < dim; y++) {
 				for (int x = 0; x < dim; x++) {
 					int idx = x + y * dim + z * (dim * dim);
-					if (vol[idx] < 0) grid.data[idx] = VoxelState::FILLED;
+					if (vol[idx] < -EPS) {
+						grid.data[idx] = VoxelState::FILLED;
+					}
+					else {
+						grid.data[idx] = VoxelState::EMPTY;
+					}
 				}
 			}
 		}
 	}
 
-	// Now build the octree with final (minX,minY,minZ)
+	// (2) Build the octree
 	OctreeNode* root = createOctreeFromVoxelGrid(grid);
 
-	// Prepare the two renderers
+	// (3) Prepare the three "renderers"
 	MarchingCubesRenderer mcRenderer;
 	AdaptiveDualContouringRenderer dcRenderer;
+	VoxelCubeRenderer blockRenderer;
 
-	// We'll draw whichever mode is active
+	// (4) We store geometry in GPU buffers for MC and DC
+	CPU_Geometry cpuGeom;
 	GPU_Geometry gpuGeom;
+	// For wireframe lines
+	CPU_Geometry cpuWire;
 	GPU_Geometry gpuWireGeom;
-
-	// Build wireframe lines once
 	std::vector<glm::vec3> wireLines;
 	generateOctreeWireframe(grid, root, 0, 0, 0, grid.dimX, wireLines);
 	if (!wireLines.empty()) {
+		cpuWire.verts = wireLines;
 		gpuWireGeom.bind();
-		gpuWireGeom.setVerts(wireLines);
+		gpuWireGeom.setVerts(cpuWire.verts);
 	}
 
-	CPU_Geometry cpuGeom;
+	ShaderProgram shader("453-skeleton/shaders/test.vert", "453-skeleton/shaders/test.frag");
+
+	// Triangle cache for MC/DC
 	std::vector<MCTriangle> triCache;
-	RenderMode currentMode = a4->renderMode;
+	RenderMode oldMode = app->currentMode;
 
-	ShaderProgram shader("453-skeleton/shaders/test.vert",
-		"453-skeleton/shaders/test.frag");
-
-	// For FPS
+	// Basic game loop
 	using clock_t = std::chrono::high_resolution_clock;
 	auto lastTime = clock_t::now();
 	int frameCount = 0;
 
 	while (!window.shouldClose()) {
-		auto frameStart = clock_t::now();
-
 		glfwPollEvents();
-		glClearColor(1, 1, 1, 1);
+
+		glClearColor(01.0f, 1.0f, 1.0f, 1);
 		glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT);
 		glEnable(GL_DEPTH_TEST);
 
 		shader.use();
-		a4->viewPipeline(shader);
+		app->viewPipeline(shader);
 
-		// If user changed mode, clear cache
-		if (a4->renderMode != currentMode) {
-			currentMode = a4->renderMode;
+		// If user switched mode, clear the caches
+		if (app->currentMode != oldMode) {
 			triCache.clear();
+			oldMode = app->currentMode;
 		}
 
-		// If we have no triangles for the current mode, compute them
-		if (triCache.empty()) {
-			Renderer* active = nullptr;
-			if (a4->renderMode == RenderMode::MarchingCubes) {
-				active = &mcRenderer;
-			}
-			else {
-				active = &dcRenderer;
-			}
-			triCache = renderOctree(root, grid, *active);
-
-			cpuGeom.verts.clear();
-			cpuGeom.normals.clear();
-			cpuGeom.cols.clear();
-
-			for (auto& t : triCache) {
-				for (int i = 0; i < 3; i++) {
-					cpuGeom.verts.push_back(t.v[i]);
-					cpuGeom.normals.push_back(t.normal[i]);
-					cpuGeom.cols.push_back(glm::vec3(0.8f, 0.8f, 0.8f));
+		if (app->currentMode == RenderMode::MarchingCubes) {
+			// (a) build triangle mesh once if needed
+			if (triCache.empty()) {
+				triCache = renderOctree(root, grid, mcRenderer);
+				cpuGeom.verts.clear();
+				cpuGeom.normals.clear();
+				cpuGeom.cols.clear();
+				for (auto& t : triCache) {
+					for (int i = 0; i < 3; i++) {
+						cpuGeom.verts.push_back(t.v[i]);
+						cpuGeom.normals.push_back(t.normal[i]);
+						cpuGeom.cols.push_back({ 0.8f,0.8f,0.8f });
+					}
 				}
+				gpuGeom.bind();
+				gpuGeom.setVerts(cpuGeom.verts);
+				gpuGeom.setNormals(cpuGeom.normals);
+				gpuGeom.setCols(cpuGeom.cols);
+			}
+			// (b) draw the mesh
+			if (app->wireframeMode) {
+				glPolygonMode(GL_FRONT_AND_BACK, GL_LINE);
 			}
 			gpuGeom.bind();
-			gpuGeom.setVerts(cpuGeom.verts);
-			gpuGeom.setNormals(cpuGeom.normals);
-			gpuGeom.setCols(cpuGeom.cols);
-		}
-
-		// Draw geometry
-		if (a4->wireframeMode) {
-			glPolygonMode(GL_FRONT_AND_BACK, GL_LINE);
-		}
-		else {
+			glDrawArrays(GL_TRIANGLES, 0, (GLsizei)cpuGeom.verts.size());
 			glPolygonMode(GL_FRONT_AND_BACK, GL_FILL);
 		}
-		gpuGeom.bind();
-		glDrawArrays(GL_TRIANGLES, 0, (GLsizei)cpuGeom.verts.size());
-		glPolygonMode(GL_FRONT_AND_BACK, GL_FILL);
-
-		// Possibly draw wire
-		if (a4->showOctreeWire) {
-			GLint uColor = glGetUniformLocation(shader, "overrideColor");
-			glUniform3f(uColor, 1, 0, 0);
-			gpuWireGeom.bind();
-			glDrawArrays(GL_LINES, 0, (GLsizei)wireLines.size());
-			glUniform3f(uColor, 1, 1, 1); // reset
+		else if (app->currentMode == RenderMode::DualContouring) {
+			// (a) build DC triangle mesh once if needed
+			if (triCache.empty()) {
+				triCache = renderOctree(root, grid, dcRenderer);
+				cpuGeom.verts.clear();
+				cpuGeom.normals.clear();
+				cpuGeom.cols.clear();
+				for (auto& t : triCache) {
+					for (int i = 0; i < 3; i++) {
+						cpuGeom.verts.push_back(t.v[i]);
+						cpuGeom.normals.push_back(t.normal[i]);
+						cpuGeom.cols.push_back({ 0.8f,0.8f,0.8f });
+					}
+				}
+				gpuGeom.bind();
+				gpuGeom.setVerts(cpuGeom.verts);
+				gpuGeom.setNormals(cpuGeom.normals);
+				gpuGeom.setCols(cpuGeom.cols);
+			}
+			// (b) draw
+			if (app->wireframeMode) {
+				glPolygonMode(GL_FRONT_AND_BACK, GL_LINE);
+			}
+			gpuGeom.bind();
+			glDrawArrays(GL_TRIANGLES, 0, (GLsizei)cpuGeom.verts.size());
+			glPolygonMode(GL_FRONT_AND_BACK, GL_FILL);
+		}
+		else if (app->currentMode == RenderMode::VoxelBlocks) {
+			if (triCache.empty()) {
+				triCache = renderOctree(root, grid, blockRenderer);
+				// build GPU geometry from triCache
+				cpuGeom.verts.clear();
+				cpuGeom.normals.clear();
+				cpuGeom.cols.clear();
+				for (auto& t : triCache) {
+					for (int i = 0; i < 3; i++) {
+						cpuGeom.verts.push_back(t.v[i]);
+						cpuGeom.normals.push_back(t.normal[i]);
+						// color the blocks grey or something
+						cpuGeom.cols.push_back(glm::vec3(0.6f, 0.6f, 0.6f));
+					}
+				}
+				gpuGeom.bind();
+				gpuGeom.setVerts(cpuGeom.verts);
+				gpuGeom.setNormals(cpuGeom.normals);
+				gpuGeom.setCols(cpuGeom.cols);
+			}
+			// draw
+			if (app->wireframeMode) {
+				glPolygonMode(GL_FRONT_AND_BACK, GL_LINE);
+			}
+			gpuGeom.bind();
+			glDrawArrays(GL_TRIANGLES, 0, (GLsizei)cpuGeom.verts.size());
+			glPolygonMode(GL_FRONT_AND_BACK, GL_FILL);
 		}
 
-		// Swap
+
+		// Possibly draw wire
+		if (app->showOctreeWire) {
+			GLint uColor = glGetUniformLocation(shader, "overrideColor");
+			glUniform3f(uColor, 1.f, 0.f, 0.f);
+			gpuWireGeom.bind();
+			glDrawArrays(GL_LINES, 0, (GLsizei)cpuWire.verts.size());
+			glUniform3f(uColor, 1.f, 1.f, 1.f);
+		}
+
 		window.swapBuffers();
 
 		// FPS
@@ -380,11 +435,11 @@ int main() {
 		auto now = clock_t::now();
 		double dt = std::chrono::duration<double>(now - lastTime).count();
 		if (dt >= 1.0) {
-			double fps = double(frameCount) / dt;
-			std::cout << "FPS: " << fps
-				<< " Triangles: " << triCache.size()
-				<< " Mode: " << (currentMode == RenderMode::MarchingCubes ? "MC" : "DC")
-				<< std::endl;
+			double fps = (double)frameCount / dt;
+			std::cout << "FPS: " << fps << "  Mode: ";
+			if (app->currentMode == RenderMode::MarchingCubes) std::cout << "MC\n";
+			else if (app->currentMode == RenderMode::DualContouring) std::cout << "DC\n";
+			else std::cout << "RayTracer\n";
 			frameCount = 0;
 			lastTime = now;
 		}

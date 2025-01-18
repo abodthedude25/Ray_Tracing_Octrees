@@ -632,8 +632,7 @@ std::vector<OctreeNode*> getNeighbors(OctreeNode* node,
 	return neighbors;
 }
 
-
-// Linear interpolation along an edge
+// standard MC single-cell
 static glm::vec3 vertexInterp(float iso,
 	const glm::vec3& p1, const glm::vec3& p2,
 	float valp1, float valp2)
@@ -645,10 +644,11 @@ static glm::vec3 vertexInterp(float iso,
 	return p1 + mu * (p2 - p1);
 }
 
-static std::vector<MCTriangle> marchingCubesCell(const std::array<Corner, 8>& corners, float isoValue = 0.f)
+
+// The actual MC cell polygonization
+std::vector<MCTriangle> marchingCubesCell(const std::array<Corner, 8>& corners, float isoValue)
 {
 	std::vector<MCTriangle> cellTris;
-	// Build cubeIndex
 	int cubeIndex = 0;
 	for (int i = 0; i < 8; i++) {
 		if (corners[i].val < isoValue) {
@@ -659,18 +659,27 @@ static std::vector<MCTriangle> marchingCubesCell(const std::array<Corner, 8>& co
 	if (edges == 0) {
 		return cellTris;
 	}
-	// Intersect edges
+
 	glm::vec3 vertList[12];
+	// The edge-to-corner mapping depends on how you define them. Make sure it matches.
+	static const int e2c[12][2] = {
+		{0,1},{1,2},{2,3},{3,0},
+		{4,5},{5,6},{6,7},{7,4},
+		{0,4},{1,5},{2,6},{3,7}
+	};
+
 	for (int e = 0; e < 12; e++) {
 		if (edges & (1 << e)) {
-			int c1 = edgeToCorner[e][0];
-			int c2 = edgeToCorner[e][1];
-			vertList[e] = vertexInterp(isoValue,
+			int c1 = e2c[e][0];
+			int c2 = e2c[e][1];
+			vertList[e] = vertexInterp(
+				isoValue,
 				corners[c1].pos, corners[c2].pos,
-				corners[c1].val, corners[c2].val);
+				corners[c1].val, corners[c2].val
+			);
 		}
 	}
-	// Build up to 5 triangles
+
 	const int* triEdges = triTable[cubeIndex];
 	for (int t = 0; t < 5; t++) {
 		if (triEdges[3 * t] == -1) break;
@@ -678,68 +687,13 @@ static std::vector<MCTriangle> marchingCubesCell(const std::array<Corner, 8>& co
 		for (int v = 0; v < 3; v++) {
 			int edgeId = triEdges[3 * t + v];
 			tri.v[v] = vertList[edgeId];
-			// optional normal
-			tri.normal[v] = glm::vec3(0, 1, 0);
+			tri.normal[v] = glm::vec3(0, 1, 0); // or compute gradient if you wish
 		}
 		cellTris.push_back(tri);
 	}
 	return cellTris;
 }
 
-/// localMC(): run uniform MC inside [x0..x0+size, y0..y0+size, z0..z0+size].
-/// IsoValue=0. Negative= inside, Positive= outside.
-std::vector<MCTriangle> localMC(const VoxelGrid& grid,
-	int x0, int y0, int z0,
-	int size)
-{
-	std::vector<MCTriangle> results;
-
-	auto getScalar = [&](int xx, int yy, int zz) {
-		if (xx < 0 || yy < 0 || zz < 0 || xx >= grid.dimX || yy >= grid.dimY || zz >= grid.dimZ) {
-			// outside the volume => treat as outside => +1
-			return 1.f;
-		}
-		// convert from VoxelState to float
-		// FILLED => -1, EMPTY => +1
-		return (grid.data[grid.index(xx, yy, zz)] == VoxelState::FILLED) ?
-			-1.f : +1.f;
-		};
-
-	float vx = grid.voxelSize;
-	float fy = grid.minY;
-	for (int z = z0; z < (z0 + size); z++) {
-		for (int y = y0; y < (y0 + size); y++) {
-			for (int x = x0; x < (x0 + size); x++) {
-				// Build corners
-				std::array<Corner, 8> c;
-				auto cornerPos = [&](int xx, int yy, int zz) {
-					return glm::vec3(grid.minX + xx * vx,
-						grid.minY + yy * vx,
-						grid.minZ + zz * vx);
-					};
-				c[0] = { cornerPos(x,y,z), getScalar(x,y,z) };
-				c[1] = { cornerPos(x + 1,y,z), getScalar(x + 1,y,z) };
-				c[2] = { cornerPos(x + 1,y + 1,z), getScalar(x + 1,y + 1,z) };
-				c[3] = { cornerPos(x,y + 1,z), getScalar(x,y + 1,z) };
-				c[4] = { cornerPos(x,y,z + 1), getScalar(x,y,z + 1) };
-				c[5] = { cornerPos(x + 1,y,z + 1), getScalar(x + 1,y,z + 1) };
-				c[6] = { cornerPos(x + 1,y + 1,z + 1), getScalar(x + 1,y + 1,z + 1) };
-				c[7] = { cornerPos(x,y + 1,z + 1), getScalar(x,y + 1,z + 1) };
-
-				auto cellTris = marchingCubesCell(c, 0.f);
-				results.insert(results.end(), cellTris.begin(), cellTris.end());
-			}
-		}
-	}
-	return results;
-}
-
-// -------------------------------------------------------------------------
-// Octree building
-// -------------------------------------------------------------------------
-// -------------------------------------
-// Safe Voxel Access
-// -------------------------------------
 VoxelState getVoxelSafe(const VoxelGrid& grid, int x, int y, int z) {
 	if (x < 0 || y < 0 || z < 0 ||
 		x >= grid.dimX ||
@@ -751,33 +705,27 @@ VoxelState getVoxelSafe(const VoxelGrid& grid, int x, int y, int z) {
 	return grid.data[grid.index(x, y, z)];
 }
 
-// -------------------------------------
 // Build Octree
-// -------------------------------------
 static OctreeNode* buildOctreeRec(const VoxelGrid& grid,
 	int x0, int y0, int z0,
 	int size,
 	std::unordered_map<long long, OctreeNode*>& nodeMap)
 {
-	// Create a node
 	OctreeNode* node = new OctreeNode(x0, y0, z0, size);
 
-	// We'll store it in a map, so we can retrieve neighbors later
-	// Let's define the key as (x0<<40) ^ (y0<<20) ^ z0 (or something).
-	// or as in your code: (x0<<20)|(y0<<10)|z0. We'll do a 64-bit shift to be safe:
-	long long key = ((long long)x0 << 40) ^
-		((long long)y0 << 20) ^
+	// Store in global map so we can find neighbors
+	long long key = ((long long)x0 << 20) ^
+		((long long)y0 << 10) ^
 		(long long)z0;
 	nodeMap[key] = node;
 
 	if (size == 1) {
-		// single voxel => leaf
 		node->isLeaf = true;
 		node->isSolid = (getVoxelSafe(grid, x0, y0, z0) == VoxelState::FILLED);
 		return node;
 	}
 
-	// Check if all voxels in [x0..x0+size, y0..y0+size, z0..z0+size] are the same
+	// Check if all voxels in this region are the same
 	bool allSame = true;
 	VoxelState firstVal = getVoxelSafe(grid, x0, y0, z0);
 
@@ -820,20 +768,65 @@ static OctreeNode* buildOctreeRec(const VoxelGrid& grid,
 OctreeNode* createOctreeFromVoxelGrid(const VoxelGrid& grid) {
 	if (grid.dimX == 0 || grid.dimY == 0 || grid.dimZ == 0) return nullptr;
 
-	// find a power-of-two size
 	int maxDim = std::max({ grid.dimX, grid.dimY, grid.dimZ });
 	int sizePow2 = 1;
 	while (sizePow2 < maxDim) sizePow2 <<= 1;
 
-	std::unordered_map<long long, OctreeNode*> octMap;
-	OctreeNode* root = buildOctreeRec(grid, 0, 0, 0, sizePow2, octMap);
+	// We'll fill this map so we can retrieve neighbors
+	extern std::unordered_map<long long, OctreeNode*> g_octreeMap;
+	g_octreeMap.clear(); // ensure empty before building
+
+	OctreeNode* root = buildOctreeRec(grid, 0, 0, 0, sizePow2, g_octreeMap);
 	return root;
 }
 
+// localMC used by MC only
+std::vector<MCTriangle> localMC(const VoxelGrid& grid,
+	int x0, int y0, int z0,
+	int size)
+{
+	std::vector<MCTriangle> results;
 
-// -------------------------------------
-// freeOctree
-// -------------------------------------
+	auto getScalar = [&](int xx, int yy, int zz) {
+		if (xx < 0 || yy < 0 || zz < 0 ||
+			xx >= grid.dimX || yy >= grid.dimY || zz >= grid.dimZ) {
+			return 1.f;
+		}
+		return (grid.data[grid.index(xx, yy, zz)] == VoxelState::FILLED) ?
+			-1.f : +1.f;
+		};
+
+	float vx = grid.voxelSize;
+
+	for (int z = z0; z < (z0 + size); z++) {
+		for (int y = y0; y < (y0 + size); y++) {
+			for (int x = x0; x < (x0 + size); x++) {
+				// Build corners
+				std::array<Corner, 8> c;
+				auto cornerPos = [&](int xx, int yy, int zz) {
+					return glm::vec3(grid.minX + xx * vx,
+						grid.minY + yy * vx,
+						grid.minZ + zz * vx);
+					};
+
+				c[0] = { cornerPos(x,   y,   z),   getScalar(x,   y,   z) };
+				c[1] = { cornerPos(x + 1, y,   z),   getScalar(x + 1, y,   z) };
+				c[2] = { cornerPos(x + 1, y + 1, z),   getScalar(x + 1, y + 1, z) };
+				c[3] = { cornerPos(x,   y + 1, z),   getScalar(x,   y + 1, z) };
+				c[4] = { cornerPos(x,   y,   z + 1), getScalar(x,   y,   z + 1) };
+				c[5] = { cornerPos(x + 1, y,   z + 1), getScalar(x + 1, y,   z + 1) };
+				c[6] = { cornerPos(x + 1, y + 1, z + 1), getScalar(x + 1, y + 1, z + 1) };
+				c[7] = { cornerPos(x,   y + 1, z + 1), getScalar(x,   y + 1, z + 1) };
+
+				// standard MC
+				auto cellTris = marchingCubesCell(c, 0.f);
+				results.insert(results.end(), cellTris.begin(), cellTris.end());
+			}
+		}
+	}
+	return results;
+}
+
 void freeOctree(OctreeNode* node)
 {
 	if (!node) return;
