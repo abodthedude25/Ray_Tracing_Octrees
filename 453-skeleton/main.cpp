@@ -13,6 +13,7 @@
 #include <glm/glm.hpp>
 #include <array>
 #include <functional>
+#include "RayTracerBVH.h"
 
 static std::vector<float> generateTestVolume(int dimX, int dimY, int dimZ) {
 	// Sphere
@@ -160,7 +161,8 @@ static void generateOctreeWireframe(const VoxelGrid& grid,
 enum class RenderMode {
 	MarchingCubes,
 	DualContouring,
-	VoxelBlocks
+	VoxelBlocks,
+	BVHRayTrace
 };
 struct Assignment4 : public CallbackInterface {
 	Assignment4()
@@ -188,6 +190,10 @@ struct Assignment4 : public CallbackInterface {
 				else if (currentMode == RenderMode::VoxelBlocks) {
 					currentMode = RenderMode::DualContouring;
 					std::cout << "Switched to Voxel Blocks\n";
+				}
+				else if (currentMode == RenderMode::DualContouring) {
+					currentMode = RenderMode::BVHRayTrace;
+					std::cout << "Switched to BVH Ray Tracer\n";
 				}
 				else {
 					currentMode = RenderMode::MarchingCubes;
@@ -293,6 +299,8 @@ int main() {
 	MarchingCubesRenderer mcRenderer;
 	AdaptiveDualContouringRenderer dcRenderer;
 	VoxelCubeRenderer blockRenderer;
+	RayTracerBVH bvhRayTracer;
+	bvhRayTracer.setOctree(root, grid);
 
 	// (4) We store geometry in GPU buffers for MC and DC
 	CPU_Geometry cpuGeom;
@@ -417,6 +425,39 @@ int main() {
 			glDrawArrays(GL_TRIANGLES, 0, (GLsizei)cpuGeom.verts.size());
 			glPolygonMode(GL_FRONT_AND_BACK, GL_FILL);
 		}
+		else if (app->currentMode == RenderMode::BVHRayTrace) {
+			// Use the ray tracer to generate a triangle mesh on the fly.
+			if (triCache.empty()) {
+				// Render the ray traced scene.
+				// For example, obtain the view and projection matrices and pass the viewport dimensions.
+				glm::mat4 V = app->camera.getView();
+				glm::mat4 P = glm::perspective(glm::radians(45.f), app->aspect, 0.01f, 1000.f);
+				// Get triangles from the ray tracer.
+				triCache = bvhRayTracer.renderScene(V, P, window.getWidth(), window.getHeight());
+				// Build geometry buffers
+				cpuGeom.verts.clear();
+				cpuGeom.normals.clear();
+				cpuGeom.cols.clear();
+				for (auto& t : triCache) {
+					for (int i = 0; i < 3; i++) {
+						cpuGeom.verts.push_back(t.v[i]);
+						cpuGeom.normals.push_back(t.normal[i]);
+						cpuGeom.cols.push_back(glm::vec3(0.9f, 0.5f, 0.2f));
+					}
+				}
+				gpuGeom.bind();
+				gpuGeom.setVerts(cpuGeom.verts);
+				gpuGeom.setNormals(cpuGeom.normals);
+				gpuGeom.setCols(cpuGeom.cols);
+			}
+			if (app->wireframeMode) {
+				glPolygonMode(GL_FRONT_AND_BACK, GL_LINE);
+			}
+			gpuGeom.bind();
+			glDrawArrays(GL_TRIANGLES, 0, (GLsizei)cpuGeom.verts.size());
+			glPolygonMode(GL_FRONT_AND_BACK, GL_FILL);
+		}
+
 
 
 		// Possibly draw wire
