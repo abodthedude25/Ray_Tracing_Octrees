@@ -5,6 +5,9 @@ This repository demonstrates **voxelization** of either a **test sphere** volume
 1. **Marching Cubes**
 2. **Dual Contouring** (Adaptive)
 
+
+NOTE: please make sure to put your .gbd folder of the city of calgary under gdb_folder/
+
 ## 1. **Overview**
 
 1. **Load or Generate** a voxel volume:
