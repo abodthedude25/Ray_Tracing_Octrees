@@ -47,19 +47,25 @@ struct VoxelGrid {
 // Our Octree Node
 // --------------------------------------------------------------------
 struct OctreeNode {
-	int x, y, z;      // voxel-space origin
-	int size;         // width in voxels at this octree level
-	bool isLeaf = false;
-	bool isSolid = false; // if isLeaf, whether it's all FILLED or not
-	OctreeNode* parent = nullptr;
-	std::array<OctreeNode*, 8> children{ nullptr,nullptr,nullptr,nullptr,
-										 nullptr,nullptr,nullptr,nullptr };
+	int x, y, z;
+	int size;
+	bool isLeaf;
+	bool isSolid; // already present, e.g., whether filled.
+	bool isUniform; // NEW MEMBER: true if all voxels in this cell are the same
+	OctreeNode* parent;
+	OctreeNode* children[8];
 
-	// constructor
+	// Constructor (update as needed)
 	OctreeNode(int _x, int _y, int _z, int _size)
-		: x(_x), y(_y), z(_z), size(_size)
-	{}
+		: x(_x), y(_y), z(_z), size(_size), isLeaf(false),
+		isSolid(false), isUniform(false), parent(nullptr)
+	{
+		for (int i = 0; i < 8; i++) {
+			children[i] = nullptr;
+		}
+	}
 };
+
 
 // --------------------------------------------------------------------
 // Building the Octree from a VoxelGrid

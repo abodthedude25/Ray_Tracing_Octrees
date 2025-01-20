@@ -561,8 +561,8 @@ std::vector<OctreeNode*> getNeighbors(OctreeNode* node,
 
 	// A 64-bit key builder
 	auto buildKey = [&](int xx, int yy, int zz) {
-		long long k = ((long long)xx << 40) ^
-			((long long)yy << 20) ^
+		long long k = ((long long)xx << 20) |
+			((long long)yy << 10) |
 			(long long)zz;
 		return k;
 		};
@@ -706,29 +706,29 @@ VoxelState getVoxelSafe(const VoxelGrid& grid, int x, int y, int z) {
 }
 
 // Build Octree
-static OctreeNode* buildOctreeRec(const VoxelGrid& grid,
+OctreeNode* buildOctreeRec(const VoxelGrid& grid,
 	int x0, int y0, int z0,
 	int size,
 	std::unordered_map<long long, OctreeNode*>& nodeMap)
 {
 	OctreeNode* node = new OctreeNode(x0, y0, z0, size);
 
-	// Store in global map so we can find neighbors
-	long long key = ((long long)x0 << 20) ^
-		((long long)y0 << 10) ^
-		(long long)z0;
+	// Build the key and add to the map (assuming you already fixed the key issues).
+	long long key = ((long long)x0 << 40) | ((long long)y0 << 20) | (long long)z0;
 	nodeMap[key] = node;
 
+	// If the cell is of size 1, it is a leaf.
 	if (size == 1) {
 		node->isLeaf = true;
-		node->isSolid = (getVoxelSafe(grid, x0, y0, z0) == VoxelState::FILLED);
+		VoxelState state = getVoxelSafe(grid, x0, y0, z0);
+		node->isSolid = (state == VoxelState::FILLED);
+		node->isUniform = true;  // When size==1 it’s trivially uniform.
 		return node;
 	}
 
-	// Check if all voxels in this region are the same
+	// Check if all voxels in this region are the same.
 	bool allSame = true;
 	VoxelState firstVal = getVoxelSafe(grid, x0, y0, z0);
-
 	for (int zz = z0; zz < z0 + size; zz++) {
 		for (int yy = y0; yy < y0 + size; yy++) {
 			for (int xx = x0; xx < x0 + size; xx++) {
@@ -744,18 +744,19 @@ static OctreeNode* buildOctreeRec(const VoxelGrid& grid,
 
 	if (allSame) {
 		node->isLeaf = true;
+		node->isUniform = true;
 		node->isSolid = (firstVal == VoxelState::FILLED);
 		return node;
 	}
 
-	// Not all same => subdiv
+	// Not uniform => subdivide.
 	node->isLeaf = false;
+	node->isUniform = false;
 	int half = size / 2;
 	for (int i = 0; i < 8; i++) {
 		int ox = x0 + ((i & 1) ? half : 0);
 		int oy = y0 + ((i & 2) ? half : 0);
 		int oz = z0 + ((i & 4) ? half : 0);
-
 		OctreeNode* child = buildOctreeRec(grid, ox, oy, oz, half, nodeMap);
 		node->children[i] = child;
 		if (child) {
@@ -764,6 +765,7 @@ static OctreeNode* buildOctreeRec(const VoxelGrid& grid,
 	}
 	return node;
 }
+
 
 OctreeNode* createOctreeFromVoxelGrid(const VoxelGrid& grid) {
 	if (grid.dimX == 0 || grid.dimY == 0 || grid.dimZ == 0) return nullptr;

@@ -71,6 +71,16 @@ struct DCCell {
 	glm::vec3 dcNormal{ 0.f };
 };
 
+enum class StitchFace {
+	POS_X,
+	NEG_X,
+	POS_Y,
+	NEG_Y,
+	POS_Z,
+	NEG_Z
+};
+
+
 // For globally identifying a cell coordinate (plus the “lod” or size)
 struct DCCellKey {
 	int lod;   // which level-of-detail (or which 'size')
@@ -125,12 +135,14 @@ private:
 		std::vector<MCTriangle>& out);
 
 	// Actually subdivides one coarse cell for bridging
-	void subdivideCoarseCell(const VoxelGrid& coarseGrid,
-		int cX, int cY, int cZ,  // one coarse cell origin
-		int cLod,
+	void subdivideCoarseCell(
+		const VoxelGrid& coarseGrid,
+		int cX, int cY, int cZ,    // coarse cell coordinates (voxel space)
+		int cLod,                // coarse LOD level
 		const VoxelGrid& fineGrid,
-		int ratio,   // fSize / cSize
-		// The difference in voxel coords
+		int ratio,               // how many fine voxels span one coarse voxel along the face
+		int fLod,                // fine LOD level
+		StitchFace face,         // which face to stitch: one of POS_X, NEG_X, etc.
 		std::vector<MCTriangle>& out);
 
 	// 3) QEF, sampling, normals

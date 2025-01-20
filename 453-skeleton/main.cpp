@@ -268,7 +268,7 @@ int main() {
 	}
 	else {
 		// fallback sphere
-		int dim = 64;
+		int dim = 128;
 		auto vol = generateTestVolume(dim, dim, dim);
 		grid.dimX = dim; grid.dimY = dim; grid.dimZ = dim;
 		grid.minX = -0.5f; grid.minY = -0.5f; grid.minZ = -0.5f;

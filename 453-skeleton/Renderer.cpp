@@ -52,8 +52,8 @@ std::vector<OctreeNode*> AdaptiveDualContouringRenderer::findLODNeighbors(
 	// For example, if you used (x << 20) ^ (y << 10) ^ z as a key:
 	auto buildKey = [&](int xx, int yy, int zz) -> long long {
 		long long key =
-			(static_cast<long long>(xx) << 20) ^
-			(static_cast<long long>(yy) << 10) ^
+			(static_cast<long long>(xx) << 20) |
+			(static_cast<long long>(yy) << 10) |
 			static_cast<long long>(zz);
 		return key;
 		};
@@ -294,6 +294,7 @@ void AdaptiveDualContouringRenderer::buildUniformDCCells(
 					int c2 = edgePairs[e][1];
 					float v1 = cornerVals[c1];
 					float v2 = cornerVals[c2];
+
 					if (v1 * v2 < 0.f) {
 						// There's an intersection
 						int gx1 = x0 + lx + cornerBits[c1][0];
@@ -317,6 +318,7 @@ void AdaptiveDualContouringRenderer::buildUniformDCCells(
 						glm::vec3 pi = intersectEdge(p1, p2, v1, v2);
 						// Use a normal from e.g. the midpoint or the first corner
 						glm::vec3 Ni = computeNormal(grid, gx1, gy1, gz1);
+						if (glm::dot(p2 - p1, Ni) < 0) Ni = -Ni;
 						pts.push_back(pi);
 						nrms.push_back(Ni);
 					}
@@ -438,90 +440,212 @@ AdaptiveDualContouringRenderer::buildUniformDCMesh(
 // --------------------------------------------------------
 // 2) Actual "stitchBoundaryFace" that merges coarse & fine
 // --------------------------------------------------------
-void AdaptiveDualContouringRenderer::stitchBoundaryFace(const VoxelGrid& coarseGrid,
+void AdaptiveDualContouringRenderer::stitchBoundaryFace(
+	const VoxelGrid& coarseGrid,
 	const OctreeNode* coarseNode,
-	int cx0, int cy0, int cz0, int cSize, int cLod,
+	int cx0, int cy0, int cz0,
+	int cSize, int cLod,
 	const VoxelGrid& fineGrid,
 	const OctreeNode* fineNode,
-	int fx0, int fy0, int fz0, int fSize, int fLod,
+	int fx0, int fy0, int fz0,
+	int fSize, int fLod,
 	std::vector<MCTriangle>& out)
 {
-	// Example: Suppose we want to stitch the +X face of the coarse leaf 
-	// with the -X face of the fine leaf (or some bounding).
-	// We'll assume fSize is smaller => ratio = fSize / cSize > 1 => fine is "finer".
+	int ratio = cSize / fSize;
+	if (ratio < 2) return;
 
-	int ratio = cSize / fSize; // or if cSize < fSize => ratio= fSize/cSize
-	if (ratio < 2) {
-		// If ratio=1 => same LOD => no special stitching needed 
-		return;
-	}
-
-	// For each voxel in the coarse boundary face:
-	// e.g. if the boundary is +X => x in [cx0 + cSize-1], y in [cy0..cy0+cSize-1], z in [cz0..cz0+cSize-1]
-	// Then subdiv each coarse cell => unify with fine data. 
-	int boundaryX = cx0 + cSize - 1; // for +X face
-	for (int z = cz0; z < cz0 + cSize - 1; z++) {
-		for (int y = cy0; y < cy0 + cSize - 1; y++) {
-			// subdivide one coarse cell
-			subdivideCoarseCell(coarseGrid, boundaryX, y, z,
-				cLod,
-				fineGrid,
-				ratio,
-				out);
+	// --- +X boundary ---
+	{
+		int boundaryX = cx0 + cSize - 1;
+		for (int z = cz0; z < cz0 + cSize; z++) {
+			for (int y = cy0; y < cy0 + cSize; y++) {
+				subdivideCoarseCell(coarseGrid, boundaryX, y, z, cLod,
+					fineGrid, ratio, fLod,
+					StitchFace::POS_X, out);
+			}
 		}
 	}
-}
 
-// Actually subdivides the coarse cell
-void AdaptiveDualContouringRenderer::subdivideCoarseCell(const VoxelGrid& coarseGrid,
-	int cX, int cY, int cZ,
-	int cLod,
-	const VoxelGrid& fineGrid,
-	int ratio,
-	std::vector<MCTriangle>& out)
-{
-	// This is a big operation. We’d gather the 8 corners from the coarse cell,
-	// then break it into ratio^3 sub-cells. Each sub-cell corresponds to 
-	// multiple cells in the fine grid. Then unify the QEF solutions => produce bridging faces.
+	// --- -X boundary ---
+	{
+		int boundaryX = cx0;
+		for (int z = cz0; z < cz0 + cSize; z++) {
+			for (int y = cy0; y < cy0 + cSize; y++) {
+				subdivideCoarseCell(coarseGrid, boundaryX, y, z, cLod,
+					fineGrid, ratio, fLod,
+					StitchFace::NEG_X, out);
+			}
+		}
+	}
 
-	// We'll do a minimal snippet (still conceptual):
+	// --- +Y boundary ---
+	{
+		int boundaryY = cy0 + cSize - 1;
+		for (int z = cz0; z < cz0 + cSize; z++) {
+			for (int x = cx0; x < cx0 + cSize; x++) {
+				subdivideCoarseCell(coarseGrid, x, boundaryY, z, cLod,
+					fineGrid, ratio, fLod,
+					StitchFace::POS_Y, out);
+			}
+		}
+	}
 
-	for (int sz = 0; sz < ratio; sz++) {
-		for (int sy = 0; sy < ratio; sy++) {
-			for (int sx = 0; sx < ratio; sx++) {
-				// 1) Build a subcell QEF from coarse corner(s) + the relevant fine cells
-				//    e.g. the fine coords might be fX = cX*ratio + sx, etc.
-				//    or we do a relative offset if the fine leaf is at a different origin. 
-				// 2) Solve QEF => a single vertex
-				// 3) Build bridging polygons that connect the coarse vertex to subcell vertices, 
-				//    ensuring no gaps.
+	// --- -Y boundary ---
+	{
+		int boundaryY = cy0;
+		for (int z = cz0; z < cz0 + cSize; z++) {
+			for (int x = cx0; x < cx0 + cSize; x++) {
+				subdivideCoarseCell(coarseGrid, x, boundaryY, z, cLod,
+					fineGrid, ratio, fLod,
+					StitchFace::NEG_Y, out);
+			}
+		}
+	}
 
-				// Because this function is large, we only show a short structure:
+	// --- +Z boundary ---
+	{
+		int boundaryZ = cz0 + cSize - 1;
+		for (int y = cy0; y < cy0 + cSize; y++) {
+			for (int x = cx0; x < cx0 + cSize; x++) {
+				subdivideCoarseCell(coarseGrid, x, y, boundaryZ, cLod,
+					fineGrid, ratio, fLod,
+					StitchFace::POS_Z, out);
+			}
+		}
+	}
 
-				std::vector<glm::vec3> pts, nrms;
-				// gather from coarse corner(s):
-				// gather from fine leaf cells (sx,sy,sz)...
-
-				glm::vec3 subVert = solveQEF(pts, nrms);
-				glm::vec3 subNorm(0.f);
-				for (auto& nn : nrms) {
-					subNorm += glm::normalize(nn);
-				}
-				if (!nrms.empty()) {
-					subNorm = glm::normalize(subNorm);
-				}
-				else {
-					subNorm = glm::vec3(0, 1, 0);
-				}
-
-				// Build bridging geometry:
-				// e.g. connect the coarse cell's main DC vertex with subVert and adjacent subcells
-				// for a watertight mesh
-				// out.push_back(...some triangles...);
+	// --- -Z boundary ---
+	{
+		int boundaryZ = cz0;
+		for (int y = cy0; y < cy0 + cSize; y++) {
+			for (int x = cx0; x < cx0 + cSize; x++) {
+				subdivideCoarseCell(coarseGrid, x, y, boundaryZ, cLod,
+					fineGrid, ratio, fLod,
+					StitchFace::NEG_Z, out);
 			}
 		}
 	}
 }
+
+
+void AdaptiveDualContouringRenderer::subdivideCoarseCell(
+	const VoxelGrid& coarseGrid,
+	int cX, int cY, int cZ,    // coarse cell coordinates (voxel space)
+	int cLod,                // coarse LOD level
+	const VoxelGrid& fineGrid,
+	int ratio,               // how many fine voxels span one coarse voxel along the face
+	int fLod,                // fine LOD level
+	StitchFace face,         // which face to stitch: one of POS_X, NEG_X, etc.
+	std::vector<MCTriangle>& out)
+{
+	// Retrieve the coarse cell's DC vertex using its key.
+	DCCellKey coarseKey{ cLod, cX, cY, cZ };
+	auto it = globalCellMap.find(coarseKey);
+	if (it == globalCellMap.end()) return;
+	const DCCell& coarseCell = it->second;
+	if (!coarseCell.isMixed) return;
+
+	glm::vec3 coarseV = coarseCell.dcVertex;
+	glm::vec3 coarseN = coarseCell.dcNormal;
+
+	// The face that we are stitching determines which coordinate remains constant,
+	// and which two coordinates vary. We will build a 2D grid (of size ratio+1) for the
+	// two varying directions.
+	int gridSize = ratio + 1;
+	std::vector<glm::vec3> fineVerts(gridSize * gridSize);
+	std::vector<glm::vec3> fineNorms(gridSize * gridSize);
+
+	auto fineIndex = [=](int a, int b) -> int { return a + gridSize * b; };
+
+	// Depending on the face, compute the appropriate fine coordinates.
+	// We assume a simple mapping: the coarse coordinate is multiplied by ratio
+	// to give the origin in the fine grid.
+	// Adjust these formulas as needed for your coordinate alignment.
+	for (int i = 0; i < gridSize; i++) {
+		for (int j = 0; j < gridSize; j++) {
+			int fineX, fineY, fineZ;
+			switch (face) {
+			case StitchFace::POS_X:
+				// +X face: x is constant; vary y and z.
+				// Set constant fineX to the coarse boundary.
+				fineX = cX * ratio; // assume cX is the boundary voxel (i.e. cX = coarse cell's max x index)
+				fineY = (cY * ratio) + i;
+				fineZ = (cZ * ratio) + j;
+				break;
+			case StitchFace::NEG_X:
+				// -X face: x is constant
+				// For the negative face, we choose the fine coordinate corresponding to the front side.
+				fineX = (cX + 1) * ratio; // adjust as desired (could also be cX*ratio)
+				fineY = (cY * ratio) + i;
+				fineZ = (cZ * ratio) + j;
+				break;
+			case StitchFace::POS_Y:
+				// +Y face: y is constant; vary x and z.
+				fineY = cY * ratio; // constant for +Y face boundary
+				fineX = (cX * ratio) + i;
+				fineZ = (cZ * ratio) + j;
+				break;
+			case StitchFace::NEG_Y:
+				// -Y face: y is constant
+				fineY = (cY + 1) * ratio; // adjust as desired
+				fineX = (cX * ratio) + i;
+				fineZ = (cZ * ratio) + j;
+				break;
+			case StitchFace::POS_Z:
+				// +Z face: z is constant; vary x and y.
+				fineZ = cZ * ratio; // constant for +Z boundary
+				fineX = (cX * ratio) + i;
+				fineY = (cY * ratio) + j;
+				break;
+			case StitchFace::NEG_Z:
+				// -Z face: z is constant
+				fineZ = (cZ + 1) * ratio; // adjust as desired
+				fineX = (cX * ratio) + i;
+				fineY = (cY * ratio) + j;
+				break;
+			}
+
+			DCCellKey fineKey{ fLod, fineX, fineY, fineZ };
+			int idx = fineIndex(i, j);
+			auto itF = globalCellMap.find(fineKey);
+			if (itF != globalCellMap.end() && itF->second.isMixed) {
+				fineVerts[idx] = itF->second.dcVertex;
+				fineNorms[idx] = itF->second.dcNormal;
+			}
+			else {
+				// Fallback: use coarse vertex
+				fineVerts[idx] = coarseV;
+				fineNorms[idx] = coarseN;
+			}
+		}
+	}
+
+	// Now form bridging geometry.
+	// For each subcell (each quad in the 2D grid of fine vertices),
+	// create a fan of triangles connecting the coarse cell’s vertex to the four corners.
+	for (int j = 0; j < ratio; j++) {
+		for (int i = 0; i < ratio; i++) {
+			// Get the four corners of the current quad.
+			glm::vec3 v00 = fineVerts[fineIndex(i, j)];
+			glm::vec3 v10 = fineVerts[fineIndex(i + 1, j)];
+			glm::vec3 v11 = fineVerts[fineIndex(i + 1, j + 1)];
+			glm::vec3 v01 = fineVerts[fineIndex(i, j + 1)];
+
+			glm::vec3 n00 = fineNorms[fineIndex(i, j)];
+			glm::vec3 n10 = fineNorms[fineIndex(i + 1, j)];
+			glm::vec3 n11 = fineNorms[fineIndex(i + 1, j + 1)];
+			glm::vec3 n01 = fineNorms[fineIndex(i, j + 1)];
+
+			// One simple method is to create a fan around the coarse vertex.
+			// We create four triangles:
+			addTriangle(coarseV, v00, v10, coarseN, n00, n10, out);
+			addTriangle(coarseV, v10, v11, coarseN, n10, n11, out);
+			addTriangle(coarseV, v11, v01, coarseN, n11, n01, out);
+			addTriangle(coarseV, v01, v00, coarseN, n01, n00, out);
+		}
+	}
+}
+
 
 // --------------------------------------------------------
 // 3) QEF, sampling, normal, etc.
@@ -560,34 +684,47 @@ glm::vec3 AdaptiveDualContouringRenderer::intersectEdge(const glm::vec3& p1,
 	float t = v1 / (v1 - v2);
 	return p1 + t * (p2 - p1);
 }
-
-glm::vec3 AdaptiveDualContouringRenderer::solveQEF(
-	const std::vector<glm::vec3>& points,
-	const std::vector<glm::vec3>& normals)
-{
+glm::vec3 AdaptiveDualContouringRenderer::solveQEF(const std::vector<glm::vec3>& points,
+	const std::vector<glm::vec3>& normals) {
 	if (points.empty()) return glm::vec3(0.f);
 
 	glm::vec3 centroid(0.f);
-	for (auto& p : points) {
-		centroid += p;
-	}
+	for (auto& p : points) centroid += p;
 	centroid /= (float)points.size();
 
-	glm::mat3 ATA(0.f);
-	glm::vec3 ATb(0.f);
-	for (size_t i = 0; i < points.size(); i++) {
-		glm::vec3 pi = points[i] - centroid;
-		glm::vec3 ni = glm::normalize(normals[i]);
-		ATA += glm::outerProduct(ni, ni);
-		float d = glm::dot(pi, ni);
-		ATb += d * ni;
+	// Build mass-spring system matrix
+	glm::mat3 A(0.f);
+	glm::vec3 b(0.f);
+	float massWeight = 0.1f; // Tune this parameter
+
+	// Add point constraints with mass
+	for (auto& p : points) {
+		glm::vec3 d = p - centroid;
+		A += massWeight * glm::mat3(1.0f);
+		b += massWeight * d;
 	}
 
-	float det = glm::determinant(ATA);
-	if (std::fabs(det) < 1e-10f) {
-		return centroid;
+	// Add normal constraints
+	for (size_t i = 0; i < points.size(); i++) {
+		glm::vec3 n = glm::normalize(normals[i]);
+		A += glm::outerProduct(n, n);
+		float d = glm::dot(points[i] - centroid, n);
+		b += d * n;
 	}
-	glm::vec3 r = glm::inverse(ATA) * ATb;
+
+	// Solve using SVD or other stable method
+	glm::mat3 U, V;
+	glm::vec3 s;
+	// Pseudo-inverse with threshold
+	const float svdThreshold = 1e-6f;
+	for (int i = 0; i < 3; i++) {
+		if (s[i] > svdThreshold) s[i] = 1.0f / s[i];
+		else s[i] = 0.0f;
+	}
+
+	glm::vec3 r = V * glm::mat3(s[0], 0, 0, 0, s[1], 0, 0, 0, s[2]) *
+		glm::transpose(U) * b;
+
 	return centroid + r;
 }
 
@@ -606,8 +743,28 @@ void AdaptiveDualContouringRenderer::addQuad(const glm::vec3& v0, const glm::vec
 	const glm::vec3& v2, const glm::vec3& v3,
 	const glm::vec3& n0, const glm::vec3& n1,
 	const glm::vec3& n2, const glm::vec3& n3,
-	std::vector<MCTriangle>& out)
-{
+	std::vector<MCTriangle>& out) {
+	// Add degenerate quad check
+	float area1 = glm::length(glm::cross(v1 - v0, v2 - v0));
+	float area2 = glm::length(glm::cross(v3 - v2, v1 - v2));
+	if (area1 < 1e-6f || area2 < 1e-6f) return;
+
+	// Check for quad planarity
+	glm::vec3 n = glm::normalize(glm::cross(v1 - v0, v2 - v0));
+	if (std::abs(glm::dot(v3 - v0, n)) > 1e-4f) {
+		// Non-planar quad - consider alternative triangulation
+		if (glm::length2(v2 - v0) < glm::length2(v3 - v1)) {
+			addTriangle(v0, v1, v2, n0, n1, n2, out);
+			addTriangle(v0, v2, v3, n0, n2, n3, out);
+		}
+		else {
+			addTriangle(v0, v1, v3, n0, n1, n3, out);
+			addTriangle(v1, v2, v3, n1, n2, n3, out);
+		}
+		return;
+	}
+
+	// Original triangulation if planar
 	addTriangle(v0, v1, v2, n0, n1, n2, out);
 	addTriangle(v2, v1, v3, n2, n1, n3, out);
 }
