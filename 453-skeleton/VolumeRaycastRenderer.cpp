@@ -2,58 +2,64 @@
 
 #include "VolumeRaycastRenderer.h"
 #include <glad/glad.h>
-#include <string>
 #include <glm/gtc/matrix_transform.hpp>
 #include <glm/gtc/type_ptr.hpp>
 #include <iostream>
+#include <vector>
+
+// Structure to hold splat vertex data (not directly used in this integrated approach)
+struct SplatVertex {
+	glm::vec3 position; // World space position
+	glm::vec3 normal;   // Voxel normal for shading
+	glm::vec3 color;    // Voxel base color
+};
 
 // -----------------------------
-// Vertex Shader: Fullscreen Quad
+// Shader Sources
 // -----------------------------
-static const char* raycastVertSrc = R"(
+
+// Vertex Shader: Fullscreen Quad
+static const char* raycastVertSrc = R"END(
 #version 330 core
 layout(location = 0) in vec2 aPos;
 out vec2 TexCoord;
+
 void main() {
-    // Convert [-1,1]^2 => [0,1]^2
+    // Convert [-1,1]^2 to [0,1]^2
     TexCoord = 0.5 * (aPos + 1.0);
     gl_Position = vec4(aPos, 0.0, 1.0);
 }
-)";
+)END";
 
-// ------------------------------------
-// Fragment Shader: Raymarch + Lighting
-// ------------------------------------
-static const char* raycastFragSrc = R"(
+// Fragment Shader: Integrated Raycasting + Splatting
+static const char* raycastFragSrc = R"END(
 #version 330 core
 in vec2 TexCoord;
 out vec4 FragColor;
 
-// Camera matrices/uniforms
+// Camera uniforms
 uniform mat4 invView;
 uniform mat4 invProj;
 uniform vec3 camPos;
 
-// 3D volume & mask textures
+// Textures
 uniform sampler3D uVolumeTex;
 uniform sampler3D uMaskTex;
 
-// Step size for raymarching
+// Raymarching parameters
 uniform float stepSize;
+uniform float voxelSize;
 
-// Light parameters
-uniform vec3 lightDir;    // Directional light direction (should be normalized)
-uniform vec3 lightColor;  // Color/intensity of the light (e.g., white)
-uniform float ambient;    // Ambient term (small constant light)
+// Lighting parameters
+uniform vec3 lightDir;    // Should be normalized
+uniform vec3 lightColor;  // e.g., white
+uniform float ambient;
 
-// Size of the 3D texture
-// (Optional) If you need it for gradient offset calculations, 
-// you can define volDimX, volDimY, volDimZ as uniforms, 
-// but we'll show a simpler approach.
+// Constants
+const int MAX_STEPS = 1024;
+const float OPACITY_THRESHOLD = 0.95;
 
-/////////////////////////////////////////////////////////
-// Helper: Ray-box intersection for [-0.5..+0.5]^3 volume
-/////////////////////////////////////////////////////////
+// Helper function: Ray-box intersection for [-0.5, 0.5]^3
 vec2 intersectBox(in vec3 rayOrig, in vec3 rayDir) {
     vec3 minB = vec3(-0.5);
     vec3 maxB = vec3( 0.5);
@@ -70,39 +76,31 @@ vec2 intersectBox(in vec3 rayOrig, in vec3 rayDir) {
     return vec2(tN, tF);
 }
 
-/////////////////////////////////////////////////////////
-// Helper: Sample the volume at "pos" in [0,1]^3
-// Returns the density (0.0 for empty, >0 for filled)
-/////////////////////////////////////////////////////////
+// Helper function: Sample the volume density
 float sampleVolume(vec3 pos) {
     return texture(uVolumeTex, pos).r;
 }
 
-/////////////////////////////////////////////////////////
-// Helper: Compute local gradient using central differences
-// We'll do 6 extra texture fetches. 
-// If performance is tight, you can optimize further.
-/////////////////////////////////////////////////////////
+// Helper function: Compute gradient using central differences
 vec3 computeGradient(vec3 pos, float delta) {
-    // sample +/- delta in x,y,z
-    // clamp pos +/- delta to [0,1]
-    vec3 ppx = clamp(pos + vec3(delta, 0, 0), 0.0, 1.0);
-    vec3 pmx = clamp(pos - vec3(delta, 0, 0), 0.0, 1.0);
-    vec3 ppy = clamp(pos + vec3(0, delta, 0), 0.0, 1.0);
-    vec3 pmy = clamp(pos - vec3(0, delta, 0), 0.0, 1.0);
-    vec3 ppz = clamp(pos + vec3(0, 0, delta), 0.0, 1.0);
-    vec3 pmz = clamp(pos - vec3(0, 0, delta), 0.0, 1.0);
+    // Sample +/- delta in x, y, z
+    vec3 ppx = clamp(pos + vec3(delta, 0.0, 0.0), 0.0, 1.0);
+    vec3 pmx = clamp(pos - vec3(delta, 0.0, 0.0), 0.0, 1.0);
+    vec3 ppy = clamp(pos + vec3(0.0, delta, 0.0), 0.0, 1.0);
+    vec3 pmy = clamp(pos - vec3(0.0, delta, 0.0), 0.0, 1.0);
+    vec3 ppz = clamp(pos + vec3(0.0, 0.0, delta), 0.0, 1.0);
+    vec3 pmz = clamp(pos - vec3(0.0, 0.0, delta), 0.0, 1.0);
 
     float dx = sampleVolume(ppx) - sampleVolume(pmx);
     float dy = sampleVolume(ppy) - sampleVolume(pmy);
     float dz = sampleVolume(ppz) - sampleVolume(pmz);
 
-    return vec3(dx, dy, dz);
+    return vec3(dx, dy, dz) / (2.0 * delta);
 }
 
 void main()
 {
-    // Reconstruct NDC
+    // Reconstruct NDC coordinates
     vec2 ndc = vec2(2.0 * TexCoord.x - 1.0, 1.0 - 2.0 * TexCoord.y);
     vec4 clipPos = vec4(ndc, 1.0, 1.0);
 
@@ -115,34 +113,36 @@ void main()
     vec3 rayDir = normalize(wPos.xyz - camPos);
     vec3 rayOrig = camPos;
 
-    // Intersect with bounding box
+    // Ray-box intersection
     vec2 tBox = intersectBox(rayOrig, rayDir);
     float tNear = tBox.x;
     float tFar  = tBox.y;
 
     // If no intersection or behind camera
     if (tNear > tFar || tFar < 0.0) {
-        FragColor = vec4(0,0,0,1);
+        FragColor = vec4(0.0, 0.0, 0.0, 1.0);
         return;
     }
 
     // Initialize
     float t = max(tNear, 0.0);
-    float tMax = 100.0;
-    float tExit = min(tFar, tMax);
-    const int MAX_STEPS = 1024;
+    float tExit = min(tFar, 100.0); // Arbitrary far plane
+    float delta = voxelSize; // Step size for gradient calculation
 
-    // Accumulation
-    vec4 colorAccum = vec4(0.0);
-    // We'll keep alpha-based compositing
-    // baseColor if we find a voxel
+    // Accumulation variables
+    vec3 accumColor = vec3(0.0);
+    float accumAlpha = 0.0;
 
-    /////////////////////////////////////////
-    // Main Raymarch Loop
-    /////////////////////////////////////////
-    for(int i=0; i<MAX_STEPS && t<=tExit; i++) {
-        vec3 pos = rayOrig + t * rayDir;        // in world space
-        vec3 texCoord3 = pos + vec3(0.5);       // map [-0.5..+0.5] -> [0..1]
+    // Main raymarch loop with integrated splatting
+    for(int i = 0; i < MAX_STEPS && t <= tExit; i++) {
+        vec3 pos = rayOrig + t * rayDir;        // Current position in world space
+        vec3 texCoord3 = pos + vec3(0.5);       // Map [-0.5..+0.5] to [0..1]
+
+        // Check if texCoord3 is within [0,1]^3
+        if(any(lessThan(texCoord3, vec3(0.0))) || any(greaterThan(texCoord3, vec3(1.0)))) {
+            t += stepSize;
+            continue;
+        }
 
         // Mask check
         float maskVal = texture(uMaskTex, texCoord3).r;
@@ -151,62 +151,51 @@ void main()
             continue;
         }
 
-        // Sample main volume
+        // Sample volume density
         float density = sampleVolume(texCoord3);
         if(density > 0.0) {
-            // Compute gradient for lighting
-            // We'll assume a small offset => 1.0/(dim) 
-            // or we can use half stepSize if you prefer
-            float delta = 1.0 / 64.0;  // For dim=64
+            // Compute gradient for shading
             vec3 grad = computeGradient(texCoord3, delta);
 
-            // If gradient is near zero, skip shading
-            if (length(grad) < 1e-5) {
-                // Just accumulate a constant color
-                vec3 baseColor = vec3(1.0, 0.5, 0.2);
-                float alpha = 0.1; 
-                colorAccum.rgb += (1.0 - colorAccum.a) * baseColor * alpha;
-                colorAccum.a   += (1.0 - colorAccum.a) * alpha;
-            }
-            else {
-                // Normal from gradient
-                vec3 normal = normalize(grad) * -1.0;
-                // Basic Lambertian shading
-                float diffuse = max(dot(normal, lightDir), 0.0);
+            // Normalize gradient to get normal
+            vec3 normal = normalize(length(grad) > 1e-5 ? grad : vec3(0.0, 0.0, 1.0));
 
-                // finalColor = ambient + diffuseTerm
-                vec3 shadedColor = ambient * lightColor + diffuse * lightColor;
-                // Tint the shaded color by the voxel "base" color
-                vec3 baseColor   = vec3(1.0, 0.5, 0.2);
-                vec3 finalColor  = baseColor * shadedColor;
+            // Lambertian shading
+            float diffuse = max(dot(normal, lightDir), 0.0);
+            vec3 shadedColor = ambient * lightColor + diffuse * lightColor;
 
-                // Alpha for compositing
-                float alpha = 0.1;
+            // Base color (can be modulated based on density or other factors)
+            vec3 baseColor = vec3(1.0, 0.5, 0.2); // Example: Orange-like color
+            vec3 finalColor = baseColor * shadedColor;
 
-                // Composite
-                colorAccum.rgb += (1.0 - colorAccum.a) * finalColor * alpha;
-                colorAccum.a   += (1.0 - colorAccum.a) * alpha;
-            }
+            // Compute opacity based on density
+            float alpha = density * 0.1; // Scale opacity as needed
 
-            // Early ray termination if fully opaque
-            if (colorAccum.a >= 0.95) {
+            // Front-to-back compositing
+            accumColor += (1.0 - accumAlpha) * finalColor * alpha;
+            accumAlpha += (1.0 - accumAlpha) * alpha;
+
+            // Early termination if opacity threshold is reached
+            if(accumAlpha >= OPACITY_THRESHOLD) {
                 break;
             }
         }
 
-        // Step forward
+        // Step forward along the ray
         t += stepSize;
     }
 
-    // Final output
-    FragColor = vec4(colorAccum.rgb, 1.0);
+    // Final color with accumulated opacity
+    FragColor = vec4(accumColor, accumAlpha);
 }
-)";
+)END";
 
-// -----------------------------------------------------
-// Helper: Compile a shader (vertex or fragment)
-// -----------------------------------------------------
-static unsigned int compileShader(const char* src, GLenum type)
+// -----------------------------
+// Helper Functions
+// -----------------------------
+
+// Helper function: Compile a shader (vertex or fragment)
+unsigned int VolumeRaycastRenderer::compileShader(const char* src, GLenum type)
 {
 	unsigned int shader = glCreateShader(type);
 	glShaderSource(shader, 1, &src, nullptr);
@@ -226,10 +215,8 @@ static unsigned int compileShader(const char* src, GLenum type)
 	return shader;
 }
 
-// -----------------------------------------------------
-// Create the raycast shader program
-// -----------------------------------------------------
-static unsigned int createRaycastProgram()
+// Helper function: Create the raycast shader program with integrated splatting
+unsigned int VolumeRaycastRenderer::createRaycastProgram()
 {
 	unsigned int vs = compileShader(raycastVertSrc, GL_VERTEX_SHADER);
 	unsigned int fs = compileShader(raycastFragSrc, GL_FRAGMENT_SHADER);
@@ -246,7 +233,7 @@ static unsigned int createRaycastProgram()
 	if (!success)
 	{
 		glGetProgramInfoLog(prog, 512, nullptr, infoLog);
-		std::cerr << "Program link error:\n" << infoLog << std::endl;
+		std::cerr << "Raycast Program link error:\n" << infoLog << std::endl;
 	}
 
 	glDeleteShader(vs);
@@ -254,9 +241,10 @@ static unsigned int createRaycastProgram()
 	return prog;
 }
 
-// -----------------------------------------------------
-// Constructor / Destructor
-// -----------------------------------------------------
+// -----------------------------
+// Constructor & Destructor
+// -----------------------------
+
 VolumeRaycastRenderer::VolumeRaycastRenderer()
 	: volumeTextureID(0), maskTextureID(0), raycastShaderProg(0),
 	quadVAO(0), quadVBO(0),
@@ -282,21 +270,25 @@ VolumeRaycastRenderer::~VolumeRaycastRenderer()
 	}
 }
 
-// -----------------------------------------------------
-// Splat-based render stub (not used here)
-// -----------------------------------------------------
+// -----------------------------
+// Render Stub (Unused)
+// -----------------------------
+
 std::vector<MCTriangle> VolumeRaycastRenderer::render(
 	const OctreeNode* node,
 	const VoxelGrid& grid,
 	int x0, int y0, int z0,
 	int size)
 {
+	// Splatting is integrated into raycasting; no separate render implementation
 	return {};
 }
 
-// -----------------------------------------------------
-// initVolume: Create 3D texture from the voxel grid
-// -----------------------------------------------------
+// -----------------------------
+// Initialization Methods
+// -----------------------------
+
+// Initialize 3D texture from the voxel grid
 void VolumeRaycastRenderer::initVolume(const VoxelGrid& grid)
 {
 	volDimX = grid.dimX;
@@ -306,7 +298,7 @@ void VolumeRaycastRenderer::initVolume(const VoxelGrid& grid)
 	gridPtr = &grid;
 
 	// Convert voxel states to float data
-	std::vector<float> volumeData(volDimX * volDimY * volDimZ, 0.f);
+	std::vector<float> volumeData(volDimX * volDimY * volDimZ, 0.0f);
 	for (int z = 0; z < volDimZ; ++z) {
 		for (int y = 0; y < volDimY; ++y) {
 			for (int x = 0; x < volDimX; ++x) {
@@ -345,15 +337,15 @@ void VolumeRaycastRenderer::initVolume(const VoxelGrid& grid)
 	// Initialize mask
 	initMaskVolume(grid);
 
-	// Create shader program
+	// Create raycasting shader program with integrated splatting
 	raycastShaderProg = createRaycastProgram();
 
-	// Fullscreen quad
+	// Create fullscreen quad
 	float fsQuadVerts[8] = {
-		-1.f, -1.f,
-		 1.f, -1.f,
-		-1.f,  1.f,
-		 1.f,  1.f
+		-1.0f, -1.0f,
+		 1.0f, -1.0f,
+		-1.0f,  1.0f,
+		 1.0f,  1.0f
 	};
 	glGenVertexArrays(1, &quadVAO);
 	glGenBuffers(1, &quadVBO);
@@ -371,9 +363,7 @@ void VolumeRaycastRenderer::initVolume(const VoxelGrid& grid)
 		<< " dimZ=" << volDimZ << "\n";
 }
 
-// -----------------------------------------------------
-// initMaskVolume: Simple peeling
-// -----------------------------------------------------
+// Initialize mask texture based on a peeling plane
 void VolumeRaycastRenderer::initMaskVolume(const VoxelGrid& grid)
 {
 	if (!gridPtr) {
@@ -383,19 +373,20 @@ void VolumeRaycastRenderer::initMaskVolume(const VoxelGrid& grid)
 
 	std::vector<float> maskData(volDimX * volDimY * volDimZ, 0.0f);
 
-	// Example plane-based peeling at z>0
+	// Example: Plane-based peeling at z > 0.0
 	for (int z = 0; z < volDimZ; z++) {
 		float voxelZ = grid.minZ + (z + 0.5f) * grid.voxelSize;
 		for (int y = 0; y < volDimY; y++) {
 			for (int x = 0; x < volDimX; x++) {
 				int idx = x + y * volDimX + z * (volDimX * volDimY);
 				if (voxelZ > 0.0f) {
-					maskData[idx] = 1.0f; // Carve away
+					maskData[idx] = 1.0f; // Carved away
 				}
 			}
 		}
 	}
 
+	// Create mask texture
 	glGenTextures(1, &maskTextureID);
 	glBindTexture(GL_TEXTURE_3D, maskTextureID);
 	glTexParameteri(GL_TEXTURE_3D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
@@ -419,9 +410,11 @@ void VolumeRaycastRenderer::initMaskVolume(const VoxelGrid& grid)
 	std::cout << "[VolumeRaycastRenderer] initMaskVolume: Initialized mask with plane at z=0.0\n";
 }
 
-// -----------------------------------------------------
-// drawRaycast: Perform raymarching + shading
-// -----------------------------------------------------
+// -----------------------------
+// Rendering Method
+// -----------------------------
+
+// Perform integrated raycasting and splatting
 void VolumeRaycastRenderer::drawRaycast(const Camera& cam,
 	float aspectRatio,
 	int screenW, int screenH)
@@ -432,7 +425,7 @@ void VolumeRaycastRenderer::drawRaycast(const Camera& cam,
 
 	// Build inverse matrices
 	glm::mat4 V = cam.getView();
-	glm::mat4 P = glm::perspective(glm::radians(45.f), aspectRatio, 0.01f, 100.f);
+	glm::mat4 P = glm::perspective(glm::radians(45.0f), aspectRatio, 0.01f, 100.0f);
 	glm::mat4 invV = glm::inverse(V);
 	glm::mat4 invP = glm::inverse(P);
 	glm::vec3 camPos = cam.getPos();
@@ -441,33 +434,33 @@ void VolumeRaycastRenderer::drawRaycast(const Camera& cam,
 	GLint locInvV = glGetUniformLocation(raycastShaderProg, "invView");
 	GLint locInvP = glGetUniformLocation(raycastShaderProg, "invProj");
 	GLint locCamPos = glGetUniformLocation(raycastShaderProg, "camPos");
+	GLint locVoxelSize = glGetUniformLocation(raycastShaderProg, "voxelSize");
 	if (locInvV >= 0) glUniformMatrix4fv(locInvV, 1, GL_FALSE, glm::value_ptr(invV));
 	if (locInvP >= 0) glUniformMatrix4fv(locInvP, 1, GL_FALSE, glm::value_ptr(invP));
 	if (locCamPos >= 0) glUniform3fv(locCamPos, 1, glm::value_ptr(camPos));
+	if (locVoxelSize >= 0) glUniform1f(locVoxelSize, gridPtr->voxelSize); // Assuming voxelSize is a member
 
-	// volume texture = unit 0
+	// Bind volume texture to texture unit 0
 	glActiveTexture(GL_TEXTURE0);
 	glBindTexture(GL_TEXTURE_3D, volumeTextureID);
 	GLint locVol = glGetUniformLocation(raycastShaderProg, "uVolumeTex");
 	if (locVol >= 0) glUniform1i(locVol, 0);
 
-	// mask texture = unit 1
+	// Bind mask texture to texture unit 1
 	glActiveTexture(GL_TEXTURE1);
 	glBindTexture(GL_TEXTURE_3D, maskTextureID);
 	GLint locMask = glGetUniformLocation(raycastShaderProg, "uMaskTex");
 	if (locMask >= 0) glUniform1i(locMask, 1);
 
-	// stepSize
+	// Set step size
 	GLint locStep = glGetUniformLocation(raycastShaderProg, "stepSize");
 	if (locStep >= 0) {
 		glUniform1f(locStep, 0.005f);
 	}
 
 	// Set lighting uniforms
-	// A directional light from some angle
 	GLint locLightDir = glGetUniformLocation(raycastShaderProg, "lightDir");
 	if (locLightDir >= 0) {
-		// e.g., pointing downward from above
 		glm::vec3 lightDir = glm::normalize(glm::vec3(0.6f, 0.6f, 1.0f));
 		glUniform3fv(locLightDir, 1, glm::value_ptr(lightDir));
 	}
@@ -480,10 +473,10 @@ void VolumeRaycastRenderer::drawRaycast(const Camera& cam,
 
 	GLint locAmbient = glGetUniformLocation(raycastShaderProg, "ambient");
 	if (locAmbient >= 0) {
-		glUniform1f(locAmbient, 0.2f); // small ambient factor
+		glUniform1f(locAmbient, 0.2f); // Small ambient factor
 	}
 
-	// Render fullscreen quad
+	// Render fullscreen quad for integrated raycasting + splatting
 	glBindVertexArray(quadVAO);
 	glDrawArrays(GL_TRIANGLE_STRIP, 0, 4);
 	glBindVertexArray(0);
@@ -491,9 +484,11 @@ void VolumeRaycastRenderer::drawRaycast(const Camera& cam,
 	glUseProgram(0);
 }
 
-// -----------------------------------------------------
-// updatePeelPlane: If user modifies peeling logic
-// -----------------------------------------------------
+// -----------------------------
+// Update Peeling Plane Method
+// -----------------------------
+
+// Update the peeling plane and corresponding mask texture
 void VolumeRaycastRenderer::updatePeelPlane(float newZ)
 {
 	if (!gridPtr) {
@@ -510,12 +505,13 @@ void VolumeRaycastRenderer::updatePeelPlane(float newZ)
 			for (int x = 0; x < volDimX; x++) {
 				int idx = x + y * volDimX + z * (volDimX * volDimY);
 				if (voxelZ > worldZ) {
-					maskData[idx] = 1.0f; // Carved
+					maskData[idx] = 1.0f; // Carved away
 				}
 			}
 		}
 	}
 
+	// Update mask texture
 	glBindTexture(GL_TEXTURE_3D, maskTextureID);
 	glTexSubImage3D(
 		GL_TEXTURE_3D,

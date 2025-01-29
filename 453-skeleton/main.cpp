@@ -196,6 +196,7 @@ struct Assignment4 : public CallbackInterface {
 		peelPlaneZ(0.0f) // Initialize peeling plane
 	{}
 
+	// keyCallback: Handle user input
 	void keyCallback(int key, int scancode, int action, int mods) override {
 		if (action == GLFW_PRESS) {
 			if (key == GLFW_KEY_W) {
@@ -205,7 +206,7 @@ struct Assignment4 : public CallbackInterface {
 				showOctreeWire = !showOctreeWire;
 			}
 			else if (key == GLFW_KEY_R) {
-				// Cycle modes
+				// Cycle modes (now excluding separate splatting mode)
 				if (currentMode == RenderMode::MarchingCubes) {
 					currentMode = RenderMode::VoxelBlocks;
 					std::cout << "Switched to Voxel Blocks\n";
@@ -220,7 +221,7 @@ struct Assignment4 : public CallbackInterface {
 				}
 				else if (currentMode == RenderMode::BVHRayTrace) {
 					currentMode = RenderMode::VolumeRaycast;
-					std::cout << "Switched to Volume Raycast\n";
+					std::cout << "Switched to Raycast + Splatting\n";
 				}
 				else {
 					currentMode = RenderMode::MarchingCubes;
@@ -231,14 +232,19 @@ struct Assignment4 : public CallbackInterface {
 				// Move peeling plane upward
 				peelPlaneZ += 0.05f; // Adjust step size as needed
 				std::cout << "Peeling Plane Z: " << peelPlaneZ << "\n";
+				// Optionally, update the mask immediately
+				// volRenderer.updatePeelPlane(peelPlaneZ);
 			}
 			else if (key == GLFW_KEY_DOWN) {
 				// Move peeling plane downward
 				peelPlaneZ -= 0.05f; // Adjust step size as needed
 				std::cout << "Peeling Plane Z: " << peelPlaneZ << "\n";
+				// Optionally, update the mask immediately
+				// volRenderer.updatePeelPlane(peelPlaneZ);
 			}
 		}
 	}
+
 
 	void cursorPosCallback(double xpos, double ypos) override {
 		if (rightMouseDown) {
@@ -296,12 +302,22 @@ int main() {
 	window.setCallbacks(app);
 
 	bool useGDB = false;
+	std::string gdbPath = "./gdb_folder/Buildings_3D.gdb";
 	int dim = 64;
 
 	VoxelGrid grid;
 	if (useGDB) {
-		// Load from GDB...
-		// recenterFilledVoxels(grid);
+		// Possibly an empty vector => first building
+		std::vector<int> targetIDs = { };
+		grid = loadBuildingsFromGDB(gdbPath, 1.0f, targetIDs);
+
+		// Re-center after load, *before* building the octree
+		recenterFilledVoxels(grid);
+
+		if (grid.data.empty()) {
+			std::cerr << "Voxel grid is empty. Exiting.\n";
+			return -1;
+		}
 	}
 	else {
 		// Fallback multi-shell sphere
