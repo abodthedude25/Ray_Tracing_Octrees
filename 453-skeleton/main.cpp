@@ -1,3 +1,4 @@
+// main.cpp
 #include <iostream>
 #include <vector>
 #include <cmath>
@@ -14,25 +15,44 @@
 #include <array>
 #include <functional>
 #include "RayTracerBVH.h"
+#include "VolumeRaycastRenderer.h"
 
+// Enhanced generateTestVolume: Multi-shell Sphere
 static std::vector<float> generateTestVolume(int dimX, int dimY, int dimZ) {
-	// Sphere
-	printf("Generating test volume: Sphere\n");
+	// Multi-shell sphere: outer shell and inner hollow core
+	printf("Generating test volume: Multi-shell Sphere\n");
 	std::vector<float> volume(dimX * dimY * dimZ, 0.f);
+
+	// Center of the volume
 	float cx = 0.5f * (dimX - 1);
 	float cy = 0.5f * (dimY - 1);
 	float cz = 0.5f * (dimZ - 1);
-	float radius = 0.3f * std::min({ float(dimX), float(dimY), float(dimZ) });
+
+	// Radii for outer shell and inner core
+	float rOuter = 0.4f * std::min({ float(dimX), float(dimY), float(dimZ) });
+	float rInner = 0.2f * std::min({ float(dimX), float(dimY), float(dimZ) });
+
 	for (int z = 0; z < dimZ; z++) {
 		for (int y = 0; y < dimY; y++) {
 			for (int x = 0; x < dimX; x++) {
-				float dx = x - cx, dy = y - cy, dz = z - cz;
+				float dx = x - cx;
+				float dy = y - cy;
+				float dz = z - cz;
 				float dist = std::sqrt(dx * dx + dy * dy + dz * dz);
 				int idx = x + y * dimX + z * (dimX * dimY);
-				volume[idx] = dist - radius; // negative => inside sphere
+
+				if (dist < rInner || dist > rOuter) {
+					// Outside the outer shell or inside the inner core: Empty
+					volume[idx] = -1.0f; // Density <= 0
+				}
+				else {
+					// Within the outer shell: Filled
+					volume[idx] = 1.0f; // Density > 0
+				}
 			}
 		}
 	}
+
 	return volume;
 }
 
@@ -90,7 +110,7 @@ static void recenterFilledVoxels(VoxelGrid& grid) {
 	}
 
 	if (filledMinX > filledMaxX) {
-		// Means no voxels were filled
+		// No filled voxels
 		std::cout << "(Recenter) No filled voxels. Skipping.\n";
 		return;
 	}
@@ -99,7 +119,7 @@ static void recenterFilledVoxels(VoxelGrid& grid) {
 	float centerY = 0.5f * (filledMinY + filledMaxY);
 	float centerZ = 0.5f * (filledMinZ + filledMaxZ);
 
-	// Shift min coords so the object's center is at world origin
+	// Shift min coordinates to center the grid around the origin
 	grid.minX -= centerX;
 	grid.minY -= centerY;
 	grid.minZ -= centerZ;
@@ -108,7 +128,7 @@ static void recenterFilledVoxels(VoxelGrid& grid) {
 		<< centerX << ", " << centerY << ", " << centerZ << ")\n";
 }
 
-// ========== A small function to gather octree wireframe lines ========== //
+// ========== Functions to Gather Octree Wireframe Lines ==========
 static void getCubeCorners(const VoxelGrid& grid, int x0, int y0, int z0,
 	int size, std::array<glm::vec3, 8>& corners) {
 	float vx = grid.voxelSize;
@@ -126,6 +146,7 @@ static void getCubeCorners(const VoxelGrid& grid, int x0, int y0, int z0,
 	corners[6] = base + glm::vec3(w, w, w);
 	corners[7] = base + glm::vec3(0, w, w);
 }
+
 static void generateOctreeWireframe(const VoxelGrid& grid,
 	const OctreeNode* node,
 	int x0, int y0, int z0,
@@ -157,20 +178,22 @@ static void generateOctreeWireframe(const VoxelGrid& grid,
 	}
 }
 
-// We define our two modes
 enum class RenderMode {
 	MarchingCubes,
 	DualContouring,
 	VoxelBlocks,
-	BVHRayTrace
+	BVHRayTrace,
+	VolumeRaycast
 };
+
 struct Assignment4 : public CallbackInterface {
 	Assignment4()
 		: wireframeMode(false), showOctreeWire(false),
 		currentMode(RenderMode::MarchingCubes),
 		aspect(1.f), rightMouseDown(false),
 		mouseOldX(0), mouseOldY(0),
-		camera(glm::radians(45.f), glm::radians(45.f), 3.f)
+		camera(glm::radians(45.f), glm::radians(45.f), 3.f),
+		peelPlaneZ(0.0f) // Initialize peeling plane
 	{}
 
 	void keyCallback(int key, int scancode, int action, int mods) override {
@@ -178,30 +201,45 @@ struct Assignment4 : public CallbackInterface {
 			if (key == GLFW_KEY_W) {
 				wireframeMode = !wireframeMode;
 			}
-			if (key == GLFW_KEY_S) {
+			else if (key == GLFW_KEY_S) {
 				showOctreeWire = !showOctreeWire;
 			}
-			if (key == GLFW_KEY_R) {
-				// Cycle through the three modes
+			else if (key == GLFW_KEY_R) {
+				// Cycle modes
 				if (currentMode == RenderMode::MarchingCubes) {
 					currentMode = RenderMode::VoxelBlocks;
-					std::cout << "Switched to Dual Contouring\n";
+					std::cout << "Switched to Voxel Blocks\n";
 				}
 				else if (currentMode == RenderMode::VoxelBlocks) {
 					currentMode = RenderMode::DualContouring;
-					std::cout << "Switched to Voxel Blocks\n";
+					std::cout << "Switched to Dual Contouring\n";
 				}
 				else if (currentMode == RenderMode::DualContouring) {
 					currentMode = RenderMode::BVHRayTrace;
 					std::cout << "Switched to BVH Ray Tracer\n";
+				}
+				else if (currentMode == RenderMode::BVHRayTrace) {
+					currentMode = RenderMode::VolumeRaycast;
+					std::cout << "Switched to Volume Raycast\n";
 				}
 				else {
 					currentMode = RenderMode::MarchingCubes;
 					std::cout << "Switched to Marching Cubes\n";
 				}
 			}
+			else if (key == GLFW_KEY_UP) {
+				// Move peeling plane upward
+				peelPlaneZ += 0.05f; // Adjust step size as needed
+				std::cout << "Peeling Plane Z: " << peelPlaneZ << "\n";
+			}
+			else if (key == GLFW_KEY_DOWN) {
+				// Move peeling plane downward
+				peelPlaneZ -= 0.05f; // Adjust step size as needed
+				std::cout << "Peeling Plane Z: " << peelPlaneZ << "\n";
+			}
 		}
 	}
+
 	void cursorPosCallback(double xpos, double ypos) override {
 		if (rightMouseDown) {
 			camera.incrementTheta(ypos - mouseOldY);
@@ -222,6 +260,7 @@ struct Assignment4 : public CallbackInterface {
 		CallbackInterface::windowSizeCallback(width, height);
 		aspect = (float)width / (float)height;
 	}
+
 	void viewPipeline(ShaderProgram& sp) {
 		glm::mat4 M(1.f);
 		glm::mat4 V = camera.getView();
@@ -241,71 +280,75 @@ struct Assignment4 : public CallbackInterface {
 	float aspect;
 	bool rightMouseDown;
 	double mouseOldX, mouseOldY;
+	float peelPlaneZ; // Current z position of the peeling plane
 };
 
 int main() {
-	glfwInit();
-	Window window(800, 800, "Octree + DC Without Holes");
+	// Initialize GLFW
+	if (!glfwInit()) {
+		std::cerr << "Failed to initialize GLFW.\n";
+		return -1;
+	}
+
+	// Create window
+	Window window(800, 800, "Octree + DC + Volume Raycast");
 	auto app = std::make_shared<Assignment4>();
 	window.setCallbacks(app);
 
 	bool useGDB = false;
-	std::string gdbPath = "./gdb_folder/Buildings_3D.gdb";
+	int dim = 64;
 
 	VoxelGrid grid;
 	if (useGDB) {
-		// Possibly an empty vector => first building
-		std::vector<int> targetIDs = { };
-		grid = loadBuildingsFromGDB(gdbPath, 1.0f, targetIDs);
-
-		// Re-center after load, *before* building the octree
-		recenterFilledVoxels(grid);
-
-		if (grid.data.empty()) {
-			std::cerr << "Voxel grid is empty. Exiting.\n";
-			return -1;
-		}
+		// Load from GDB...
+		// recenterFilledVoxels(grid);
 	}
 	else {
-		// fallback sphere
-		int dim = 128;
+		// Fallback multi-shell sphere
 		auto vol = generateTestVolume(dim, dim, dim);
 		grid.dimX = dim; grid.dimY = dim; grid.dimZ = dim;
 		grid.minX = -0.5f; grid.minY = -0.5f; grid.minZ = -0.5f;
 		grid.voxelSize = 1.f / dim;
 		grid.data.resize(dim * dim * dim, VoxelState::EMPTY);
 
-		// *** ADDED an epsilon to ensure borderline volumes classify consistently
 		const float EPS = 1e-7f;
 		for (int z = 0; z < dim; z++) {
 			for (int y = 0; y < dim; y++) {
 				for (int x = 0; x < dim; x++) {
 					int idx = x + y * dim + z * (dim * dim);
-					if (vol[idx] < -EPS) {
-						grid.data[idx] = VoxelState::FILLED;
+					if (vol[idx] > EPS) { // Changed to > EPS based on new generateTestVolume
+						grid.data[idx] = VoxelState::FILLED;  // Inside shell => FILLED
 					}
 					else {
-						grid.data[idx] = VoxelState::EMPTY;
+						grid.data[idx] = VoxelState::EMPTY;   // Core and outside => EMPTY
 					}
 				}
 			}
 		}
 	}
 
+	// Recenter the voxel grid if necessary
+	recenterFilledVoxels(grid);
+
 	// (2) Build the octree
 	OctreeNode* root = createOctreeFromVoxelGrid(grid);
 
-	// (3) Prepare the three "renderers"
+	// (3) Prepare the "renderers"
 	MarchingCubesRenderer mcRenderer;
 	AdaptiveDualContouringRenderer dcRenderer;
 	VoxelCubeRenderer blockRenderer;
 	RayTracerBVH bvhRayTracer;
 	bvhRayTracer.setOctree(root, grid);
 
-	// (4) We store geometry in GPU buffers for MC and DC
+	// (3b) The volume raycast renderer
+	VolumeRaycastRenderer volRenderer;
+	volRenderer.initVolume(grid);
+
+	// GPU geometry for MC/DC
 	CPU_Geometry cpuGeom;
 	GPU_Geometry gpuGeom;
-	// For wireframe lines
+
+	// Octree wireframe
 	CPU_Geometry cpuWire;
 	GPU_Geometry gpuWireGeom;
 	std::vector<glm::vec3> wireLines;
@@ -316,13 +359,12 @@ int main() {
 		gpuWireGeom.setVerts(cpuWire.verts);
 	}
 
+	// Shader for wireframe and other geometry
 	ShaderProgram shader("453-skeleton/shaders/test.vert", "453-skeleton/shaders/test.frag");
 
-	// Triangle cache for MC/DC
 	std::vector<MCTriangle> triCache;
 	RenderMode oldMode = app->currentMode;
 
-	// Basic game loop
 	using clock_t = std::chrono::high_resolution_clock;
 	auto lastTime = clock_t::now();
 	int frameCount = 0;
@@ -330,12 +372,19 @@ int main() {
 	while (!window.shouldClose()) {
 		glfwPollEvents();
 
-		glClearColor(01.0f, 1.0f, 1.0f, 1);
+		// Clear screen with black
+		glClearColor(0.0f, 0.0f, 0.0f, 1.0f);
 		glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT);
-		glEnable(GL_DEPTH_TEST);
 
-		shader.use();
-		app->viewPipeline(shader);
+		// Disable depth test for volume pass
+		glDisable(GL_DEPTH_TEST);
+
+		if (app->currentMode != RenderMode::VolumeRaycast) {
+			// Enable depth test for geometry-based modes
+			glEnable(GL_DEPTH_TEST);
+			shader.use();
+			app->viewPipeline(shader);
+		}
 
 		// If user switched mode, clear the caches
 		if (app->currentMode != oldMode) {
@@ -343,8 +392,30 @@ int main() {
 			oldMode = app->currentMode;
 		}
 
-		if (app->currentMode == RenderMode::MarchingCubes) {
-			// (a) build triangle mesh once if needed
+		if (app->currentMode == RenderMode::VolumeRaycast) {
+			// Enable blending for transparency
+			glEnable(GL_BLEND);
+			glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
+
+			// Toggle wireframe mode
+			if (app->wireframeMode) {
+				glPolygonMode(GL_FRONT_AND_BACK, GL_LINE);
+			}
+
+			// Fullscreen pass with peeling
+			volRenderer.drawRaycast(app->camera,
+				app->aspect,
+				window.getWidth(),
+				window.getHeight());
+
+			// Reset polygon mode and disable blending
+			glPolygonMode(GL_FRONT_AND_BACK, GL_FILL);
+			glDisable(GL_BLEND);
+
+			// Update the peeling plane based on user input
+			volRenderer.updatePeelPlane(app->peelPlaneZ);
+		}
+		else if (app->currentMode == RenderMode::MarchingCubes) {
 			if (triCache.empty()) {
 				triCache = renderOctree(root, grid, mcRenderer);
 				cpuGeom.verts.clear();
@@ -354,7 +425,7 @@ int main() {
 					for (int i = 0; i < 3; i++) {
 						cpuGeom.verts.push_back(t.v[i]);
 						cpuGeom.normals.push_back(t.normal[i]);
-						cpuGeom.cols.push_back({ 0.8f,0.8f,0.8f });
+						cpuGeom.cols.push_back({ 0.8f, 0.8f, 0.8f });
 					}
 				}
 				gpuGeom.bind();
@@ -362,7 +433,6 @@ int main() {
 				gpuGeom.setNormals(cpuGeom.normals);
 				gpuGeom.setCols(cpuGeom.cols);
 			}
-			// (b) draw the mesh
 			if (app->wireframeMode) {
 				glPolygonMode(GL_FRONT_AND_BACK, GL_LINE);
 			}
@@ -371,7 +441,6 @@ int main() {
 			glPolygonMode(GL_FRONT_AND_BACK, GL_FILL);
 		}
 		else if (app->currentMode == RenderMode::DualContouring) {
-			// (a) build DC triangle mesh once if needed
 			if (triCache.empty()) {
 				triCache = renderOctree(root, grid, dcRenderer);
 				cpuGeom.verts.clear();
@@ -381,7 +450,7 @@ int main() {
 					for (int i = 0; i < 3; i++) {
 						cpuGeom.verts.push_back(t.v[i]);
 						cpuGeom.normals.push_back(t.normal[i]);
-						cpuGeom.cols.push_back({ 0.8f,0.8f,0.8f });
+						cpuGeom.cols.push_back({ 0.8f, 0.8f, 0.8f });
 					}
 				}
 				gpuGeom.bind();
@@ -389,7 +458,6 @@ int main() {
 				gpuGeom.setNormals(cpuGeom.normals);
 				gpuGeom.setCols(cpuGeom.cols);
 			}
-			// (b) draw
 			if (app->wireframeMode) {
 				glPolygonMode(GL_FRONT_AND_BACK, GL_LINE);
 			}
@@ -400,7 +468,6 @@ int main() {
 		else if (app->currentMode == RenderMode::VoxelBlocks) {
 			if (triCache.empty()) {
 				triCache = renderOctree(root, grid, blockRenderer);
-				// build GPU geometry from triCache
 				cpuGeom.verts.clear();
 				cpuGeom.normals.clear();
 				cpuGeom.cols.clear();
@@ -408,7 +475,6 @@ int main() {
 					for (int i = 0; i < 3; i++) {
 						cpuGeom.verts.push_back(t.v[i]);
 						cpuGeom.normals.push_back(t.normal[i]);
-						// color the blocks grey or something
 						cpuGeom.cols.push_back(glm::vec3(0.6f, 0.6f, 0.6f));
 					}
 				}
@@ -417,7 +483,6 @@ int main() {
 				gpuGeom.setNormals(cpuGeom.normals);
 				gpuGeom.setCols(cpuGeom.cols);
 			}
-			// draw
 			if (app->wireframeMode) {
 				glPolygonMode(GL_FRONT_AND_BACK, GL_LINE);
 			}
@@ -426,15 +491,10 @@ int main() {
 			glPolygonMode(GL_FRONT_AND_BACK, GL_FILL);
 		}
 		else if (app->currentMode == RenderMode::BVHRayTrace) {
-			// Use the ray tracer to generate a triangle mesh on the fly.
 			if (triCache.empty()) {
-				// Render the ray traced scene.
-				// For example, obtain the view and projection matrices and pass the viewport dimensions.
 				glm::mat4 V = app->camera.getView();
 				glm::mat4 P = glm::perspective(glm::radians(45.f), app->aspect, 0.01f, 1000.f);
-				// Get triangles from the ray tracer.
 				triCache = bvhRayTracer.renderScene(V, P, window.getWidth(), window.getHeight());
-				// Build geometry buffers
 				cpuGeom.verts.clear();
 				cpuGeom.normals.clear();
 				cpuGeom.cols.clear();
@@ -458,34 +518,40 @@ int main() {
 			glPolygonMode(GL_FRONT_AND_BACK, GL_FILL);
 		}
 
-
-
-		// Possibly draw wire
+		// Possibly draw octree wireframe
 		if (app->showOctreeWire) {
+			shader.use(); // Bind the shader for wireframe rendering
+			app->viewPipeline(shader);
 			GLint uColor = glGetUniformLocation(shader, "overrideColor");
-			glUniform3f(uColor, 1.f, 0.f, 0.f);
+			glUniform3f(uColor, 1.f, 0.f, 0.f); // Set wireframe color to red
 			gpuWireGeom.bind();
 			glDrawArrays(GL_LINES, 0, (GLsizei)cpuWire.verts.size());
-			glUniform3f(uColor, 1.f, 1.f, 1.f);
+			glUniform3f(uColor, 1.f, 1.f, 1.f); // Reset color
 		}
 
+		// Swap buffers
 		window.swapBuffers();
 
-		// FPS
+		// FPS counter
 		frameCount++;
 		auto now = clock_t::now();
 		double dt = std::chrono::duration<double>(now - lastTime).count();
 		if (dt >= 1.0) {
 			double fps = (double)frameCount / dt;
 			std::cout << "FPS: " << fps << "  Mode: ";
-			if (app->currentMode == RenderMode::MarchingCubes) std::cout << "MC\n";
-			else if (app->currentMode == RenderMode::DualContouring) std::cout << "DC\n";
-			else std::cout << "RayTracer\n";
+			switch (app->currentMode) {
+			case RenderMode::MarchingCubes:    std::cout << "MC\n"; break;
+			case RenderMode::DualContouring:   std::cout << "DC\n"; break;
+			case RenderMode::VoxelBlocks:      std::cout << "Blocks\n"; break;
+			case RenderMode::BVHRayTrace:      std::cout << "RayTrace\n"; break;
+			case RenderMode::VolumeRaycast:    std::cout << "Volume\n"; break;
+			}
 			frameCount = 0;
 			lastTime = now;
 		}
 	}
 
+	// Clean up and terminate
 	glfwTerminate();
 	return 0;
 }

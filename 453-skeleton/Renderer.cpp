@@ -350,90 +350,140 @@ void AdaptiveDualContouringRenderer::buildUniformDCCells(
 std::vector<MCTriangle>
 AdaptiveDualContouringRenderer::buildUniformDCMesh(
 	const VoxelGrid& grid,
-	int x0, int y0, int z0,
+	int x0, int y0, int z0,    // origin (voxel indices) of this DC cell block
 	int subDimX, int subDimY, int subDimZ,
 	const std::vector<DCCell>& dcCells,
 	int lodLevel)
 {
 	std::vector<MCTriangle> out;
 
-	auto cellIndex = [&](int lx, int ly, int lz) {
+	// Helper lambda to get the 1D index within the dcCells vector:
+	auto cellIndex = [&](int lx, int ly, int lz) -> int {
 		return lx + subDimX * (ly + subDimY * lz);
 		};
-	auto getCellPtr = [&](int lx, int ly, int lz)-> const DCCell* {
-		if (lx < 0 || lx >= subDimX || ly < 0 || ly >= subDimY || lz < 0 || lz >= subDimZ) {
+
+	// Helper lambda that returns a pointer to a mixed cell (or nullptr if out-of-range or not mixed)
+	auto getCellPtr = [&](int lx, int ly, int lz) -> const DCCell* {
+		if (lx < 0 || lx >= subDimX || ly < 0 || ly >= subDimY || lz < 0 || lz >= subDimZ)
 			return nullptr;
-		}
 		const DCCell& c = dcCells[cellIndex(lx, ly, lz)];
 		return c.isMixed ? &c : nullptr;
 		};
 
+	// For each cell in the grid, if it is mixed, attempt to build faces on all six directions.
+	// (In a production system you might want to restrict face generation to one side to avoid duplicates,
+	// but here we show separate faces for both positive and negative directions.)
 	for (int lz = 0; lz < subDimZ; ++lz) {
 		for (int ly = 0; ly < subDimY; ++ly) {
 			for (int lx = 0; lx < subDimX; ++lx) {
-				const DCCell& c0 = dcCells[cellIndex(lx, ly, lz)];
-				if (!c0.isMixed) continue;
+				const DCCell* c0 = getCellPtr(lx, ly, lz);
+				if (!c0) continue;
+				glm::vec3 v0 = c0->dcVertex;
+				glm::vec3 n0 = c0->dcNormal;
 
-				glm::vec3 v0 = c0.dcVertex;
-				glm::vec3 n0 = c0.dcNormal;
-
-				// +X face
-				if (lx + 1 < subDimX) {
-					const DCCell* cx = getCellPtr(lx + 1, ly, lz);
-					if (cx) {
-						// +Y direction from c0, cx
-						if (ly + 1 < subDimY) {
-							auto cy = getCellPtr(lx, ly + 1, lz);
-							auto cxy = getCellPtr(lx + 1, ly + 1, lz);
-							if (cy && cxy) {
-								addQuad(
-									v0, cx->dcVertex,
-									cy->dcVertex, cxy->dcVertex,
-									n0, cx->dcNormal,
-									cy->dcNormal, cxy->dcNormal,
-									out
-								);
-							}
-						}
-						// +Z direction from c0, cx
-						if (lz + 1 < subDimZ) {
-							auto cz = getCellPtr(lx, ly, lz + 1);
-							auto cxz = getCellPtr(lx + 1, ly, lz + 1);
-							if (cz && cxz) {
-								addQuad(
-									v0, cx->dcVertex,
-									cz->dcVertex, cxz->dcVertex,
-									n0, cx->dcNormal,
-									cz->dcNormal, cxz->dcNormal,
-									out
-								);
-							}
-						}
+				// --- +X face: between cell (lx,ly,lz) and (lx+1,ly,lz) ---
+				if (const DCCell* cx = getCellPtr(lx + 1, ly, lz)) {
+					// Form a quad over the (y,z) subcell
+					if (ly + 1 < subDimY && getCellPtr(lx, ly + 1, lz) && getCellPtr(lx + 1, ly + 1, lz)) {
+						addQuad(v0, cx->dcVertex,
+							getCellPtr(lx, ly + 1, lz)->dcVertex,
+							getCellPtr(lx + 1, ly + 1, lz)->dcVertex,
+							n0, cx->dcNormal,
+							getCellPtr(lx, ly + 1, lz)->dcNormal,
+							getCellPtr(lx + 1, ly + 1, lz)->dcNormal,
+							out);
+					}
+					if (lz + 1 < subDimZ && getCellPtr(lx, ly, lz + 1) && getCellPtr(lx + 1, ly, lz + 1)) {
+						addQuad(v0, cx->dcVertex,
+							getCellPtr(lx, ly, lz + 1)->dcVertex,
+							getCellPtr(lx + 1, ly, lz + 1)->dcVertex,
+							n0, cx->dcNormal,
+							getCellPtr(lx, ly, lz + 1)->dcNormal,
+							getCellPtr(lx + 1, ly, lz + 1)->dcNormal,
+							out);
 					}
 				}
 
-				// If we skip +X, we still want to connect +Y, +Z
-				// +Y face
-				if (ly + 1 < subDimY) {
-					const DCCell* cy = getCellPtr(lx, ly + 1, lz);
-					if (cy && (lz + 1 < subDimZ)) {
-						// Connect +Z diagonal
-						auto cz = getCellPtr(lx, ly, lz + 1);
-						auto cyz = getCellPtr(lx, ly + 1, lz + 1);
-						if (cz && cyz) {
-							addQuad(
-								v0, cy->dcVertex,
-								cz->dcVertex, cyz->dcVertex,
-								n0, cy->dcNormal,
-								cz->dcNormal, cyz->dcNormal,
-								out
-							);
-						}
+				// --- -X face: between cell (lx,ly,lz) and (lx-1,ly,lz) ---
+				if (const DCCell* cl = getCellPtr(lx - 1, ly, lz)) {
+					// For -X, we reverse the ordering so that the face orientation is consistent.
+					if (ly + 1 < subDimY && getCellPtr(lx - 1, ly + 1, lz) && getCellPtr(lx, ly + 1, lz)) {
+						addQuad(cl->dcVertex, v0,
+							getCellPtr(lx - 1, ly + 1, lz)->dcVertex,
+							getCellPtr(lx, ly + 1, lz)->dcVertex,
+							cl->dcNormal, n0,
+							getCellPtr(lx - 1, ly + 1, lz)->dcNormal,
+							getCellPtr(lx, ly + 1, lz)->dcNormal,
+							out);
+					}
+					if (lz + 1 < subDimZ && getCellPtr(lx - 1, ly, lz + 1) && getCellPtr(lx, ly, lz + 1)) {
+						addQuad(cl->dcVertex, v0,
+							getCellPtr(lx - 1, ly, lz + 1)->dcVertex,
+							getCellPtr(lx, ly, lz + 1)->dcVertex,
+							cl->dcNormal, n0,
+							getCellPtr(lx - 1, ly, lz + 1)->dcNormal,
+							getCellPtr(lx, ly, lz + 1)->dcNormal,
+							out);
+					}
+				}
+
+				// --- +Y face: between cell (lx,ly,lz) and (lx,ly+1,lz) ---
+				if (const DCCell* cy = getCellPtr(lx, ly + 1, lz)) {
+					if (lz + 1 < subDimZ && getCellPtr(lx, ly, lz + 1) && getCellPtr(lx, ly + 1, lz + 1)) {
+						addQuad(v0, cy->dcVertex,
+							getCellPtr(lx, ly, lz + 1)->dcVertex,
+							getCellPtr(lx, ly + 1, lz + 1)->dcVertex,
+							n0, cy->dcNormal,
+							getCellPtr(lx, ly, lz + 1)->dcNormal,
+							getCellPtr(lx, ly + 1, lz + 1)->dcNormal,
+							out);
+					}
+				}
+
+				// --- -Y face: between cell (lx,ly,lz) and (lx,ly-1,lz) ---
+				if (const DCCell* cy = getCellPtr(lx, ly - 1, lz)) {
+					if (lz + 1 < subDimZ && getCellPtr(lx, ly - 1, lz + 1) && getCellPtr(lx, ly, lz + 1)) {
+						// Reverse the order when generating -Y
+						addQuad(cy->dcVertex, v0,
+							getCellPtr(lx, ly - 1, lz + 1)->dcVertex,
+							getCellPtr(lx, ly, lz + 1)->dcVertex,
+							cy->dcNormal, n0,
+							getCellPtr(lx, ly - 1, lz + 1)->dcNormal,
+							getCellPtr(lx, ly, lz + 1)->dcNormal,
+							out);
+					}
+				}
+
+				// --- +Z face: between cell (lx,ly,lz) and (lx,ly,lz+1) ---
+				if (const DCCell* cz = getCellPtr(lx, ly, lz + 1)) {
+					if (ly + 1 < subDimY && getCellPtr(lx, ly + 1, lz) && getCellPtr(lx, ly + 1, lz + 1)) {
+						addQuad(v0, cz->dcVertex,
+							getCellPtr(lx, ly + 1, lz)->dcVertex,
+							getCellPtr(lx, ly + 1, lz + 1)->dcVertex,
+							n0, cz->dcNormal,
+							getCellPtr(lx, ly + 1, lz)->dcNormal,
+							getCellPtr(lx, ly + 1, lz + 1)->dcNormal,
+							out);
+					}
+				}
+
+				// --- -Z face: between cell (lx,ly,lz) and (lx,ly,lz-1) ---
+				if (const DCCell* cz = getCellPtr(lx, ly, lz - 1)) {
+					if (ly + 1 < subDimY && getCellPtr(lx, ly, lz - 1) && getCellPtr(lx, ly + 1, lz - 1) && getCellPtr(lx, ly + 1, lz)) {
+						// Reverse the ordering for -Z face:
+						addQuad(cz->dcVertex, v0,
+							getCellPtr(lx, ly + 1, lz - 1)->dcVertex,
+							getCellPtr(lx, ly + 1, lz)->dcVertex,
+							cz->dcNormal, n0,
+							getCellPtr(lx, ly + 1, lz - 1)->dcNormal,
+							getCellPtr(lx, ly + 1, lz)->dcNormal,
+							out);
 					}
 				}
 			}
 		}
 	}
+
 	return out;
 }
 
