@@ -16,6 +16,8 @@
 #include <functional>
 #include "RayTracerBVH.h"
 #include "VolumeRaycastRenderer.h"
+#include "CacheUtils.h"
+
 
 // Enhanced generateTestVolume: Multi-shell Sphere
 static std::vector<float> generateTestVolume(int dimX, int dimY, int dimZ) {
@@ -264,7 +266,11 @@ struct Assignment4 : public CallbackInterface {
 	}
 	void windowSizeCallback(int width, int height) override {
 		CallbackInterface::windowSizeCallback(width, height);
-		aspect = (float)width / (float)height;
+		// Avoid division by zero: if height is zero, set it to 1.
+		if (height <= 0)
+			height = 1;
+
+		aspect = static_cast<float>(width) / static_cast<float>(height);
 	}
 
 	void viewPipeline(ShaderProgram& sp) {
@@ -301,22 +307,58 @@ int main() {
 	auto app = std::make_shared<Assignment4>();
 	window.setCallbacks(app);
 
-	bool useGDB = false;
+	bool useGDB = true;
 	std::string gdbPath = "./gdb_folder/Buildings_3D.gdb";
-	int dim = 64;
+	int dim = 2.0f;
+	int maxBuildings = 5;
+	float voxelSize = 5.0f;
+	int maxScanFeatures = 10000000000;
+	float binSize = 500.0f;        // 500m bin
+	std::vector<int> structureIDs = { 1371763, 1427271, 1372219, 2327658 }; // example IDs
+
 
 	VoxelGrid grid;
+	std::string cacheFilename = "sceneCache.bin";
+
 	if (useGDB) {
 		// Possibly an empty vector => first building
-		std::vector<int> targetIDs = { };
-		grid = loadBuildingsFromGDB(gdbPath, 1.0f, targetIDs);
+		/*std::vector<int> targetIDs = { };
+		grid = loadBuildingsFromGDB(gdbPath, 1.0f, targetIDs);*/
 
-		// Re-center after load, *before* building the octree
-		recenterFilledVoxels(grid);
+		// First, try to load the grid from a cache file.
+		if (!loadVoxelGrid(cacheFilename, grid)) {
+			//auto tallestBox = detectTallestArea(gdbPath, maxScanFeatures, maxBuildings); // top 10 tallest
+			//grid = loadBuildingsFromGDB(gdbPath, voxelSize,
+			//	tallestBox.minX, tallestBox.minY,
+			//	tallestBox.maxX, tallestBox.maxY,
+			//	maxBuildings);
 
-		if (grid.data.empty()) {
-			std::cerr << "Voxel grid is empty. Exiting.\n";
-			return -1;
+			grid = loadBuildingsFromGDB(gdbPath, voxelSize, structureIDs);
+
+			//// 1) Find the tallest building a1rea
+			//BoundingBox2D area = findSkyscraperArea(gdbPath, maxScanFeatures, binSize);
+
+			//// 2) Load just that building (or bounding region) from the GDB
+			//grid = loadBuildingsFromGDB(
+			//	gdbPath,
+			//	voxelSize,
+			//	area.minX, // bounding region in X
+			//	area.minY,
+			//	area.maxX,
+			//	area.maxY,
+			//	maxBuildings
+			//);
+
+			// Re-center after load, *before* building the octree
+			recenterFilledVoxels(grid);
+
+			if (grid.data.empty()) {
+				std::cerr << "Voxel grid is empty. Exiting.\n";
+				return -1;
+			}
+
+			// Save the processed grid to a cache file.
+			saveVoxelGrid(cacheFilename, grid);
 		}
 	}
 	else {

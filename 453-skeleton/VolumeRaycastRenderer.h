@@ -34,6 +34,7 @@ private:
 	// OpenGL texture IDs
 	unsigned int volumeTextureID; // 3D texture for volume density
 	unsigned int maskTextureID;   // 3D texture for masking (peeling)
+	glm::vec3 boxMin, boxMax; // The world-space bounding box corners
 
 	// Shader program ID for raycasting and splatting
 	unsigned int raycastShaderProg;

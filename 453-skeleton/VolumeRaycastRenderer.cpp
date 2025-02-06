@@ -42,30 +42,30 @@ uniform mat4 invView;
 uniform mat4 invProj;
 uniform vec3 camPos;
 
+// Volume bounding box in world space
+uniform vec3 uBoxMin;
+uniform vec3 uBoxMax;
+
 // Textures
 uniform sampler3D uVolumeTex;
 uniform sampler3D uMaskTex;
 
 // Raymarching parameters
 uniform float stepSize;
-uniform float voxelSize;
 
 // Lighting parameters
 uniform vec3 lightDir;    // Should be normalized
 uniform vec3 lightColor;  // e.g., white
 uniform float ambient;
 
-// Constants
-const int MAX_STEPS = 1024;
-const float OPACITY_THRESHOLD = 0.95;
+const int MAX_STEPS = 2048;
+const float OPACITY_THRESHOLD = 0.99;
 
-// Helper function: Ray-box intersection for [-0.5, 0.5]^3
-vec2 intersectBox(in vec3 rayOrig, in vec3 rayDir) {
-    vec3 minB = vec3(-0.5);
-    vec3 maxB = vec3( 0.5);
-
-    vec3 t1 = (minB - rayOrig) / rayDir;
-    vec3 t2 = (maxB - rayOrig) / rayDir;
+// Helper: Ray-box intersection with boxMin, boxMax in world space
+vec2 intersectBox(in vec3 rayOrig, in vec3 rayDir, in vec3 bmin, in vec3 bmax)
+{
+    vec3 t1 = (bmin - rayOrig) / rayDir;
+    vec3 t2 = (bmax - rayOrig) / rayDir;
 
     vec3 tNear = min(t1, t2);
     vec3 tFar  = max(t1, t2);
@@ -73,122 +73,107 @@ vec2 intersectBox(in vec3 rayOrig, in vec3 rayDir) {
     float tN = max(tNear.x, max(tNear.y, tNear.z));
     float tF = min(tFar.x,  min(tFar.y,  tFar.z));
 
-    return vec2(tN, tF);
+    return vec2(tN, tF); // (tNear, tFar)
 }
 
-// Helper function: Sample the volume density
-float sampleVolume(vec3 pos) {
-    return texture(uVolumeTex, pos).r;
+// Sample the volume
+float sampleVolume(vec3 uvw) {
+    return texture(uVolumeTex, uvw).r;
 }
 
-// Helper function: Compute gradient using central differences
-vec3 computeGradient(vec3 pos, float delta) {
-    // Sample +/- delta in x, y, z
-    vec3 ppx = clamp(pos + vec3(delta, 0.0, 0.0), 0.0, 1.0);
-    vec3 pmx = clamp(pos - vec3(delta, 0.0, 0.0), 0.0, 1.0);
-    vec3 ppy = clamp(pos + vec3(0.0, delta, 0.0), 0.0, 1.0);
-    vec3 pmy = clamp(pos - vec3(0.0, delta, 0.0), 0.0, 1.0);
-    vec3 ppz = clamp(pos + vec3(0.0, 0.0, delta), 0.0, 1.0);
-    vec3 pmz = clamp(pos - vec3(0.0, 0.0, delta), 0.0, 1.0);
-
-    float dx = sampleVolume(ppx) - sampleVolume(pmx);
-    float dy = sampleVolume(ppy) - sampleVolume(pmy);
-    float dz = sampleVolume(ppz) - sampleVolume(pmz);
-
-    return vec3(dx, dy, dz) / (2.0 * delta);
+// For gradient, we can do a small offset in normalized texture space
+vec3 computeGradient(vec3 uvw, float deltaUV) {
+    float v0 = sampleVolume(clamp(uvw + vec3(deltaUV,0,0), 0.0, 1.0));
+    float v1 = sampleVolume(clamp(uvw - vec3(deltaUV,0,0), 0.0, 1.0));
+    float v2 = sampleVolume(clamp(uvw + vec3(0,deltaUV,0), 0.0, 1.0));
+    float v3 = sampleVolume(clamp(uvw - vec3(0,deltaUV,0), 0.0, 1.0));
+    float v4 = sampleVolume(clamp(uvw + vec3(0,0,deltaUV), 0.0, 1.0));
+    float v5 = sampleVolume(clamp(uvw - vec3(0,0,deltaUV), 0.0, 1.0));
+    return vec3(v0 - v1, v2 - v3, v4 - v5) * 0.5;
 }
 
 void main()
 {
-    // Reconstruct NDC coordinates
+    // Reconstruct from screen => view => world
     vec2 ndc = vec2(2.0 * TexCoord.x - 1.0, 1.0 - 2.0 * TexCoord.y);
     vec4 clipPos = vec4(ndc, 1.0, 1.0);
 
-    // View space
     vec4 viewPos = invProj * clipPos;
     viewPos /= viewPos.w;
 
-    // World space
     vec4 wPos = invView * viewPos;
     vec3 rayDir = normalize(wPos.xyz - camPos);
     vec3 rayOrig = camPos;
 
-    // Ray-box intersection
-    vec2 tBox = intersectBox(rayOrig, rayDir);
+    // Ray-box intersection for [uBoxMin, uBoxMax]
+    vec2 tBox = intersectBox(rayOrig, rayDir, uBoxMin, uBoxMax);
     float tNear = tBox.x;
     float tFar  = tBox.y;
 
-    // If no intersection or behind camera
     if (tNear > tFar || tFar < 0.0) {
-        FragColor = vec4(0.0, 0.0, 0.0, 1.0);
+        FragColor = vec4(0,0,0,1);
         return;
     }
 
-    // Initialize
     float t = max(tNear, 0.0);
-    float tExit = min(tFar, 100.0); // Arbitrary far plane
-    float delta = voxelSize; // Step size for gradient calculation
+    float tExit = tFar;
 
-    // Accumulation variables
-    vec3 accumColor = vec3(0.0);
+    // For shading
+    float deltaUV = 1.0 / 512.0; // or compute something better based on volume dimension
+    vec3 accumColor = vec3(0);
     float accumAlpha = 0.0;
 
-    // Main raymarch loop with integrated splatting
-    for(int i = 0; i < MAX_STEPS && t <= tExit; i++) {
-        vec3 pos = rayOrig + t * rayDir;        // Current position in world space
-        vec3 texCoord3 = pos + vec3(0.5);       // Map [-0.5..+0.5] to [0..1]
+    // Raymarch
+    for(int i=0; i<MAX_STEPS && t <= tExit; i++) {
+        vec3 posWorld = rayOrig + t*rayDir; 
+        // Convert to [0..1]^3 for sampling
+        vec3 uvw = (posWorld - uBoxMin) / (uBoxMax - uBoxMin);
 
-        // Check if texCoord3 is within [0,1]^3
-        if(any(lessThan(texCoord3, vec3(0.0))) || any(greaterThan(texCoord3, vec3(1.0)))) {
+        // Check bounds
+        if(any(lessThan(uvw, vec3(0))) || any(greaterThan(uvw, vec3(1)))) {
             t += stepSize;
             continue;
         }
 
-        // Mask check
-        float maskVal = texture(uMaskTex, texCoord3).r;
-        if(maskVal > 0.5) {
+        // Check mask
+        float m = texture(uMaskTex, uvw).r;
+        if(m > 0.5) {
             t += stepSize;
             continue;
         }
 
-        // Sample volume density
-        float density = sampleVolume(texCoord3);
+        // Sample density
+        float density = sampleVolume(uvw);
         if(density > 0.0) {
-            // Compute gradient for shading
-            vec3 grad = computeGradient(texCoord3, delta);
+            // Compute gradient
+            vec3 grad = computeGradient(uvw, deltaUV);
+            if(length(grad) < 1e-5) {
+                grad = vec3(0,0,1);
+            }
+            vec3 normal = normalize(grad);
 
-            // Normalize gradient to get normal
-            vec3 normal = normalize(length(grad) > 1e-5 ? grad : vec3(0.0, 0.0, 1.0));
+            // Basic lambert shading
+            float diff = max(dot(normal, lightDir), 0.0);
+            vec3 color = vec3(1.0, 0.5, 0.2); 
+            vec3 shading = ambient*lightColor + diff*lightColor;
+            vec3 finalColor = color*shading;
 
-            // Lambertian shading
-            float diffuse = max(dot(normal, lightDir), 0.0);
-            vec3 shadedColor = ambient * lightColor + diffuse * lightColor;
-
-            // Base color (can be modulated based on density or other factors)
-            vec3 baseColor = vec3(1.0, 0.5, 0.2); // Example: Orange-like color
-            vec3 finalColor = baseColor * shadedColor;
-
-            // Compute opacity based on density
-            float alpha = density * 0.1; // Scale opacity as needed
-
-            // Front-to-back compositing
-            accumColor += (1.0 - accumAlpha) * finalColor * alpha;
-            accumAlpha += (1.0 - accumAlpha) * alpha;
-
-            // Early termination if opacity threshold is reached
+            // Opacity
+            float alpha = 0.1 * density; // tweak as needed
+            accumColor += (1.0 - accumAlpha)*finalColor*alpha;
+            accumAlpha += (1.0 - accumAlpha)*alpha;
             if(accumAlpha >= OPACITY_THRESHOLD) {
                 break;
             }
         }
 
-        // Step forward along the ray
         t += stepSize;
     }
 
-    // Final color with accumulated opacity
     FragColor = vec4(accumColor, accumAlpha);
 }
 )END";
+
 
 // -----------------------------
 // Helper Functions
@@ -294,8 +279,19 @@ void VolumeRaycastRenderer::initVolume(const VoxelGrid& grid)
 	volDimX = grid.dimX;
 	volDimY = grid.dimY;
 	volDimZ = grid.dimZ;
-
 	gridPtr = &grid;
+
+	// Compute the bounding box in world space
+	boxMin = glm::vec3(grid.minX, grid.minY, grid.minZ);
+	boxMax = glm::vec3(grid.minX + grid.dimX * grid.voxelSize,
+		grid.minY + grid.dimY * grid.voxelSize,
+		grid.minZ + grid.dimZ * grid.voxelSize);
+
+	std::cout << "[VolumeRaycastRenderer] World BBox min="
+		<< boxMin.x << ", " << boxMin.y << ", " << boxMin.z
+		<< "  max="
+		<< boxMax.x << ", " << boxMax.y << ", " << boxMax.z
+		<< std::endl;
 
 	// Convert voxel states to float data
 	std::vector<float> volumeData(volDimX * volDimY * volDimZ, 0.0f);
@@ -422,6 +418,10 @@ void VolumeRaycastRenderer::drawRaycast(const Camera& cam,
 	if (!raycastShaderProg || !volumeTextureID || !maskTextureID) return;
 
 	glUseProgram(raycastShaderProg);
+	GLint locBoxMin = glGetUniformLocation(raycastShaderProg, "uBoxMin");
+	GLint locBoxMax = glGetUniformLocation(raycastShaderProg, "uBoxMax");
+	if (locBoxMin >= 0) glUniform3fv(locBoxMin, 1, glm::value_ptr(boxMin));
+	if (locBoxMax >= 0) glUniform3fv(locBoxMax, 1, glm::value_ptr(boxMax));
 
 	// Build inverse matrices
 	glm::mat4 V = cam.getView();
@@ -455,7 +455,9 @@ void VolumeRaycastRenderer::drawRaycast(const Camera& cam,
 	// Set step size
 	GLint locStep = glGetUniformLocation(raycastShaderProg, "stepSize");
 	if (locStep >= 0) {
-		glUniform1f(locStep, 0.005f);
+		float diag = glm::length(boxMax - boxMin);
+		float step = diag / 400.0f;
+		glUniform1f(locStep, step);
 	}
 
 	// Set lighting uniforms
