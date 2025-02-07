@@ -20,9 +20,13 @@ public:
 	void incrementTheta(float dt);
 	void incrementPhi(float dp);
 	void incrementR(float dr);
+	void pan(float dx, float dy);
 
 private:
 	float theta;
 	float phi;
 	float radius;
+	const float MIN_RADIUS = 0.1f;
+	const float MAX_RADIUS = 1000.0f;
+	glm::vec3 target;
 };

@@ -16,9 +16,14 @@ VoxelGrid loadBuildingsFromGDB(const std::string& gdbPath,
 	float maxXUser,
 	float maxYUser,
 	int   maxBuildings);
+
 VoxelGrid loadBuildingsFromGDB(const std::string& gdbPath,
 	float voxelSize,
 	const std::vector<int>& structureIDs);
+
+VoxelGrid loadCSVDataIntoVoxelGrid(const std::string& vertsFilename,
+	const std::string& facesFilename,
+	float voxelSize);
 
 BoundingBox2D detectDenseArea(const std::string& gdbPath, int maxFeatures, float cellSize);
 

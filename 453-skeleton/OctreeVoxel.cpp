@@ -633,14 +633,12 @@ std::vector<OctreeNode*> getNeighbors(OctreeNode* node,
 }
 
 // standard MC single-cell
-static glm::vec3 vertexInterp(float iso,
-	const glm::vec3& p1, const glm::vec3& p2,
-	float valp1, float valp2)
-{
-	if (std::fabs(iso - valp1) < 1e-6f) return p1;
-	if (std::fabs(iso - valp2) < 1e-6f) return p2;
-	if (std::fabs(valp1 - valp2) < 1e-6f) return p1;
-	float mu = (iso - valp1) / (valp2 - valp1);
+inline glm::vec3 vertexInterp(float isoLevel, const glm::vec3& p1, const glm::vec3& p2, float valp1, float valp2) {
+	if (std::abs(isoLevel - valp1) < 0.00001f) return p1;
+	if (std::abs(isoLevel - valp2) < 0.00001f) return p2;
+	if (std::abs(valp1 - valp2) < 0.00001f) return p1;
+
+	float mu = (isoLevel - valp1) / (valp2 - valp1);
 	return p1 + mu * (p2 - p1);
 }
 
@@ -781,54 +779,106 @@ OctreeNode* createOctreeFromVoxelGrid(const VoxelGrid& grid) {
 	OctreeNode* root = buildOctreeRec(grid, 0, 0, 0, sizePow2, g_octreeMap);
 	return root;
 }
-
-// localMC used by MC only
-std::vector<MCTriangle> localMC(const VoxelGrid& grid,
-	int x0, int y0, int z0,
-	int size)
-{
+std::vector<MCTriangle> localMC(const VoxelGrid& grid, int x0, int y0, int z0, int size) {
 	std::vector<MCTriangle> results;
+	results.reserve(size * size * size / 2);  // Pre-allocate space
 
-	auto getScalar = [&](int xx, int yy, int zz) {
-		if (xx < 0 || yy < 0 || zz < 0 ||
-			xx >= grid.dimX || yy >= grid.dimY || zz >= grid.dimZ) {
-			return 1.f;
-		}
-		return (grid.data[grid.index(xx, yy, zz)] == VoxelState::FILLED) ?
-			-1.f : +1.f;
-		};
-
+	const float EPSILON = 1e-6f;
 	float vx = grid.voxelSize;
 
-	for (int z = z0; z < (z0 + size); z++) {
-		for (int y = y0; y < (y0 + size); y++) {
-			for (int x = x0; x < (x0 + size); x++) {
+	auto getScalar = [&](int x, int y, int z) -> float {
+		if (x < 0 || y < 0 || z < 0 || x >= grid.dimX || y >= grid.dimY || z >= grid.dimZ) {
+			return 1.0f;
+		}
+		return (grid.data[grid.index(x, y, z)] == VoxelState::FILLED) ? -1.0f : 1.0f;
+		};
+
+	// Process one cell at a time
+	for (int z = z0; z < (z0 + size) && z < grid.dimZ - 1; z++) {
+		for (int y = y0; y < (y0 + size) && y < grid.dimY - 1; y++) {
+			for (int x = x0; x < (x0 + size) && x < grid.dimX - 1; x++) {
 				// Build corners
-				std::array<Corner, 8> c;
-				auto cornerPos = [&](int xx, int yy, int zz) {
-					return glm::vec3(grid.minX + xx * vx,
-						grid.minY + yy * vx,
-						grid.minZ + zz * vx);
-					};
+				std::array<Corner, 8> corners;
 
-				c[0] = { cornerPos(x,   y,   z),   getScalar(x,   y,   z) };
-				c[1] = { cornerPos(x + 1, y,   z),   getScalar(x + 1, y,   z) };
-				c[2] = { cornerPos(x + 1, y + 1, z),   getScalar(x + 1, y + 1, z) };
-				c[3] = { cornerPos(x,   y + 1, z),   getScalar(x,   y + 1, z) };
-				c[4] = { cornerPos(x,   y,   z + 1), getScalar(x,   y,   z + 1) };
-				c[5] = { cornerPos(x + 1, y,   z + 1), getScalar(x + 1, y,   z + 1) };
-				c[6] = { cornerPos(x + 1, y + 1, z + 1), getScalar(x + 1, y + 1, z + 1) };
-				c[7] = { cornerPos(x,   y + 1, z + 1), getScalar(x,   y + 1, z + 1) };
+				// Corner positions in world space
+				corners[0] = { glm::vec3(grid.minX + x * vx, grid.minY + y * vx, grid.minZ + z * vx),
+							 getScalar(x, y, z) };
+				corners[1] = { glm::vec3(grid.minX + (x + 1) * vx, grid.minY + y * vx, grid.minZ + z * vx),
+							 getScalar(x + 1, y, z) };
+				corners[2] = { glm::vec3(grid.minX + (x + 1) * vx, grid.minY + (y + 1) * vx, grid.minZ + z * vx),
+							 getScalar(x + 1, y + 1, z) };
+				corners[3] = { glm::vec3(grid.minX + x * vx, grid.minY + (y + 1) * vx, grid.minZ + z * vx),
+							 getScalar(x, y + 1, z) };
+				corners[4] = { glm::vec3(grid.minX + x * vx, grid.minY + y * vx, grid.minZ + (z + 1) * vx),
+							 getScalar(x, y, z + 1) };
+				corners[5] = { glm::vec3(grid.minX + (x + 1) * vx, grid.minY + y * vx, grid.minZ + (z + 1) * vx),
+							 getScalar(x + 1, y, z + 1) };
+				corners[6] = { glm::vec3(grid.minX + (x + 1) * vx, grid.minY + (y + 1) * vx, grid.minZ + (z + 1) * vx),
+							 getScalar(x + 1, y + 1, z + 1) };
+				corners[7] = { glm::vec3(grid.minX + x * vx, grid.minY + (y + 1) * vx, grid.minZ + (z + 1) * vx),
+							 getScalar(x, y + 1, z + 1) };
 
-				// standard MC
-				auto cellTris = marchingCubesCell(c, 0.f);
-				results.insert(results.end(), cellTris.begin(), cellTris.end());
+				// Check if cell intersects surface
+				bool hasPos = false, hasNeg = false;
+				for (const auto& c : corners) {
+					if (c.val < 0) hasNeg = true;
+					if (c.val > 0) hasPos = true;
+					if (hasPos && hasNeg) break;
+				}
+
+				if (!hasPos || !hasNeg) continue;
+
+				// Process cell
+				int cubeIndex = 0;
+				for (int i = 0; i < 8; i++) {
+					if (corners[i].val < 0) {
+						cubeIndex |= (1 << i);
+					}
+				}
+
+				// Get edge flags
+				int edgeFlags = edgeTable[cubeIndex];
+				if (edgeFlags == 0) continue;
+
+				// Calculate vertices
+				glm::vec3 vertList[12];
+				if (edgeFlags & 1)    vertList[0] = vertexInterp(0.0f, corners[0].pos, corners[1].pos, corners[0].val, corners[1].val);
+				if (edgeFlags & 2)    vertList[1] = vertexInterp(0.0f, corners[1].pos, corners[2].pos, corners[1].val, corners[2].val);
+				if (edgeFlags & 4)    vertList[2] = vertexInterp(0.0f, corners[2].pos, corners[3].pos, corners[2].val, corners[3].val);
+				if (edgeFlags & 8)    vertList[3] = vertexInterp(0.0f, corners[3].pos, corners[0].pos, corners[3].val, corners[0].val);
+				if (edgeFlags & 16)   vertList[4] = vertexInterp(0.0f, corners[4].pos, corners[5].pos, corners[4].val, corners[5].val);
+				if (edgeFlags & 32)   vertList[5] = vertexInterp(0.0f, corners[5].pos, corners[6].pos, corners[5].val, corners[6].val);
+				if (edgeFlags & 64)   vertList[6] = vertexInterp(0.0f, corners[6].pos, corners[7].pos, corners[6].val, corners[7].val);
+				if (edgeFlags & 128)  vertList[7] = vertexInterp(0.0f, corners[7].pos, corners[4].pos, corners[7].val, corners[4].val);
+				if (edgeFlags & 256)  vertList[8] = vertexInterp(0.0f, corners[0].pos, corners[4].pos, corners[0].val, corners[4].val);
+				if (edgeFlags & 512)  vertList[9] = vertexInterp(0.0f, corners[1].pos, corners[5].pos, corners[1].val, corners[5].val);
+				if (edgeFlags & 1024) vertList[10] = vertexInterp(0.0f, corners[2].pos, corners[6].pos, corners[2].val, corners[6].val);
+				if (edgeFlags & 2048) vertList[11] = vertexInterp(0.0f, corners[3].pos, corners[7].pos, corners[3].val, corners[7].val);
+
+				// Create triangles
+				for (int i = 0; triTable[cubeIndex][i] != -1; i += 3) {
+					MCTriangle tri;
+					tri.v[0] = vertList[triTable[cubeIndex][i]];
+					tri.v[1] = vertList[triTable[cubeIndex][i + 1]];
+					tri.v[2] = vertList[triTable[cubeIndex][i + 2]];
+
+					// Calculate normal
+					glm::vec3 edge1 = tri.v[1] - tri.v[0];
+					glm::vec3 edge2 = tri.v[2] - tri.v[0];
+					glm::vec3 normal = glm::normalize(glm::cross(edge1, edge2));
+
+					tri.normal[0] = normal;
+					tri.normal[1] = normal;
+					tri.normal[2] = normal;
+
+					results.push_back(tri);
+				}
 			}
 		}
 	}
+
 	return results;
 }
-
 void freeOctree(OctreeNode* node)
 {
 	if (!node) return;

@@ -253,12 +253,18 @@ struct Assignment4 : public CallbackInterface {
 			camera.incrementTheta(ypos - mouseOldY);
 			camera.incrementPhi(xpos - mouseOldX);
 		}
+		if (leftMouseDown) {
+			camera.pan(xpos - mouseOldX, ypos - mouseOldY);
+		}
 		mouseOldX = xpos;
 		mouseOldY = ypos;
 	}
 	void mouseButtonCallback(int button, int action, int mods) override {
 		if (button == GLFW_MOUSE_BUTTON_RIGHT) {
 			rightMouseDown = (action == GLFW_PRESS);
+		}
+		if (button == GLFW_MOUSE_BUTTON_LEFT) {
+			leftMouseDown = (action == GLFW_PRESS);
 		}
 	}
 	void scrollCallback(double xoffset, double yoffset) override {
@@ -276,12 +282,14 @@ struct Assignment4 : public CallbackInterface {
 	void viewPipeline(ShaderProgram& sp) {
 		glm::mat4 M(1.f);
 		glm::mat4 V = camera.getView();
-		glm::mat4 P = glm::perspective(glm::radians(45.f), aspect, 0.01f, 1000.f);
+		glm::mat4 P = glm::perspective(glm::radians(45.f), aspect, 0.01f, 5000.f);
+
 		GLint uM = glGetUniformLocation(sp, "M");
-		glUniformMatrix4fv(uM, 1, GL_FALSE, &M[0][0]);
 		GLint uV = glGetUniformLocation(sp, "V");
-		glUniformMatrix4fv(uV, 1, GL_FALSE, &V[0][0]);
 		GLint uP = glGetUniformLocation(sp, "P");
+
+		glUniformMatrix4fv(uM, 1, GL_FALSE, &M[0][0]);
+		glUniformMatrix4fv(uV, 1, GL_FALSE, &V[0][0]);
 		glUniformMatrix4fv(uP, 1, GL_FALSE, &P[0][0]);
 	}
 
@@ -293,6 +301,7 @@ struct Assignment4 : public CallbackInterface {
 	bool rightMouseDown;
 	double mouseOldX, mouseOldY;
 	float peelPlaneZ; // Current z position of the peeling plane
+	bool leftMouseDown = false;
 };
 
 int main() {
@@ -311,10 +320,10 @@ int main() {
 	std::string gdbPath = "./gdb_folder/Buildings_3D.gdb";
 	int dim = 2.0f;
 	int maxBuildings = 5;
-	float voxelSize = 5.0f;
+	float voxelSize = 0.025f;
 	int maxScanFeatures = 10000000000;
 	float binSize = 500.0f;        // 500m bin
-	std::vector<int> structureIDs = { 1371763, 1427271, 1372219, 2327658 }; // example IDs
+	std::vector<int> structureIDs = { 1427271 }; // example IDs
 
 
 	VoxelGrid grid;
@@ -333,7 +342,7 @@ int main() {
 			//	tallestBox.maxX, tallestBox.maxY,
 			//	maxBuildings);
 
-			grid = loadBuildingsFromGDB(gdbPath, voxelSize, structureIDs);
+			//grid = loadBuildingsFromGDB(gdbPath, voxelSize, structureIDs);
 
 			//// 1) Find the tallest building a1rea
 			//BoundingBox2D area = findSkyscraperArea(gdbPath, maxScanFeatures, binSize);
@@ -348,6 +357,12 @@ int main() {
 			//	area.maxY,
 			//	maxBuildings
 			//);
+
+			grid = loadCSVDataIntoVoxelGrid("./DT/DTVerts.csv", "./DT/DTFaces.csv", voxelSize);
+			if (grid.data.empty()) {
+				std::cerr << "Voxel grid is empty. Exiting." << std::endl;
+				return -1;
+			}
 
 			// Re-center after load, *before* building the octree
 			recenterFilledVoxels(grid);
@@ -551,7 +566,7 @@ int main() {
 		else if (app->currentMode == RenderMode::BVHRayTrace) {
 			if (triCache.empty()) {
 				glm::mat4 V = app->camera.getView();
-				glm::mat4 P = glm::perspective(glm::radians(45.f), app->aspect, 0.01f, 1000.f);
+				glm::mat4 P = glm::perspective(glm::radians(45.f), app->aspect, 0.01f, 10000.f);
 				triCache = bvhRayTracer.renderScene(V, P, window.getWidth(), window.getHeight());
 				cpuGeom.verts.clear();
 				cpuGeom.normals.clear();

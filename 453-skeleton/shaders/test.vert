@@ -7,13 +7,13 @@ uniform mat4 M;
 uniform mat4 V;
 uniform mat4 P;
 
-out vec3 fragPos;
-out vec3 fragColor;
-out vec3 n;
+out vec3 FragPos;
+out vec3 Normal;
+out vec3 Color;
 
 void main() {
-	fragPos = pos;
-	fragColor = color;
-	n = normal;
-	gl_Position = P * V * M * vec4(pos, 1.0);
+    FragPos = vec3(M * vec4(pos, 1.0));
+    Normal = mat3(transpose(inverse(M))) * normal;
+    Color = color;
+    gl_Position = P * V * M * vec4(pos, 1.0);
 }
