@@ -304,3 +304,4 @@ __pycache__/
 # End of https://www.gitignore.io/api/visualstudio
 
 gdb_folder/Buildings_3D.gdb/
+/453-skeleton/VolumeRaycastRenderer.cpp

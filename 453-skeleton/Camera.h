@@ -7,26 +7,39 @@
 //------------------------------------------------------------------------------
 class Camera {
 public:
-	Camera(float t, float p, float r);
+    Camera(float t, float p, float r);
 
-	// Mark these methods as const so they can be called on a const Camera.
-	glm::mat4 getView() const;
-	glm::vec3 getPos() const;
+    // Return the view matrix (using the updated eye position)
+    glm::mat4 getView() const;
+    
+    // Return the actual camera position (eye) including the pan offset.
+    glm::vec3 getPos() const;
+    
+    // Return the normalized look direction (from the eye to the target)
+    glm::vec3 getLookDir() const;
 
-	// Added: A method to return the normalized look direction.
-	// Since your camera always looks at the origin, the look direction is -normalize(eye).
-	glm::vec3 getLookDir() const;
+    // Increment (rotate) the camera angles and zoom.
+    void incrementTheta(float dt);
+    void incrementPhi(float dp);
+    void incrementR(float dr);
 
-	void incrementTheta(float dt);
-	void incrementPhi(float dp);
-	void incrementR(float dr);
-	void pan(float dx, float dy);
+	float getTheta() const;
+	float getPhi() const;
+	float getR() const;
+    
+    // Pan the camera (this changes the target).
+    void pan(float dx, float dy);
+    
+    // New: set the target (i.e. recenter the camera)
+    void setTarget(const glm::vec3& newTarget);
+    const glm::vec3& getTarget() const;
 
 private:
-	float theta;
-	float phi;
-	float radius;
-	const float MIN_RADIUS = 0.1f;
-	const float MAX_RADIUS = 1000.0f;
-	glm::vec3 target;
+    float theta;
+    float phi;
+    float radius;
+    glm::vec3 target; // target point (for panning/recentering)
+    
+    const float MIN_RADIUS = 0.1f;
+    const float MAX_RADIUS = 1000.0f;
 };

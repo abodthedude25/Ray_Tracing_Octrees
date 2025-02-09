@@ -29,7 +29,9 @@ include_directories(SYSTEM thirdparty/argh-1.3.1/)
 # include_directories(SYSTEM thirdparty/glew-2.1.0/include)
 
 # https://glad.dav1d.de/
-add_subdirectory(thirdparty/glad)
+#add_subdirectory(thirdparty/glad-opengl-3.3-core) 
+# This is needed for Bonus 3 to access the optional shader stages (Possibly won't work on MacOS)
+add_subdirectory(thirdparty/glad-opengl-4.6-core)  
 set(LIBRARIES ${LIBRARIES} glad)
 
 #-------------------------------------------------------------------------------
@@ -40,7 +42,7 @@ set(GLFW_BUILD_DOCS OFF CACHE BOOL "" FORCE)
 set(GLFW_BUILD_TESTS OFF CACHE BOOL "" FORCE)
 set(GLFW_BUILD_EXAMPLES OFF CACHE BOOL "" FORCE)
 
-add_subdirectory(thirdparty/glfw-3.3.2)
+add_subdirectory(thirdparty/glfw-3.4)
 set(LIBRARIES ${LIBRARIES} glfw)
 
 #-------------------------------------------------------------------------------
@@ -56,7 +58,7 @@ include_directories(SYSTEM thirdparty/glm-0.9.9.7/)
 # https://fmt.dev/latest/index.html
 # Turn off building their tests
 set(FMT_TES OFF CACHE BOOL "" FORCE)
-add_subdirectory(thirdparty/fmt-7.0.3)
+add_subdirectory(thirdparty/fmt-11.0.2)
 set(LIBRARIES ${LIBRARIES} fmt::fmt)
 include_directories(SYSTEM thirdparty/fmt-7.0.3/include)
 
@@ -70,6 +72,7 @@ find_package(GDAL REQUIRED)
 message(STATUS "GDAL Include Directory: ${GDAL_INCLUDE_DIRS}")
 message(STATUS "GDAL Libraries: ${GDAL_LIBRARIES}")
 set(LIBRARIES ${LIBRARIES} GDAL::GDAL)
+
 
 if ("${CMAKE_CXX_COMPILER_ID}" STREQUAL "Clang")
 	list(APPEND _453_CMAKE_CXX_FLAGS ${_453_CMAKE_CXX_FLAGS} "-Wall" "-pedantic")

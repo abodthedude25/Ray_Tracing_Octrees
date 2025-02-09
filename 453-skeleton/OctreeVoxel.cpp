@@ -779,6 +779,7 @@ OctreeNode* createOctreeFromVoxelGrid(const VoxelGrid& grid) {
 	OctreeNode* root = buildOctreeRec(grid, 0, 0, 0, sizePow2, g_octreeMap);
 	return root;
 }
+
 std::vector<MCTriangle> localMC(const VoxelGrid& grid, int x0, int y0, int z0, int size) {
 	std::vector<MCTriangle> results;
 	results.reserve(size * size * size / 2);  // Pre-allocate space

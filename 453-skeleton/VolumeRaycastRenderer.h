@@ -1,12 +1,9 @@
 // VolumeRaycastRenderer.h
-
 #pragma once
-
 #include "Camera.h"
 #include "Geometry.h"
 #include "Renderer.h"
-
-struct VoxelGrid; // Forward declaration
+#include <vector>
 
 class VolumeRaycastRenderer : public Renderer {
 public:
@@ -32,9 +29,12 @@ public:
 
 private:
 	// OpenGL texture IDs
-	unsigned int volumeTextureID; // 3D texture for volume density
-	unsigned int maskTextureID;   // 3D texture for masking (peeling)
-	glm::vec3 boxMin, boxMax; // The world-space bounding box corners
+	unsigned int volumeTextureID;  // 3D texture for volume density
+	unsigned int maskTextureID;    // 3D texture for masking (peeling)
+	unsigned int gaussian2DTexID;  // 2D texture for XY-plane Gaussian kernel
+	unsigned int gaussian1DTexID;  // 1D texture for Z-axis Gaussian kernel
+
+	glm::vec3 boxMin, boxMax;     // The world-space bounding box corners
 
 	// Shader program ID for raycasting and splatting
 	unsigned int raycastShaderProg;
@@ -47,11 +47,33 @@ private:
 
 	// Pointer to the voxel grid data
 	const VoxelGrid* gridPtr;
+	GLuint tempTexture;     // For compute shader passes
+	GLuint tempTexture2;    // Additional temp texture for compute
+	bool hasComputeShaders; // Flag to check compute shader support
+	GLuint antiAliasComputeProgram;
+
+	bool initComputeShader();
+	void checkComputeShaderCapabilities();
 
 	// Initialize the mask volume based on a peeling plane
-	void initMaskVolume(const VoxelGrid& grid);
+	void initMaskVolume();
 
-	// Helper functions
+	// Initialize Gaussian kernel textures
+	void initGaussianKernels();
+	void applyParallelAntiAliasing(GLuint sourceTexture, GLuint destTexture);
+
+	// Generate Gaussian kernel data
+	std::vector<float> generateGaussian2DKernel(int size = 64, float sigma = 0.4f);
+	std::vector<float> generateGaussian1DKernel(int size = 64, float sigma = 0.4f);
+
+	// Anti-aliasing helpers
+	void applyJitteringSlice(std::vector<float>& maskData, int dimX, int dimY, int dimZ, int sliceZ);
+	void applyCubicBSplineFilterSlice(std::vector<float>& maskData,
+		int dimX,
+		int dimY,
+		int dimZ,
+		int sliceZ);
+	// Shader compilation helpers
 	unsigned int compileShader(const char* src, GLenum type);
 	unsigned int createRaycastProgram();
 };

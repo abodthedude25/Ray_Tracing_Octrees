@@ -1,10 +1,14 @@
 #pragma once
-
+#include "OctreeVoxel.h"
 #include <vector>
 #include <glm/glm.hpp>
-#include "OctreeVoxel.h"
+#include "Camera.h"
 
-// A simple Ray structure.
+// Forward declarations
+class OctreeNode;
+class VoxelGrid;
+
+// Ray structure for ray tracing
 struct Ray {
 	glm::vec3 origin;
 	glm::vec3 direction;
@@ -15,28 +19,26 @@ public:
 	RayTracerBVH();
 	~RayTracerBVH();
 
-	// Set the octree that serves as our BVH accelerator.
+	// Set the octree and grid
 	void setOctree(OctreeNode* root, const VoxelGrid& grid);
 
-	// Render the scene by ray tracing. Returns a list of triangles (or other geometry)
-	// that can be rendered with your existing pipeline.
-	std::vector<MCTriangle> renderScene(const glm::mat4& view, const glm::mat4& proj, int width, int height);
+	// Render the scene
+	std::vector<MCTriangle> renderScene(const Camera& camera, const glm::mat4& view,
+		const glm::mat4& proj, int width, int height);
 
 private:
-	// The recursive function that tests a ray against the BVH (octree).
-	bool intersectOctree(const Ray& ray, OctreeNode* node, float tMin, float tMax, glm::vec3& hitPoint, glm::vec3& hitNormal);
+	// Ray intersection helpers
+	bool intersectAABB(const Ray& ray, const glm::vec3& bmin, const glm::vec3& bmax,
+		float& tNear, float& tFar);
+	bool intersectOctree(const Ray& ray, OctreeNode* node, float tMin, float tMax,
+		glm::vec3& hitPoint, glm::vec3& hitNormal);
 
-	// A helper to intersect a ray with an axis-aligned bounding box.
-	bool intersectAABB(const Ray& ray, const glm::vec3& bmin, const glm::vec3& bmax, float& tNear, float& tFar);
-
-	// A simple function to “shade” an intersection point.
-	glm::vec3 shade(const glm::vec3& hitPoint, const glm::vec3& normal);
-
-	// Generate a ray from camera parameters and pixel coordinates.
+	// Shading and ray generation
+	glm::vec3 shade(const glm::vec3& hitPoint, const glm::vec3& normal, const glm::vec3& cameraPos);
 	Ray generateRay(int x, int y, int width, int height, const glm::mat4& invVP);
 
-	// The BVH (octree) data:
+private:
+	// Scene data
 	OctreeNode* m_octreeRoot;
 	VoxelGrid m_grid;
 };
-
