@@ -34,7 +34,6 @@ public:
     void setTarget(const glm::vec3& newTarget);
     const glm::vec3& getTarget() const;
 
-private:
     float theta;
     float phi;
     float radius;

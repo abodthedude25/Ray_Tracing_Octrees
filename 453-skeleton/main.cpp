@@ -19,8 +19,6 @@
 #include "CacheUtils.h"
 
 
-std::vector<MCTriangle> triCache;
-RayTracerBVH bvhRayTracer;
 
 // Enhanced generateTestVolume: Multi-shell Sphere
 static std::vector<float> generateTestVolume(int dimX, int dimY, int dimZ) {
@@ -57,7 +55,6 @@ static std::vector<float> generateTestVolume(int dimX, int dimY, int dimZ) {
 			}
 		}
 	}
-
 	return volume;
 }
 
@@ -234,17 +231,6 @@ struct Assignment4 : public CallbackInterface {
 					currentMode = RenderMode::MarchingCubes;
 				}
 				std::cout << "Switched render mode!\n";
-
-				// Clear the triCache so we can rebuild geometry in the main loop if needed
-				triCache.clear();
-
-				// OPTIONAL: if we switch *into* BVH, do one immediate pass
-				if (currentMode == RenderMode::BVHRayTrace) {
-					glm::mat4 V = camera.getView();
-					glm::mat4 P = glm::perspective(glm::radians(45.f), aspect, 0.01f, 10000.f);
-					triCache = bvhRayTracer.renderScene(camera, V, P,
-						lastWindowWidth, lastWindowHeight);
-				}
 			}
 			else if (key == GLFW_KEY_C && currentMode == RenderMode::BVHRayTrace) {
 				// Re-center camera on buildings
@@ -253,44 +239,6 @@ struct Assignment4 : public CallbackInterface {
 					<< buildingCenter.x << ", "
 					<< buildingCenter.y << ", "
 					<< buildingCenter.z << "\n";
-
-				// Force re-render and cache geometry
-				triCache.clear();
-				std::cout << "Re-running BVH Ray Trace...\n";
-
-				glm::mat4 V = camera.getView();
-				glm::mat4 P = glm::perspective(glm::radians(45.f), aspect, 0.01f, 10000.f);
-
-				// Get new triangles
-				triCache = bvhRayTracer.renderScene(camera, V, P, lastWindowWidth, lastWindowHeight);
-
-				// Immediately upload to GPU
-				if (!triCache.empty()) {
-					cpuGeom.verts.clear();
-					cpuGeom.normals.clear();
-					cpuGeom.cols.clear();
-
-					// Pre-allocate vectors
-					size_t numVerts = triCache.size() * 3;
-					cpuGeom.verts.reserve(numVerts);
-					cpuGeom.normals.reserve(numVerts);
-					cpuGeom.cols.reserve(numVerts);
-
-					for (const auto& t : triCache) {
-						for (int i = 0; i < 3; i++) {
-							cpuGeom.verts.push_back(t.v[i]);
-							cpuGeom.normals.push_back(t.normal[i]);
-							cpuGeom.cols.push_back(glm::vec3(0.9f, 0.85f, 0.8f));
-						}
-					}
-
-					gpuGeom.bind();
-					gpuGeom.setVerts(cpuGeom.verts);
-					gpuGeom.setNormals(cpuGeom.normals);
-					gpuGeom.setCols(cpuGeom.cols);
-
-					std::cout << "Uploaded " << triCache.size() << " triangles to GPU\n";
-				}
 			}
 			else if (key == GLFW_KEY_UP) {
 				peelPlaneZ += 0.05f;
@@ -376,6 +324,7 @@ struct Assignment4 : public CallbackInterface {
 	int lastWindowWidth = 800;
 	int lastWindowHeight = 800;
 
+	// Some geometry for CPU-based modes:
 	CPU_Geometry cpuGeom;
 	GPU_Geometry gpuGeom;
 };
@@ -392,14 +341,12 @@ int main() {
 	glfwWindowHint(GLFW_OPENGL_PROFILE, GLFW_OPENGL_CORE_PROFILE);
 	glfwWindowHint(GLFW_OPENGL_FORWARD_COMPAT, GL_TRUE);
 
-	// Debug context can help identify OpenGL errors
 #ifdef _DEBUG
 	glfwWindowHint(GLFW_OPENGL_DEBUG_CONTEXT, GL_TRUE);
 #endif
 
-
 	// Create window
-	Window window(800, 800, "Octree + DC + Volume Raycast");
+	Window window(800, 800, "Octree + DC + Volume Raycast + Compute BVH");
 	if (!window.getWindow()) {
 		std::cerr << "Failed to create GLFW window. Check if your GPU supports OpenGL 4.3\n";
 		glfwTerminate();
@@ -423,6 +370,7 @@ int main() {
 		glfwTerminate();
 		return -1;
 	}
+
 	// CPU/GPU geometry
 	CPU_Geometry cpuGeom;
 	GPU_Geometry gpuGeom;
@@ -431,28 +379,34 @@ int main() {
 	window.setCallbacks(app);
 
 	bool useGDB = true;
-	std::string gdbPath = "./gdb_folder/Buildings_3D.gdb";
 	int dim = 64;
-	int maxBuildings = 5;
 	float voxelSize = 0.025f;
-	int maxScanFeatures = 10000000000;
-	float binSize = 500.0f;
-	std::vector<int> structureIDs = { 1427271 };
-
-	VoxelGrid grid;
 	std::string cacheFilename = "sceneCache.bin";
 
+	VoxelGrid grid;
 	// Load or generate voxel data
 	if (useGDB) {
-		// Try to load from cache first
+		// Attempt to load from your own caching mechanism, or fallback
 		if (!loadVoxelGrid(cacheFilename, grid)) {
-			// Example: load from CSV
-			grid = loadCSVDataIntoVoxelGrid("./DT/DTVerts.csv",
-				"./DT/DTFaces.csv",
-				voxelSize);
-			if (grid.data.empty()) {
-				std::cerr << "Voxel grid is empty.\n";
-				return -1;
+			// fallback multi-shell sphere
+			auto vol = generateTestVolume(dim, dim, dim);
+			grid.dimX = dim; grid.dimY = dim; grid.dimZ = dim;
+			grid.minX = -0.5f; grid.minY = -0.5f; grid.minZ = -0.5f;
+			grid.voxelSize = 1.f / dim;
+			grid.data.resize(dim * dim * dim, VoxelState::EMPTY);
+
+			for (int z = 0; z < dim; z++) {
+				for (int y = 0; y < dim; y++) {
+					for (int x = 0; x < dim; x++) {
+						int idx = x + y * dim + z * (dim * dim);
+						if (vol[idx] > 0.0f) {
+							grid.data[idx] = VoxelState::FILLED;
+						}
+						else {
+							grid.data[idx] = VoxelState::EMPTY;
+						}
+					}
+				}
 			}
 			saveVoxelGrid(cacheFilename, grid);
 		}
@@ -483,9 +437,10 @@ int main() {
 	// Recenter the voxel grid if necessary
 	recenterFilledVoxels(grid);
 
-	// (2) Build the octree
+	// Build the octree
 	OctreeNode* root = createOctreeFromVoxelGrid(grid);
 
+	// Find approximate center
 	{
 		float minX = 1e30f, minY = 1e30f, minZ = 1e30f;
 		float maxX = -1e30f, maxY = -1e30f, maxZ = -1e30f;
@@ -513,14 +468,18 @@ int main() {
 		std::cout << "Building center: " << cx << ", " << cy << ", " << cz << "\n";
 	}
 
-	// Prepare renderers
+	// Prepare other renderers
 	MarchingCubesRenderer      mcRenderer;
 	AdaptiveDualContouringRenderer dcRenderer;
 	VoxelCubeRenderer          blockRenderer;
-	bvhRayTracer.setOctree(root, grid);
-
 	VolumeRaycastRenderer      volRenderer;
 	volRenderer.initVolume(grid);
+	std::vector<MCTriangle> triCache;
+	RayTracerBVH bvhRayTracer;
+	bvhRayTracer.ensureComputeInitialized();
+
+	// Initialize the BVH Ray tracer (GPU)
+	bvhRayTracer.setOctree(root, grid);
 
 	// Wireframe for octree
 	CPU_Geometry cpuWire;
@@ -533,7 +492,7 @@ int main() {
 		gpuWireGeom.setVerts(cpuWire.verts);
 	}
 
-	// Shader for wireframe and other geometry
+	// Shader for wireframe/other geometry
 	ShaderProgram shader("453-skeleton/shaders/test.vert", "453-skeleton/shaders/test.frag");
 
 	RenderMode oldMode = app->currentMode;
@@ -545,49 +504,40 @@ int main() {
 	while (!window.shouldClose()) {
 		glfwPollEvents();
 
-		// Clear screen with black
-		//glClearColor(0.0f, 0.0f, 0.0f, 1.0f);
+		// Clear
+		glClearColor(0.0f, 0.0f, 0.0f, 1.0f);
 		glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT);
 
-		// Disable depth test for volume pass
-		glDisable(GL_DEPTH_TEST);
-
 		if (app->currentMode != RenderMode::VolumeRaycast) {
-			// Enable depth test for geometry-based modes
 			glEnable(GL_DEPTH_TEST);
-			shader.use();
-			app->viewPipeline(shader);
+		}
+		else {
+			glDisable(GL_DEPTH_TEST);
 		}
 
-		// If user switched mode, clear the caches
+		// If user switched mode, clear the triCache (for CPU geom modes)
 		if (app->currentMode != oldMode) {
 			triCache.clear();
 			oldMode = app->currentMode;
 		}
 
 		if (app->currentMode == RenderMode::VolumeRaycast) {
-
-			// Enable blending for transparency
+			// Volume raycasting pass
 			glEnable(GL_BLEND);
 			glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
 
-			// Toggle wireframe mode
 			if (app->wireframeMode) {
 				glPolygonMode(GL_FRONT_AND_BACK, GL_LINE);
 			}
-
-			// Fullscreen pass with peeling
 			volRenderer.drawRaycast(app->camera,
 				app->aspect,
 				window.getWidth(),
 				window.getHeight());
-
-			// Reset polygon mode and disable blending
 			glPolygonMode(GL_FRONT_AND_BACK, GL_FILL);
 			glDisable(GL_BLEND);
 
-			// Update the peeling plane based on user input
 			volRenderer.updatePeelPlane(app->peelPlaneZ);
+
 		}
 		else if (app->currentMode == RenderMode::MarchingCubes) {
 			if (triCache.empty()) {
@@ -607,12 +557,16 @@ int main() {
 				gpuGeom.setNormals(cpuGeom.normals);
 				gpuGeom.setCols(cpuGeom.cols);
 			}
+			shader.use();
+			app->viewPipeline(shader);
+
 			if (app->wireframeMode) {
 				glPolygonMode(GL_FRONT_AND_BACK, GL_LINE);
 			}
 			gpuGeom.bind();
 			glDrawArrays(GL_TRIANGLES, 0, (GLsizei)cpuGeom.verts.size());
 			glPolygonMode(GL_FRONT_AND_BACK, GL_FILL);
+
 		}
 		else if (app->currentMode == RenderMode::DualContouring) {
 			if (triCache.empty()) {
@@ -632,12 +586,16 @@ int main() {
 				gpuGeom.setNormals(cpuGeom.normals);
 				gpuGeom.setCols(cpuGeom.cols);
 			}
+			shader.use();
+			app->viewPipeline(shader);
+
 			if (app->wireframeMode) {
 				glPolygonMode(GL_FRONT_AND_BACK, GL_LINE);
 			}
 			gpuGeom.bind();
 			glDrawArrays(GL_TRIANGLES, 0, (GLsizei)cpuGeom.verts.size());
 			glPolygonMode(GL_FRONT_AND_BACK, GL_FILL);
+
 		}
 		else if (app->currentMode == RenderMode::VoxelBlocks) {
 			if (triCache.empty()) {
@@ -657,53 +615,35 @@ int main() {
 				gpuGeom.setNormals(cpuGeom.normals);
 				gpuGeom.setCols(cpuGeom.cols);
 			}
+			shader.use();
+			app->viewPipeline(shader);
+
 			if (app->wireframeMode) {
 				glPolygonMode(GL_FRONT_AND_BACK, GL_LINE);
 			}
 			gpuGeom.bind();
 			glDrawArrays(GL_TRIANGLES, 0, (GLsizei)cpuGeom.verts.size());
 			glPolygonMode(GL_FRONT_AND_BACK, GL_FILL);
+
 		}
 		else if (app->currentMode == RenderMode::BVHRayTrace) {
-
-			if (!triCache.empty()) {
-				// Clear depth buffer to ensure visibility
-				glClear(GL_DEPTH_BUFFER_BIT);
-
-				if (app->wireframeMode) {
-					glPolygonMode(GL_FRONT_AND_BACK, GL_LINE);
-				}
-
-				// Enable depth testing but also enable alpha blending
-				glEnable(GL_DEPTH_TEST);
-				glEnable(GL_BLEND);
-				glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
-
-				// Bind shader and set color override for debugging
-				shader.use();
-				app->viewPipeline(shader);
-				GLint uColor = glGetUniformLocation(shader, "overrideColor");
-				glUniform3f(uColor, 1.0f, 0.8f, 0.6f);
-
-				app->gpuGeom.bind();
-				glDrawArrays(GL_TRIANGLES, 0, (GLsizei)app->cpuGeom.verts.size());
-
-				// Reset states
-				glPolygonMode(GL_FRONT_AND_BACK, GL_FILL);
-				glDisable(GL_BLEND);
-				glUniform3f(uColor, 1.f, 1.f, 1.f);
-			}
+			// --- GPU BVH Ray Tracing via compute shader ---
+			bvhRayTracer.renderSceneCompute(app->camera,
+				app->lastWindowWidth,
+				app->lastWindowHeight,
+				app->aspect,
+				/*fov=*/45.0f);
 		}
 
 		// Possibly draw octree wireframe
 		if (app->showOctreeWire) {
-			shader.use(); // Bind the shader for wireframe rendering
+			shader.use();
 			app->viewPipeline(shader);
 			GLint uColor = glGetUniformLocation(shader, "overrideColor");
-			glUniform3f(uColor, 1.f, 0.f, 0.f); // Set wireframe color to red
+			glUniform3f(uColor, 1.f, 0.f, 0.f); // red
 			gpuWireGeom.bind();
 			glDrawArrays(GL_LINES, 0, (GLsizei)cpuWire.verts.size());
-			glUniform3f(uColor, 1.f, 1.f, 1.f); // Reset color
+			glUniform3f(uColor, 1.f, 1.f, 1.f); // reset
 		}
 
 		// Swap buffers
@@ -728,7 +668,6 @@ int main() {
 		}
 	}
 
-	// Clean up and terminate
 	glfwTerminate();
 	return 0;
 }

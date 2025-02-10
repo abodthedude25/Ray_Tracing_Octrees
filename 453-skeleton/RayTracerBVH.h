@@ -3,15 +3,24 @@
 #include <vector>
 #include <glm/glm.hpp>
 #include "Camera.h"
+#include <glad/glad.h>
+#include <unordered_map>
 
 // Forward declarations
 class OctreeNode;
 class VoxelGrid;
 
-// Ray structure for ray tracing
+// A small struct for Ray
 struct Ray {
 	glm::vec3 origin;
 	glm::vec3 direction;
+};
+
+// GPU-friendly node storage
+struct GPUNodes {
+	int x, y, z, size;
+	int isLeaf, isSolid;
+	int child[8];
 };
 
 class RayTracerBVH {
@@ -19,26 +28,37 @@ public:
 	RayTracerBVH();
 	~RayTracerBVH();
 
-	// Set the octree and grid
+	// Set the octree and grid (builds a flattened GPU array)
 	void setOctree(OctreeNode* root, const VoxelGrid& grid);
 
-	// Render the scene
-	std::vector<MCTriangle> renderScene(const Camera& camera, const glm::mat4& view,
-		const glm::mat4& proj, int width, int height);
+	// Initialize the compute pipeline if not already done
+	void ensureComputeInitialized();
 
-private:
-	// Ray intersection helpers
-	bool intersectAABB(const Ray& ray, const glm::vec3& bmin, const glm::vec3& bmax,
-		float& tNear, float& tFar);
-	bool intersectOctree(const Ray& ray, OctreeNode* node, float tMin, float tMax,
-		glm::vec3& hitPoint, glm::vec3& hitNormal);
-
-	// Shading and ray generation
-	glm::vec3 shade(const glm::vec3& hitPoint, const glm::vec3& normal, const glm::vec3& cameraPos);
-	Ray generateRay(int x, int y, int width, int height, const glm::mat4& invVP);
+	// Main GPU-based render
+	void renderSceneCompute(const Camera& camera,
+		int width, int height,
+		float aspect,
+		float fovDeg);
 
 private:
 	// Scene data
 	OctreeNode* m_octreeRoot;
-	VoxelGrid m_grid;
+	VoxelGrid   m_grid;
+
+	// Flattened octree for GPU
+	std::vector<GPUNodes> m_flatNodes;
+	GLuint m_nodeSSBO;
+	int    m_numNodes;
+
+	// Compute pipeline
+	bool   m_computeInited;
+	GLuint m_outputTex;
+	GLuint m_fullscreenVAO;
+	GLuint m_fullscreenVBO;
+	GLuint m_computeProg;
+	GLuint m_fsqProg;
+
+	// Helper
+	// BFS/flatten, store in SSBO, etc.
+
 };

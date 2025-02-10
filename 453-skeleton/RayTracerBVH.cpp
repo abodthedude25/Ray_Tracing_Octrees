@@ -4,180 +4,527 @@
 #include <limits>
 #include <cmath>
 #include <iostream>
+#include <queue>
 
-RayTracerBVH::RayTracerBVH() : m_octreeRoot(nullptr) {}
+// ============ GPU Shader Source (inline) ============
+static const char* g_computeShaderSrc = R"(
+#version 430
 
-RayTracerBVH::~RayTracerBVH() {}
+// For local workgroup sizes, you can tweak these to best match your GPU
+layout(local_size_x = 8, local_size_y = 8) in;
 
-void RayTracerBVH::setOctree(OctreeNode* root, const VoxelGrid& grid) {
+// We'll write color results to an RGBA32F image
+layout(rgba32f, binding = 0) uniform image2D outputImage;
+
+struct Ray {
+    vec3 origin;
+    vec3 direction;
+};
+
+struct OctreeNodeGPUStruct {
+    // x,y,z are int voxel indices
+    int x;
+    int y;
+    int z;
+    int size;
+    int isLeaf;
+    int isSolid;
+    int child[8];
+};
+
+layout(std430, binding = 1) buffer OctreeNodes
+{
+    OctreeNodeGPUStruct nodes[];
+};
+
+uniform int numNodes;
+uniform vec3 gridMin;
+uniform float voxelSize;
+uniform mat4 invVP;
+uniform mat4 viewMat;
+uniform vec3 cameraPos;
+uniform float aspect;
+uniform float fov;  // in degrees
+uniform int imageWidth;
+uniform int imageHeight;
+
+// ============ Utility functions ============
+
+// simple AABB intersection test
+bool intersectAABB(vec3 rayOrigin, vec3 rayDir,
+                   vec3 bmin, vec3 bmax,
+                   out float tNear, out float tFar)
+{
+    vec3 invDir = vec3(1.0) / rayDir;
+    vec3 t1 = (bmin - rayOrigin) * invDir;
+    vec3 t2 = (bmax - rayOrigin) * invDir;
+
+    vec3 tMin = min(t1, t2);
+    vec3 tMax = max(t1, t2);
+
+    tNear = max(max(tMin.x, tMin.y), tMin.z);
+    tFar  = min(min(tMax.x, tMax.y), tMax.z);
+
+    return (tNear <= tFar && tFar > 0.0);
+}
+
+// Returns true if we hit a solid leaf, with the nearest hit recorded.
+// For performance, you may want to limit stack size or do early outs, etc.
+bool intersectOctreeIterative(vec3 rayOrigin, vec3 rayDir,
+                              out vec3 hitPoint, out vec3 hitNormal)
+{
+    // We'll track the nearest intersection
+    float closestT = 1e30;
+    bool hitFound = false;
+    vec3 bestNormal = vec3(0.0);
+
+    // A small stack to hold node indices
+    // Adjust size if your octree can get deeper
+    int stack[128];
+    int sp = 0;
+
+    // Push root node (index 0)
+    stack[sp++] = 0; // if your root is always 0
+
+    while (sp > 0) {
+        sp--;
+        int nodeIdx = stack[sp];
+        if (nodeIdx < 0) {
+            continue;
+        }
+
+        OctreeNodeGPUStruct node = nodes[nodeIdx];
+
+        // Compute AABB in world space
+        vec3 boxMin = gridMin + vec3(node.x, node.y, node.z) * voxelSize;
+        vec3 boxMax = boxMin + vec3(node.size) * voxelSize;
+
+        // Intersect bounding box
+        float tNear, tFar;
+        if (!intersectAABB(rayOrigin, rayDir, boxMin, boxMax, tNear, tFar)) {
+            continue; // no intersection
+        }
+
+        // If it's a leaf and solid, record hit
+        if (node.isLeaf == 1 && node.isSolid == 1) {
+            float tHit = max(0.0, tNear);
+            if (tHit < closestT && tHit <= tFar) {
+                closestT = tHit;
+                hitFound = true;
+                // approximate normal from center
+                vec3 center = 0.5 * (boxMin + boxMax);
+                vec3 p = rayOrigin + rayDir * tHit;
+                bestNormal = normalize(p - center);
+            }
+        }
+        else if (node.isLeaf == 0) {
+            // Not a leaf => push children onto the stack
+            for (int i = 0; i < 8; i++) {
+                int c = node.child[i];
+                if (c >= 0) {
+                    // push child
+                    stack[sp++] = c;
+                }
+            }
+        }
+    }
+
+    if (hitFound) {
+        hitPoint = rayOrigin + rayDir * closestT;
+        hitNormal = bestNormal;
+    }
+    return hitFound;
+}
+
+
+// quick Lambert color
+vec3 shade(vec3 hitPoint, vec3 normal)
+{
+    // A simple directional light from (-1,-1,-1)
+    vec3 lightDir = normalize(vec3(-1.0, -1.0, -1.0));
+    float ndotl = max(0.0, dot(normal, -lightDir));
+    vec3 color = vec3(1.0, 0.8, 0.6) * ndotl + vec3(0.1, 0.1, 0.1);
+    return color;
+}
+
+// Generate a primary ray for pixel (x, y).
+// This is a simpler approach than using invVP: we replicate
+// the typical pinhole camera approach using aspect & fov.
+Ray generateRay(int px, int py, int w, int h, vec3 camPos, mat4 view, float fovDeg, float aspect)
+{
+    float fovRad = radians(fovDeg);
+    float nx = (float(px) + 0.5) / float(w) * 2.0 - 1.0;
+    float ny = 1.0 - (float(py) + 0.5) / float(h) * 2.0;
+
+    nx *= aspect;
+    float tanHalfFov = tan(fovRad * 0.5);
+    nx *= tanHalfFov;
+    ny *= tanHalfFov;
+
+    // inverse view for direction in world space
+    mat4 invView = inverse(view);
+    vec4 rayDirView = normalize(vec4(nx, ny, -1.0, 0.0));
+    vec4 rayDirWorld = invView * rayDirView;
+
+    Ray r;
+    r.origin = camPos;
+    r.direction = normalize(vec3(rayDirWorld));
+    return r;
+}
+
+void main()
+{
+    ivec2 gid = ivec2(gl_GlobalInvocationID.xy);
+    if (gid.x >= imageWidth || gid.y >= imageHeight) return;
+
+    Ray ray = generateRay(gid.x, gid.y, imageWidth, imageHeight, cameraPos, viewMat, fov, aspect);
+
+    vec3 hitPoint, hitNormal;
+    bool hit = intersectOctreeIterative(ray.origin, ray.direction, hitPoint, hitNormal);
+
+    vec3 color = vec3(0.0);
+    if (hit) {
+        color = shade(hitPoint, hitNormal);
+    }
+
+    imageStore(outputImage, gid, vec4(color, 1.0));
+}
+)";
+
+static const char* g_fsqVertSrc = R"(
+#version 430
+layout(location = 0) in vec2 inPos;
+out vec2 uv;
+void main() {
+    uv = 0.5*(inPos+vec2(1.0));
+    gl_Position = vec4(inPos, 0.0, 1.0);
+}
+)";
+
+static const char* g_fsqFragSrc = R"(
+#version 430
+in vec2 uv;
+out vec4 fragColor;
+
+uniform sampler2D tex;
+
+void main() {
+    fragColor = texture(tex, uv);
+}
+)";
+
+// ============ RayTracerBVH Implementation ============
+
+RayTracerBVH::RayTracerBVH()
+	: m_octreeRoot(nullptr),
+	m_computeInited(false),
+	m_outputTex(0),
+	m_fullscreenVAO(0),
+	m_fullscreenVBO(0),
+	m_computeProg(0),
+	m_fsqProg(0),
+	m_nodeSSBO(0),
+	m_numNodes(0)
+{
+}
+
+RayTracerBVH::~RayTracerBVH()
+{
+	// Clean up GL resources
+	if (m_outputTex) {
+		glDeleteTextures(1, &m_outputTex);
+	}
+	if (m_fullscreenVBO) {
+		glDeleteBuffers(1, &m_fullscreenVBO);
+	}
+	if (m_fullscreenVAO) {
+		glDeleteVertexArrays(1, &m_fullscreenVAO);
+	}
+	if (m_computeProg) {
+		glDeleteProgram(m_computeProg);
+	}
+	if (m_fsqProg) {
+		glDeleteProgram(m_fsqProg);
+	}
+	if (m_nodeSSBO) {
+		glDeleteBuffers(1, &m_nodeSSBO);
+	}
+}
+
+void RayTracerBVH::setOctree(OctreeNode* root, const VoxelGrid& grid)
+{
 	m_octreeRoot = root;
 	m_grid = grid;
-}
 
-// A helper to intersect a ray with an axis-aligned bounding box given by bmin and bmax.
-// Returns true if there is an intersection and sets tNear and tFar.
-bool RayTracerBVH::intersectAABB(const Ray& ray, const glm::vec3& bmin, const glm::vec3& bmax,
-	float& tNear, float& tFar) {
-	glm::vec3 invDir = 1.0f / ray.direction;
-	glm::vec3 t1 = (bmin - ray.origin) * invDir;
-	glm::vec3 t2 = (bmax - ray.origin) * invDir;
+	// Flatten the octree into a single array for the SSBO
+	// BFS or DFS approach:
+	m_flatNodes.clear();
 
-	glm::vec3 tMin = glm::min(t1, t2);
-	glm::vec3 tMax = glm::max(t1, t2);
+	if (!root) return;
 
-	tNear = std::max(std::max(tMin.x, tMin.y), tMin.z);
-	tFar = std::min(std::min(tMax.x, tMax.y), tMax.z);
+	// We'll store each node in a queue
+	// We'll keep the index in the array so children can reference it
+	std::queue<OctreeNode*> q;
+	q.push(root);
 
-	return tNear <= tFar && tFar > 0;
-}
+	// We also need a map from OctreeNode* -> index
+	std::unordered_map<OctreeNode*, int> indexMap;
+	indexMap[root] = 0;
 
-// Given a ray, traverse the octree recursively and find the closest hit that represents an interface.
-// For simplicity we assume that a leaf (isLeaf==true) and isSolid==true is “occupied” (hit).
+	// Pre-insert the root
+	m_flatNodes.push_back(GPUNodes{ 0,0,0,0,0,0,{ -1,-1,-1,-1,-1,-1,-1,-1 } });
 
-bool RayTracerBVH::intersectOctree(const Ray& ray, OctreeNode* node, float tMin, float tMax,
-	glm::vec3& hitPoint, glm::vec3& hitNormal) {
-	if (!node) return false;
+	while (!q.empty()) {
+		OctreeNode* nd = q.front();
+		q.pop();
+		int idx = indexMap[nd];
 
-	float vx = m_grid.voxelSize;
-	glm::vec3 boxMin(m_grid.minX + node->x * vx,
-		m_grid.minY + node->y * vx,
-		m_grid.minZ + node->z * vx);
-	glm::vec3 boxMax = boxMin + glm::vec3(node->size * vx);
-
-	float tNear, tFar;
-	if (!intersectAABB(ray, boxMin, boxMax, tNear, tFar)) {
-		return false;
-	}
-
-	if (node->isLeaf && node->isSolid) {
-		// Use intersection point as hit point
-		hitPoint = ray.origin + ray.direction * tNear;
-
-		// Compute normal based on hit face
-		glm::vec3 center = (boxMin + boxMax) * 0.5f;
-		hitNormal = glm::normalize(hitPoint - center);
-
-		return true;
-	}
-
-	if (!node->isLeaf) {
-		float closest = std::numeric_limits<float>::max();
-		bool hit = false;
-		glm::vec3 tempHit, tempNormal;
+		// Fill in data
+		m_flatNodes[idx].x = nd->x;
+		m_flatNodes[idx].y = nd->y;
+		m_flatNodes[idx].z = nd->z;
+		m_flatNodes[idx].size = nd->size;
+		m_flatNodes[idx].isLeaf = (nd->isLeaf ? 1 : 0);
+		m_flatNodes[idx].isSolid = (nd->isSolid ? 1 : 0);
 
 		for (int i = 0; i < 8; i++) {
-			if (node->children[i] &&
-				intersectOctree(ray, node->children[i], tMin, tMax, tempHit, tempNormal)) {
-				float dist = glm::length(tempHit - ray.origin);
-				if (dist < closest) {
-					closest = dist;
-					hitPoint = tempHit;
-					hitNormal = tempNormal;
-					hit = true;
-				}
-			}
+			m_flatNodes[idx].child[i] = -1; // default
 		}
-		return hit;
-	}
 
-	return false;
-}
-
-// A simple Lambertian shading function (white diffuse light from direction [-1,-1,-1])
-glm::vec3 RayTracerBVH::shade(const glm::vec3& hitPoint, const glm::vec3& normal, const glm::vec3& cameraPos) {
-	// Simplified shading for debugging
-	return glm::vec3(1.0f, 0.8f, 0.6f); // Just return a constant color for now
-}
-
-// Generate a ray from the camera for a given pixel coordinate.
-// We assume that invVP is the inverse of the view*projection matrix.
-Ray RayTracerBVH::generateRay(int x, int y, int width, int height, const glm::mat4& invVP) {
-	// Convert pixel to NDC space
-	float ndcX = (2.0f * x) / width - 1.0f;
-	float ndcY = 1.0f - (2.0f * y) / height;  // Flip Y for OpenGL
-
-	// Unproject near and far points
-	glm::vec4 nearPoint = invVP * glm::vec4(ndcX, ndcY, -1.0f, 1.0f);
-	glm::vec4 farPoint = invVP * glm::vec4(ndcX, ndcY, 1.0f, 1.0f);
-
-	nearPoint /= nearPoint.w;
-	farPoint /= farPoint.w;
-
-	Ray ray;
-	ray.origin = glm::vec3(nearPoint);
-	ray.direction = glm::normalize(glm::vec3(farPoint - nearPoint));
-
-	return ray;
-}
-
-// The main render function for the ray tracer. It loops over all pixels,
-// casts rays through the scene, and builds a collection of tiny triangles (e.g. quads)
-// that represent the computed radiance (you could also render to an image buffer).
-// Here we “build” triangles for each hit pixel that can later be uploaded to GPU buffers.
-
-std::vector<MCTriangle> RayTracerBVH::renderScene(const Camera& camera, const glm::mat4& view,
-	const glm::mat4& proj, int width, int height) {
-	std::vector<MCTriangle> triList;
-	triList.reserve(width * height / 2); // Pre-allocate for better performance
-
-	glm::mat4 vp = proj * view;
-	glm::mat4 invVP = glm::inverse(vp);
-
-	// Calculate scene scale
-	glm::vec3 sceneCenter = camera.getTarget();
-	float sceneDist = glm::length(camera.getPos() - sceneCenter);
-	float baseQuadSize = sceneDist * 0.001f;
-
-	// Smaller step size for denser coverage
-	const int stepSize = 1; // Sample every pixel for better coverage
-
-#pragma omp parallel for collapse(2) // Enable OpenMP parallelization if available
-	for (int y = 0; y < height; y += stepSize) {
-		for (int x = 0; x < width; x += stepSize) {
-			Ray ray = generateRay(x, y, width, height, invVP);
-			glm::vec3 hitPoint, hitNormal;
-
-			if (intersectOctree(ray, m_octreeRoot, 0.f, std::numeric_limits<float>::max(),
-				hitPoint, hitNormal)) {
-
-				// Distance-based quad sizing
-				float dist = glm::length(hitPoint - camera.getPos());
-				float quadSize = baseQuadSize * (dist / sceneDist);
-				quadSize = std::max(quadSize, 0.001f); // Ensure minimum size
-
-				// Create basis vectors for quad
-				glm::vec3 viewDir = glm::normalize(camera.getPos() - hitPoint);
-				glm::vec3 right = glm::normalize(glm::cross(hitNormal, glm::vec3(0, 1, 0)));
-				if (glm::length(right) < 0.001f) {
-					right = glm::normalize(glm::cross(hitNormal, glm::vec3(1, 0, 0)));
-				}
-				glm::vec3 up = glm::normalize(glm::cross(right, hitNormal));
-
-				// Generate quad corners
-				glm::vec3 v0 = hitPoint + (-right - up) * quadSize;
-				glm::vec3 v1 = hitPoint + (right - up) * quadSize;
-				glm::vec3 v2 = hitPoint + (-right + up) * quadSize;
-				glm::vec3 v3 = hitPoint + (right + up) * quadSize;
-
-				// Create triangles
-				MCTriangle tri1, tri2;
-				tri1.v[0] = v0; tri1.v[1] = v1; tri1.v[2] = v2;
-				tri2.v[0] = v2; tri2.v[1] = v1; tri2.v[2] = v3;
-
-				for (int i = 0; i < 3; i++) {
-					tri1.normal[i] = hitNormal;
-					tri2.normal[i] = hitNormal;
-				}
-
-				// Thread-safe insertion
-#pragma omp critical
-				{
-					triList.push_back(tri1);
-					triList.push_back(tri2);
+		if (!nd->isLeaf) {
+			// push children
+			for (int i = 0; i < 8; i++) {
+				OctreeNode* c = nd->children[i];
+				if (c) {
+					if (indexMap.find(c) == indexMap.end()) {
+						int newIdx = (int)m_flatNodes.size();
+						indexMap[c] = newIdx;
+						m_flatNodes.push_back(GPUNodes{});
+						for (int j = 0; j < 8; j++) {
+							m_flatNodes.back().child[j] = -1;
+						}
+					}
+					int cIndex = indexMap[c];
+					m_flatNodes[idx].child[i] = cIndex;
+					q.push(c);
 				}
 			}
 		}
 	}
 
-	return triList;
+	m_numNodes = (int)m_flatNodes.size();
+
+	// Create or update SSBO
+	if (!m_nodeSSBO) {
+		glGenBuffers(1, &m_nodeSSBO);
+	}
+	glBindBuffer(GL_SHADER_STORAGE_BUFFER, m_nodeSSBO);
+	glBufferData(GL_SHADER_STORAGE_BUFFER,
+		m_numNodes * sizeof(GPUNodes),
+		m_flatNodes.data(),
+		GL_STATIC_DRAW);
+	glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 1, m_nodeSSBO);
+	glBindBuffer(GL_SHADER_STORAGE_BUFFER, 0);
+}
+
+// Ensure we have created/compiled the compute pipeline, the fullscreen pass, etc.
+void RayTracerBVH::ensureComputeInitialized()
+{
+	if (m_computeInited) return;
+	m_computeInited = true;
+
+	// =============== Compute Shader Program ===============
+	{
+		GLuint cs = glCreateShader(GL_COMPUTE_SHADER);
+		glShaderSource(cs, 1, &g_computeShaderSrc, nullptr);
+		glCompileShader(cs);
+
+		GLint status;
+		glGetShaderiv(cs, GL_COMPILE_STATUS, &status);
+		if (!status) {
+			char log[512];
+			glGetShaderInfoLog(cs, 512, nullptr, log);
+			std::cerr << "[Compute Shader] Compile Error:\n" << log << std::endl;
+			glDeleteShader(cs);
+			m_computeProg = 0;
+			return;
+		}
+
+		m_computeProg = glCreateProgram();
+		glAttachShader(m_computeProg, cs);
+		glLinkProgram(m_computeProg);
+
+		glGetProgramiv(m_computeProg, GL_LINK_STATUS, &status);
+		if (!status) {
+			char log[512];
+			glGetProgramInfoLog(m_computeProg, 512, nullptr, log);
+			std::cerr << "[Compute Program] Link Error:\n" << log << std::endl;
+			glDeleteProgram(m_computeProg);
+			m_computeProg = 0;
+			return;
+		}
+		glDeleteShader(cs);
+	}
+
+	// =============== Fullscreen Quad Program ===============
+	{
+		// Vertex shader
+		GLuint vs = glCreateShader(GL_VERTEX_SHADER);
+		glShaderSource(vs, 1, &g_fsqVertSrc, nullptr);
+		glCompileShader(vs);
+
+		GLint status;
+		glGetShaderiv(vs, GL_COMPILE_STATUS, &status);
+		if (!status) {
+			char log[512];
+			glGetShaderInfoLog(vs, 512, nullptr, log);
+			std::cerr << "[FSQ Vertex Shader] Compile Error:\n" << log << std::endl;
+			glDeleteShader(vs);
+			return;
+		}
+
+		// Fragment shader
+		GLuint fs = glCreateShader(GL_FRAGMENT_SHADER);
+		glShaderSource(fs, 1, &g_fsqFragSrc, nullptr);
+		glCompileShader(fs);
+
+		glGetShaderiv(fs, GL_COMPILE_STATUS, &status);
+		if (!status) {
+			char log[512];
+			glGetShaderInfoLog(fs, 512, nullptr, log);
+			std::cerr << "[FSQ Fragment Shader] Compile Error:\n" << log << std::endl;
+			glDeleteShader(vs);
+			glDeleteShader(fs);
+			return;
+		}
+
+		m_fsqProg = glCreateProgram();
+		glAttachShader(m_fsqProg, vs);
+		glAttachShader(m_fsqProg, fs);
+		glLinkProgram(m_fsqProg);
+
+		glGetProgramiv(m_fsqProg, GL_LINK_STATUS, &status);
+		if (!status) {
+			char log[512];
+			glGetProgramInfoLog(m_fsqProg, 512, nullptr, log);
+			std::cerr << "[FSQ Program] Link Error:\n" << log << std::endl;
+			glDeleteProgram(m_fsqProg);
+			m_fsqProg = 0;
+		}
+		glDeleteShader(vs);
+		glDeleteShader(fs);
+	}
+
+	// =============== Create fullscreen quad geometry ===============
+	{
+		glGenVertexArrays(1, &m_fullscreenVAO);
+		glBindVertexArray(m_fullscreenVAO);
+
+		glGenBuffers(1, &m_fullscreenVBO);
+		glBindBuffer(GL_ARRAY_BUFFER, m_fullscreenVBO);
+		// 2D positions covering the entire screen
+		float fsqVerts[] = {
+			-1.f, -1.f,
+			+1.f, -1.f,
+			-1.f, +1.f,
+			+1.f, +1.f
+		};
+		glBufferData(GL_ARRAY_BUFFER, sizeof(fsqVerts), fsqVerts, GL_STATIC_DRAW);
+		glEnableVertexAttribArray(0);
+		glVertexAttribPointer(0, 2, GL_FLOAT, GL_FALSE, 2 * sizeof(float), (void*)0);
+
+		glBindVertexArray(0);
+	}
+}
+
+void RayTracerBVH::renderSceneCompute(const Camera& camera,
+	int width, int height,
+	float aspect,
+	float fovDeg)
+{
+	if (!m_computeInited || m_computeProg == 0 || m_fsqProg == 0) {
+		std::cerr << "[RayTracerBVH] Compute pipeline not initialized or failed.\n";
+		return;
+	}
+
+	// If we have no data, skip
+	if (m_numNodes <= 0) {
+		return;
+	}
+
+	// Resize or create output image
+	if (!m_outputTex) {
+		glGenTextures(1, &m_outputTex);
+	}
+	glActiveTexture(GL_TEXTURE0);
+	glBindTexture(GL_TEXTURE_2D, m_outputTex);
+
+	// Allocate or re-allocate as RGBA32F
+	glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA32F, width, height,
+		0, GL_RGBA, GL_FLOAT, nullptr);
+	glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
+	glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
+
+	// Bind SSBO
+	glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 1, m_nodeSSBO);
+
+	// Use compute shader
+	glUseProgram(m_computeProg);
+
+	// Bind image for output
+	glBindImageTexture(0, m_outputTex, 0, GL_FALSE, 0, GL_WRITE_ONLY, GL_RGBA32F);
+
+	// set uniforms
+	GLint locNumNodes = glGetUniformLocation(m_computeProg, "numNodes");
+	GLint locGridMin = glGetUniformLocation(m_computeProg, "gridMin");
+	GLint locVoxelSize = glGetUniformLocation(m_computeProg, "voxelSize");
+	GLint locInvVP = glGetUniformLocation(m_computeProg, "invVP");
+	GLint locViewMat = glGetUniformLocation(m_computeProg, "viewMat");
+	GLint locCamPos = glGetUniformLocation(m_computeProg, "cameraPos");
+	GLint locAspect = glGetUniformLocation(m_computeProg, "aspect");
+	GLint locFov = glGetUniformLocation(m_computeProg, "fov");
+	GLint locWidth = glGetUniformLocation(m_computeProg, "imageWidth");
+	GLint locHeight = glGetUniformLocation(m_computeProg, "imageHeight");
+
+	glUniform1i(locNumNodes, m_numNodes);
+	glUniform3f(locGridMin, m_grid.minX, m_grid.minY, m_grid.minZ);
+	glUniform1f(locVoxelSize, m_grid.voxelSize);
+
+	// For reference, we can pass invVP if you prefer unproject approach:
+	glm::mat4 view = camera.getView();
+	glm::mat4 invVP = glm::inverse(glm::perspective(glm::radians(fovDeg), aspect, 0.01f, 5000.f) * view);
+	glUniformMatrix4fv(locInvVP, 1, GL_FALSE, &invVP[0][0]);
+	glUniformMatrix4fv(locViewMat, 1, GL_FALSE, &view[0][0]);
+
+	glm::vec3 camPos = camera.getPos();
+	glUniform3f(locCamPos, camPos.x, camPos.y, camPos.z);
+
+	glUniform1f(locAspect, aspect);
+	glUniform1f(locFov, fovDeg);
+
+	glUniform1i(locWidth, width);
+	glUniform1i(locHeight, height);
+
+	// Dispatch
+	int gx = (width + 7) / 8;   // match local_size_x=8
+	int gy = (height + 7) / 8;   // match local_size_y=8
+	glDispatchCompute(gx, gy, 1);
+
+	// Wait for compute
+	glMemoryBarrier(GL_SHADER_IMAGE_ACCESS_BARRIER_BIT);
+
+	// Now draw a fullscreen quad to show the result
+	glUseProgram(m_fsqProg);
+
+	// Our texture is bound to GL_TEXTURE0, so set the sampler uniform
+	GLint locTex = glGetUniformLocation(m_fsqProg, "tex");
+	glUniform1i(locTex, 0); // texture unit 0
+
+	glBindVertexArray(m_fullscreenVAO);
+	glDrawArrays(GL_TRIANGLE_STRIP, 0, 4);
+	glBindVertexArray(0);
+
+	// Unbind
+	glBindImageTexture(0, 0, 0, GL_FALSE, 0, GL_WRITE_ONLY, GL_RGBA32F);
+	glUseProgram(0);
 }
