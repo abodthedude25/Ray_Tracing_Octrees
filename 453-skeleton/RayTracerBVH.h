@@ -20,6 +20,7 @@ struct Ray {
 struct GPUNodes {
 	int x, y, z, size;
 	int isLeaf, isSolid;
+	int isUniform;
 	int child[8];
 };
 

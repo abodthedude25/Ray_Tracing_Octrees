@@ -1,79 +1,69 @@
-// VolumeRaycastRenderer.h
 #pragma once
-#include "Camera.h"
-#include "Geometry.h"
 #include "Renderer.h"
 #include <vector>
+#include <glm/glm.hpp>
+#include "OctreeVoxel.h" // for VoxelGrid
+#include "Camera.h"      // for the Camera reference
 
-class VolumeRaycastRenderer : public Renderer {
+// Structure for point-radiation (unchanged)
+struct RadiationPoint {
+	glm::vec3 worldPos;
+	float radius;
+};
+
+class VolumeRaycastRenderer {
 public:
 	VolumeRaycastRenderer();
 	~VolumeRaycastRenderer();
 
-	// Override the render method from Renderer
-	// Since our volume renderer doesn't generate triangles, we return an empty vector
-	std::vector<MCTriangle> render(const OctreeNode* node,
-		const VoxelGrid& grid,
-		int x0, int y0, int z0, int size) override;
+	void init(const VoxelGrid& grid);
+	void setCamera(const Camera* camPtr) { m_cameraPtr = camPtr; }
 
-	// Initialize the volume textures from the voxel grid data
-	void initVolume(const VoxelGrid& grid);
+	// point radiation usage
+	void clearRadiationVolume();
+	void updateSplatPoints(const std::vector<RadiationPoint>& pts);
+	void dispatchRadiationCompute();
+	void dispatchPrecompute();
 
-	// Draw the volume using integrated raycasting and splatting
-	void drawRaycast(const Camera& cam,
-		float aspectRatio,
-		int screenW, int screenH);
+	// final volume raycast
+	void drawRaycast(float aspect);
 
-	// Update the peeling plane position and corresponding mask texture
-	void updatePeelPlane(float newZ);
+	bool isInitialized() const { return m_inited; }
 
 private:
-	// OpenGL texture IDs
-	unsigned int volumeTextureID;  // 3D texture for volume density
-	unsigned int maskTextureID;    // 3D texture for masking (peeling)
-	unsigned int gaussian2DTexID;  // 2D texture for XY-plane Gaussian kernel
-	unsigned int gaussian1DTexID;  // 1D texture for Z-axis Gaussian kernel
+	void createVolumeTexture(const VoxelGrid& grid);
+	void createRadiationTexture();
+	void createComputeShader();
+	void createPrecomputeShader();
+	void createPrecomputeTextures();
+	void createRaycastProgram();
+	void createFullscreenQuad();
+	void bindRaycastUniforms(float aspect);
 
-	glm::vec3 boxMin, boxMax;     // The world-space bounding box corners
+private:
+	// GL IDs
+	GLuint m_volumeTex;
+	GLuint m_radiationTex;
+	GLuint m_computeProg;
+	GLuint m_raycastProg;
+	GLuint m_quadVAO, m_quadVBO;
 
-	// Shader program ID for raycasting and splatting
-	unsigned int raycastShaderProg;
+	GLuint m_precomputeProg;  // The precompute shader program
+	GLuint m_gradientMagTex;  // Texture for gradient magnitude
+	GLuint m_gradientDirTex;  // Texture for gradient direction
+	GLuint m_edgeFactorTex;   // Texture for edge factors
+	bool m_precomputeNeeded;  // Flag for when precomputation is needed
 
-	// Vertex Array Object and Vertex Buffer Object for fullscreen quad
-	unsigned int quadVAO, quadVBO;
+	// grid info
+	int m_dimX, m_dimY, m_dimZ;
+	glm::vec3 m_boxMin, m_boxMax;
+	const VoxelGrid* m_gridPtr;
 
-	// Dimensions of the volume grid
-	int volDimX, volDimY, volDimZ;
+	// for point-splats
+	std::vector<RadiationPoint> m_splatPoints;
 
-	// Pointer to the voxel grid data
-	const VoxelGrid* gridPtr;
-	GLuint tempTexture;     // For compute shader passes
-	GLuint tempTexture2;    // Additional temp texture for compute
-	bool hasComputeShaders; // Flag to check compute shader support
-	GLuint antiAliasComputeProgram;
+	// camera pointer
+	const Camera* m_cameraPtr = nullptr;
 
-	bool initComputeShader();
-	void checkComputeShaderCapabilities();
-
-	// Initialize the mask volume based on a peeling plane
-	void initMaskVolume();
-
-	// Initialize Gaussian kernel textures
-	void initGaussianKernels();
-	void applyParallelAntiAliasing(GLuint sourceTexture, GLuint destTexture);
-
-	// Generate Gaussian kernel data
-	std::vector<float> generateGaussian2DKernel(int size = 64, float sigma = 0.4f);
-	std::vector<float> generateGaussian1DKernel(int size = 64, float sigma = 0.4f);
-
-	// Anti-aliasing helpers
-	void applyJitteringSlice(std::vector<float>& maskData, int dimX, int dimY, int dimZ, int sliceZ);
-	void applyCubicBSplineFilterSlice(std::vector<float>& maskData,
-		int dimX,
-		int dimY,
-		int dimZ,
-		int sliceZ);
-	// Shader compilation helpers
-	unsigned int compileShader(const char* src, GLenum type);
-	unsigned int createRaycastProgram();
+	bool m_inited;
 };

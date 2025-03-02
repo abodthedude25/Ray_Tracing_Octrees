@@ -192,9 +192,9 @@ struct Assignment4 : public CallbackInterface {
 	Assignment4()
 		: wireframeMode(false),
 		showOctreeWire(false),
-		currentMode(RenderMode::MarchingCubes),
-		oldMode(RenderMode::MarchingCubes),
-		camera(glm::radians(90.f), glm::radians(90.f), 3.f),
+		currentMode(RenderMode::VolumeRaycast),
+		oldMode(RenderMode::VolumeRaycast),
+		camera(glm::radians(90.0f), glm::radians(0.f), 500.f),
 		aspect(1.f),
 		rightMouseDown(false),
 		leftMouseDown(false),
@@ -202,7 +202,9 @@ struct Assignment4 : public CallbackInterface {
 		buildingCenter(0.f),
 		peelPlaneZ(0.0f),
 		renderModeToggle(0)
-	{}
+	{
+		camera.pan(0.f, 100.f);
+	}
 
 	// ----------- KEY CALLBACK -------------
 	void keyCallback(int key, int scancode, int action, int mods) override {
@@ -214,26 +216,51 @@ struct Assignment4 : public CallbackInterface {
 				showOctreeWire = !showOctreeWire;
 			}
 			else if (key == GLFW_KEY_R) {
-				// cycle among MC -> Blocks -> DC -> BVH -> Volume
-				if (currentMode == RenderMode::MarchingCubes) {
+				// First store the old mode
+				oldMode = currentMode;
+
+				// Clear geometry caches when switching modes
+				cpuGeom.verts.clear();
+				cpuGeom.normals.clear();
+				cpuGeom.cols.clear();
+
+				// Cycle through modes in order
+				switch (currentMode) {
+				case RenderMode::MarchingCubes:
 					currentMode = RenderMode::VoxelBlocks;
-				}
-				else if (currentMode == RenderMode::VoxelBlocks) {
+					break;
+				case RenderMode::VoxelBlocks:
 					currentMode = RenderMode::DualContouring;
-				}
-				else if (currentMode == RenderMode::DualContouring) {
-					currentMode = RenderMode::BVHRayTrace;
-				}
-				else if (currentMode == RenderMode::BVHRayTrace) {
+					break;
+				case RenderMode::DualContouring:
 					currentMode = RenderMode::VolumeRaycast;
-				}
-				else {
+					break;
+				case RenderMode::BVHRayTrace:
 					currentMode = RenderMode::MarchingCubes;
+					break;
+				case RenderMode::VolumeRaycast:
+					currentMode = RenderMode::BVHRayTrace;
+					break;
 				}
-				std::cout << "Switched render mode!\n";
+
+				std::cout << "Switched render mode from ";
+				switch (oldMode) {
+				case RenderMode::MarchingCubes:    std::cout << "MC"; break;
+				case RenderMode::DualContouring:   std::cout << "DC"; break;
+				case RenderMode::VoxelBlocks:      std::cout << "Blocks"; break;
+				case RenderMode::BVHRayTrace:      std::cout << "RayTrace"; break;
+				case RenderMode::VolumeRaycast:    std::cout << "Volume"; break;
+				}
+				std::cout << " to ";
+				switch (currentMode) {
+				case RenderMode::MarchingCubes:    std::cout << "MC\n"; break;
+				case RenderMode::DualContouring:   std::cout << "DC\n"; break;
+				case RenderMode::VoxelBlocks:      std::cout << "Blocks\n"; break;
+				case RenderMode::BVHRayTrace:      std::cout << "RayTrace\n"; break;
+				case RenderMode::VolumeRaycast:    std::cout << "Volume\n"; break;
+				}
 			}
 			else if (key == GLFW_KEY_C && currentMode == RenderMode::BVHRayTrace) {
-				// Re-center camera on buildings
 				camera.setTarget(buildingCenter);
 				std::cout << "Camera target set to building center: "
 					<< buildingCenter.x << ", "
@@ -247,12 +274,7 @@ struct Assignment4 : public CallbackInterface {
 				peelPlaneZ -= 0.05f;
 			}
 			else if (key == GLFW_KEY_X) {
-				if (renderModeToggle == 0) {
-					renderModeToggle = 1;
-				}
-				else {
-					renderModeToggle = 0;
-				}
+				renderModeToggle = renderModeToggle == 0 ? 1 : 0;
 			}
 		}
 	}
@@ -288,6 +310,9 @@ struct Assignment4 : public CallbackInterface {
 		aspect = float(width) / float(height);
 		lastWindowWidth = width;
 		lastWindowHeight = height;
+
+		// Tell OpenGL to match the new window size:
+		glViewport(0, 0, width, height);
 	}
 
 	void viewPipeline(ShaderProgram& sp) {
@@ -379,7 +404,7 @@ int main() {
 	window.setCallbacks(app);
 
 	bool useGDB = true;
-	int dim = 64;
+	int dim = 256;
 	float voxelSize = 0.025f;
 	std::string cacheFilename = "sceneCache.bin";
 
@@ -388,26 +413,21 @@ int main() {
 	if (useGDB) {
 		// Attempt to load from your own caching mechanism, or fallback
 		if (!loadVoxelGrid(cacheFilename, grid)) {
-			// fallback multi-shell sphere
-			auto vol = generateTestVolume(dim, dim, dim);
-			grid.dimX = dim; grid.dimY = dim; grid.dimZ = dim;
-			grid.minX = -0.5f; grid.minY = -0.5f; grid.minZ = -0.5f;
-			grid.voxelSize = 1.f / dim;
-			grid.data.resize(dim * dim * dim, VoxelState::EMPTY);
-
-			for (int z = 0; z < dim; z++) {
-				for (int y = 0; y < dim; y++) {
-					for (int x = 0; x < dim; x++) {
-						int idx = x + y * dim + z * (dim * dim);
-						if (vol[idx] > 0.0f) {
-							grid.data[idx] = VoxelState::FILLED;
-						}
-						else {
-							grid.data[idx] = VoxelState::EMPTY;
-						}
-					}
-				}
+			grid = loadCSVDataIntoVoxelGrid("./DT/DTVerts.csv", "./DT/DTFaces.csv", voxelSize);
+			if (grid.data.empty()) {
+				std::cerr << "Voxel grid is empty. Exiting." << std::endl;
+				return -1;
 			}
+
+			// Re-center after load, *before* building the octree
+			recenterFilledVoxels(grid);
+
+			if (grid.data.empty()) {
+				std::cerr << "Voxel grid is empty. Exiting.\n";
+				return -1;
+			}
+
+			// Save the processed grid to a cache file.
 			saveVoxelGrid(cacheFilename, grid);
 		}
 	}
@@ -472,8 +492,11 @@ int main() {
 	MarchingCubesRenderer      mcRenderer;
 	AdaptiveDualContouringRenderer dcRenderer;
 	VoxelCubeRenderer          blockRenderer;
-	VolumeRaycastRenderer      volRenderer;
-	volRenderer.initVolume(grid);
+	static VolumeRaycastRenderer pointRadRenderer;
+	std::cout << "Before createComputeShader()" << std::endl;
+	pointRadRenderer.init(grid);
+	std::cout << "After createComputeShader()" << std::endl;
+
 	std::vector<MCTriangle> triCache;
 	RayTracerBVH bvhRayTracer;
 	bvhRayTracer.ensureComputeInitialized();
@@ -501,43 +524,58 @@ int main() {
 	auto lastTime = clock_t::now();
 	int frameCount = 0;
 
+	std::cout << "Entering main loop...\n";
+
 	while (!window.shouldClose()) {
 		glfwPollEvents();
 
-		// Clear
+		// Always clear both buffers at the start
 		glClearColor(0.0f, 0.0f, 0.0f, 1.0f);
 		glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT);
 
-		if (app->currentMode != RenderMode::VolumeRaycast) {
-			glEnable(GL_DEPTH_TEST);
-		}
-		else {
+		// Handle mode changes first
+		if (app->currentMode != app->oldMode) {
+			// Clear all geometry caches
+			triCache.clear();
+			app->cpuGeom.verts.clear();
+			app->cpuGeom.normals.clear();
+			app->cpuGeom.cols.clear();
+
+			// Reset OpenGL state
+			glDisable(GL_BLEND);
 			glDisable(GL_DEPTH_TEST);
+			glPolygonMode(GL_FRONT_AND_BACK, GL_FILL);
+
+			app->oldMode = app->currentMode;
 		}
 
-		// If user switched mode, clear the triCache (for CPU geom modes)
-		if (app->currentMode != oldMode) {
-			triCache.clear();
-			oldMode = app->currentMode;
+		// Set appropriate global state for each mode
+		if (app->currentMode == RenderMode::VolumeRaycast) {
+			glDisable(GL_DEPTH_TEST);
+			glEnable(GL_BLEND);
+			glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
+		}
+		else {
+			glDisable(GL_BLEND);
+			glEnable(GL_DEPTH_TEST);
 		}
 
 		if (app->currentMode == RenderMode::VolumeRaycast) {
-			// Volume raycasting pass
+			// REPLACED the old volRenderer code with new pointRad usage
+			glDisable(GL_DEPTH_TEST);
 			glEnable(GL_BLEND);
 			glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
 
-			if (app->wireframeMode) {
-				glPolygonMode(GL_FRONT_AND_BACK, GL_LINE);
-			}
-			volRenderer.drawRaycast(app->camera,
-				app->aspect,
-				window.getWidth(),
-				window.getHeight());
-			glPolygonMode(GL_FRONT_AND_BACK, GL_FILL);
+			// Clear
+			glClearColor(0.2f, 0.f, 0.f, 1.f);
+			glClear(GL_COLOR_BUFFER_BIT);
+
+			// If we want to keep camera updates:
+			pointRadRenderer.setCamera(&app->camera);
+			pointRadRenderer.drawRaycast(app->aspect);
+
 			glDisable(GL_BLEND);
-
-			volRenderer.updatePeelPlane(app->peelPlaneZ);
-
+			glEnable(GL_DEPTH_TEST);
 		}
 		else if (app->currentMode == RenderMode::MarchingCubes) {
 			if (triCache.empty()) {
@@ -667,6 +705,7 @@ int main() {
 			lastTime = now;
 		}
 	}
+	std::cout << "Exiting main loop...\n";
 
 	glfwTerminate();
 	return 0;

@@ -8,32 +8,27 @@
 
 // ============ GPU Shader Source (inline) ============
 static const char* g_computeShaderSrc = R"(
-#version 430
+#version 430 core
 
-// For local workgroup sizes, you can tweak these to best match your GPU
+// For local workgroup sizes
 layout(local_size_x = 8, local_size_y = 8) in;
 
-// We'll write color results to an RGBA32F image
+// Output image: final rendered image
 layout(rgba32f, binding = 0) uniform image2D outputImage;
 
-struct Ray {
-    vec3 origin;
-    vec3 direction;
-};
-
+// GPU octree node structure – note the added 'isUniform' field.
 struct OctreeNodeGPUStruct {
-    // x,y,z are int voxel indices
     int x;
     int y;
     int z;
     int size;
     int isLeaf;
     int isSolid;
+    int isUniform;  // 1 if uniform (all voxels are the same), else 0.
     int child[8];
 };
 
-layout(std430, binding = 1) buffer OctreeNodes
-{
+layout(std430, binding = 1) buffer OctreeNodes {
     OctreeNodeGPUStruct nodes[];
 };
 
@@ -48,83 +43,94 @@ uniform float fov;  // in degrees
 uniform int imageWidth;
 uniform int imageHeight;
 
-// ============ Utility functions ============
+struct Ray {
+    vec3 origin;
+    vec3 direction;
+};
 
-// simple AABB intersection test
-bool intersectAABB(vec3 rayOrigin, vec3 rayDir,
-                   vec3 bmin, vec3 bmax,
-                   out float tNear, out float tFar)
+// ---------- Utility Functions ----------
+
+bool intersectAABB(vec3 rayOrigin, vec3 rayDir, vec3 bmin, vec3 bmax, out float tNear, out float tFar)
 {
-    vec3 invDir = vec3(1.0) / rayDir;
+    vec3 invDir = 1.0 / rayDir;
     vec3 t1 = (bmin - rayOrigin) * invDir;
     vec3 t2 = (bmax - rayOrigin) * invDir;
-
     vec3 tMin = min(t1, t2);
     vec3 tMax = max(t1, t2);
-
     tNear = max(max(tMin.x, tMin.y), tMin.z);
-    tFar  = min(min(tMax.x, tMax.y), tMax.z);
-
+    tFar = min(min(tMax.x, tMax.y), tMax.z);
     return (tNear <= tFar && tFar > 0.0);
 }
 
-// Returns true if we hit a solid leaf, with the nearest hit recorded.
-// For performance, you may want to limit stack size or do early outs, etc.
+// ---------- Optimized Octree Traversal with Early Exit ----------
+
 bool intersectOctreeIterative(vec3 rayOrigin, vec3 rayDir,
                               out vec3 hitPoint, out vec3 hitNormal)
 {
-    // We'll track the nearest intersection
     float closestT = 1e30;
     bool hitFound = false;
     vec3 bestNormal = vec3(0.0);
 
-    // A small stack to hold node indices
-    // Adjust size if your octree can get deeper
+    // Stack for node indices
     int stack[128];
     int sp = 0;
-
-    // Push root node (index 0)
-    stack[sp++] = 0; // if your root is always 0
+    stack[sp++] = 0;  // Push root node (assumed index 0)
 
     while (sp > 0) {
         sp--;
         int nodeIdx = stack[sp];
-        if (nodeIdx < 0) {
-            continue;
-        }
+        if (nodeIdx < 0) continue;
 
         OctreeNodeGPUStruct node = nodes[nodeIdx];
 
-        // Compute AABB in world space
-        vec3 boxMin = gridMin + vec3(node.x, node.y, node.z) * voxelSize;
-        vec3 boxMax = boxMin + vec3(node.size) * voxelSize;
+        // Compute world-space AABB for the node.
+        vec3 nodeMin = gridMin + vec3(node.x, node.y, node.z) * voxelSize;
+        vec3 nodeMax = nodeMin + vec3(node.size) * voxelSize;
 
-        // Intersect bounding box
         float tNear, tFar;
-        if (!intersectAABB(rayOrigin, rayDir, boxMin, boxMax, tNear, tFar)) {
-            continue; // no intersection
-        }
+        if (!intersectAABB(rayOrigin, rayDir, nodeMin, nodeMax, tNear, tFar))
+            continue;
 
-        // If it's a leaf and solid, record hit
-        if (node.isLeaf == 1 && node.isSolid == 1) {
-            float tHit = max(0.0, tNear);
-            if (tHit < closestT && tHit <= tFar) {
-                closestT = tHit;
-                hitFound = true;
-                // approximate normal from center
-                vec3 center = 0.5 * (boxMin + boxMax);
-                vec3 p = rayOrigin + rayDir * tHit;
-                bestNormal = normalize(p - center);
-            }
-        }
-        else if (node.isLeaf == 0) {
-            // Not a leaf => push children onto the stack
-            for (int i = 0; i < 8; i++) {
-                int c = node.child[i];
-                if (c >= 0) {
-                    // push child
-                    stack[sp++] = c;
+        // Early exit if tNear is not better than current hit.
+        if (tNear >= closestT)
+            continue;
+        
+        // NEW: If this node is uniform (all voxels are the same), treat it as a leaf.
+        if (node.isUniform == 1) {
+            if (node.isSolid == 1) {  // Uniform and solid: update hit directly.
+                float tHit = max(0.0, tNear);
+                if (tHit < closestT && tHit <= tFar) {
+                    closestT = tHit;
+                    hitFound = true;
+                    vec3 center = 0.5 * (nodeMin + nodeMax);
+                    vec3 p = rayOrigin + rayDir * tHit;
+                    bestNormal = normalize(p - center);
                 }
+            }
+            // If uniform and empty, nothing to do.
+            continue;
+        }
+        
+        // If this is a leaf (non–uniform leaves are possible, though unlikely)
+        if (node.isLeaf == 1) {
+            if (node.isSolid == 1) {
+                float tHit = max(0.0, tNear);
+                if (tHit < closestT && tHit <= tFar) {
+                    closestT = tHit;
+                    hitFound = true;
+                    vec3 center = 0.5 * (nodeMin + nodeMax);
+                    vec3 p = rayOrigin + rayDir * tHit;
+                    bestNormal = normalize(p - center);
+                }
+            }
+            continue;
+        }
+        else {
+            // For non-uniform internal nodes, push all children.
+            for (int i = 0; i < 8; i++) {
+                int childIdx = node.child[i];
+                if (childIdx >= 0)
+                    stack[sp++] = childIdx;
             }
         }
     }
@@ -137,35 +143,27 @@ bool intersectOctreeIterative(vec3 rayOrigin, vec3 rayDir,
 }
 
 
-// quick Lambert color
+// Simple Lambert shading function.
 vec3 shade(vec3 hitPoint, vec3 normal)
 {
-    // A simple directional light from (-1,-1,-1)
     vec3 lightDir = normalize(vec3(-1.0, -1.0, -1.0));
     float ndotl = max(0.0, dot(normal, -lightDir));
-    vec3 color = vec3(1.0, 0.8, 0.6) * ndotl + vec3(0.1, 0.1, 0.1);
-    return color;
+    return vec3(1.0, 0.8, 0.6) * ndotl + vec3(0.1, 0.1, 0.1);
 }
 
-// Generate a primary ray for pixel (x, y).
-// This is a simpler approach than using invVP: we replicate
-// the typical pinhole camera approach using aspect & fov.
 Ray generateRay(int px, int py, int w, int h, vec3 camPos, mat4 view, float fovDeg, float aspect)
 {
     float fovRad = radians(fovDeg);
     float nx = (float(px) + 0.5) / float(w) * 2.0 - 1.0;
     float ny = 1.0 - (float(py) + 0.5) / float(h) * 2.0;
-
     nx *= aspect;
     float tanHalfFov = tan(fovRad * 0.5);
     nx *= tanHalfFov;
     ny *= tanHalfFov;
 
-    // inverse view for direction in world space
     mat4 invView = inverse(view);
     vec4 rayDirView = normalize(vec4(nx, ny, -1.0, 0.0));
     vec4 rayDirWorld = invView * rayDirView;
-
     Ray r;
     r.origin = camPos;
     r.direction = normalize(vec3(rayDirWorld));
@@ -175,18 +173,13 @@ Ray generateRay(int px, int py, int w, int h, vec3 camPos, mat4 view, float fovD
 void main()
 {
     ivec2 gid = ivec2(gl_GlobalInvocationID.xy);
-    if (gid.x >= imageWidth || gid.y >= imageHeight) return;
+    if (gid.x >= imageWidth || gid.y >= imageHeight)
+        return;
 
     Ray ray = generateRay(gid.x, gid.y, imageWidth, imageHeight, cameraPos, viewMat, fov, aspect);
-
     vec3 hitPoint, hitNormal;
     bool hit = intersectOctreeIterative(ray.origin, ray.direction, hitPoint, hitNormal);
-
-    vec3 color = vec3(0.0);
-    if (hit) {
-        color = shade(hitPoint, hitNormal);
-    }
-
+    vec3 color = hit ? shade(hitPoint, hitNormal) : vec3(0.0);
     imageStore(outputImage, gid, vec4(color, 1.0));
 }
 )";
@@ -272,7 +265,7 @@ void RayTracerBVH::setOctree(OctreeNode* root, const VoxelGrid& grid)
 	indexMap[root] = 0;
 
 	// Pre-insert the root
-	m_flatNodes.push_back(GPUNodes{ 0,0,0,0,0,0,{ -1,-1,-1,-1,-1,-1,-1,-1 } });
+	m_flatNodes.push_back(GPUNodes{ 0, 0, 0, 0, 0, 0, 0, { -1,-1,-1,-1,-1,-1,-1,-1 } });
 
 	while (!q.empty()) {
 		OctreeNode* nd = q.front();
@@ -286,6 +279,7 @@ void RayTracerBVH::setOctree(OctreeNode* root, const VoxelGrid& grid)
 		m_flatNodes[idx].size = nd->size;
 		m_flatNodes[idx].isLeaf = (nd->isLeaf ? 1 : 0);
 		m_flatNodes[idx].isSolid = (nd->isSolid ? 1 : 0);
+		m_flatNodes[idx].isUniform = (nd->isUniform ? 1 : 0);
 
 		for (int i = 0; i < 8; i++) {
 			m_flatNodes[idx].child[i] = -1; // default
