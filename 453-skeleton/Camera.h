@@ -26,6 +26,7 @@ public:
 	float getTheta() const;
 	float getPhi() const;
 	float getR() const;
+	glm::mat4 getProj(float aspect) const;
     
     // Pan the camera (this changes the target).
     void pan(float dx, float dy);

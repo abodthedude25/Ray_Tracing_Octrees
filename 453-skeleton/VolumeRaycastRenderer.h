@@ -30,6 +30,16 @@ public:
 
 	bool isInitialized() const { return m_inited; }
 
+	glm::vec3 getBoxMin() const { return m_boxMin; }
+	glm::vec3 getBoxMax() const { return m_boxMax; }
+	// Provide read-only pointer to the voxel grid
+	const VoxelGrid* getGridPtr() const { return m_gridPtr; }
+	bool m_enableOctreeSkip = false;
+	OctreeNode* m_octreeRoot = nullptr;
+	void setOctreeRoot(OctreeNode* root) {
+		m_octreeRoot = root;
+	}
+
 private:
 	void createVolumeTexture(const VoxelGrid& grid);
 	void createRadiationTexture();
@@ -39,8 +49,11 @@ private:
 	void createRaycastProgram();
 	void createFullscreenQuad();
 	void bindRaycastUniforms(float aspect);
+	void debugReadbackRadiationTexture(int x, int y, int z);
 
 private:
+	float m_timeValue;
+
 	// GL IDs
 	GLuint m_volumeTex;
 	GLuint m_radiationTex;

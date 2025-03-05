@@ -19,6 +19,132 @@
 #include "CacheUtils.h"
 
 
+static bool intersectBuildingVoxel(
+	const Camera& cam,
+	float screenX, float screenY,
+	int windowWidth, int windowHeight,
+	const glm::vec3& boxMin,
+	const glm::vec3& boxMax,
+	const VoxelGrid& grid,
+	glm::vec3& outPosWorld,
+	float aspect
+)
+{
+	// 1) Convert screen coords -> NDC
+	float ndcX = (screenX / float(windowWidth)) * 2.f - 1.f;
+	float ndcY = 1.f - (screenY / float(windowHeight)) * 2.f;
+
+	// 2) Build ray from camera through click point
+	glm::mat4 V = cam.getView();
+	glm::mat4 P = cam.getProj(aspect);
+	glm::mat4 invV = glm::inverse(V);
+	glm::mat4 invP = glm::inverse(P);
+
+	glm::vec4 clipPos(ndcX, ndcY, 1.f, 1.f);
+	glm::vec4 viewPos = invP * clipPos;
+	viewPos /= viewPos.w;
+	glm::vec4 worldPos4 = invV * viewPos;
+	glm::vec3 rayDir = glm::normalize(glm::vec3(worldPos4) - cam.getPos());
+	glm::vec3 rayOrigin = cam.getPos();
+
+	// 3) Intersect with volume bounding box
+	auto intersectBox = [](const glm::vec3& ro, const glm::vec3& rd,
+		const glm::vec3& bmin, const glm::vec3& bmax) -> glm::vec2
+		{
+			glm::vec3 t1 = (bmin - ro) / rd;
+			glm::vec3 t2 = (bmax - ro) / rd;
+			glm::vec3 tmin = glm::min(t1, t2);
+			glm::vec3 tmax = glm::max(t1, t2);
+			float tN = std::max(std::max(tmin.x, tmin.y), tmin.z);
+			float tF = std::min(std::min(tmax.x, tmax.y), tmax.z);
+			return glm::vec2(tN, tF);
+		};
+
+	glm::vec2 tHit = intersectBox(rayOrigin, rayDir, boxMin, boxMax);
+	float tNear = std::max(tHit.x, 0.f);
+	float tFar = tHit.y;
+
+	if (tNear > tFar) {
+		return false; // No intersection with volume bounds
+	}
+
+	// 4) More precise ray marching to find first building voxel
+	float stepSize = grid.voxelSize * 0.5f; // Smaller step size for accuracy
+	float T = tNear; // Start at the box entry point
+
+	// Calculate voxel dimensions in world units
+	glm::vec3 voxelSize = (boxMax - boxMin) / glm::vec3(grid.dimX, grid.dimY, grid.dimZ);
+
+	for (int i = 0; i < 8000; i++) { // Increased max iterations for precision
+		if (T > tFar) break;
+
+		// Current position along ray
+		glm::vec3 posWorld = rayOrigin + rayDir * T;
+
+		// Convert to normalized volume coordinates [0,1]
+		glm::vec3 uvw = (posWorld - boxMin) / (boxMax - boxMin);
+
+		// Check if within volume bounds
+		if (uvw.x < 0.0f || uvw.x >= 1.0f ||
+			uvw.y < 0.0f || uvw.y >= 1.0f ||
+			uvw.z < 0.0f || uvw.z >= 1.0f)
+		{
+			T += stepSize;
+			continue;
+		}
+
+		// Convert to voxel indices
+		int vx = int(uvw.x * grid.dimX);
+		int vy = int(uvw.y * grid.dimY);
+		int vz = int(uvw.z * grid.dimZ);
+
+		// Clamp to valid indices (should be redundant with previous check)
+		vx = std::max(0, std::min(vx, grid.dimX - 1));
+		vy = std::max(0, std::min(vy, grid.dimY - 1));
+		vz = std::max(0, std::min(vz, grid.dimZ - 1));
+
+		// Look up voxel state
+		int idx = vx + vy * grid.dimX + vz * (grid.dimX * grid.dimY);
+
+		if (idx >= 0 && idx < grid.data.size() && grid.data[idx] == VoxelState::FILLED) {
+			// Found a filled voxel - adjust position to be exactly at the voxel surface
+
+			// Calculate the position slightly before the hit point to place the radiation
+			// point just at the surface rather than inside the voxel
+			outPosWorld = posWorld - rayDir * (stepSize * 0.1f);
+
+			return true;
+		}
+
+		// Adaptive step size - smaller near potential surfaces
+		// Check neighbors to see if we're approaching a surface
+		bool nearSurface = false;
+		for (int dz = -1; dz <= 1 && !nearSurface; dz++) {
+			for (int dy = -1; dy <= 1 && !nearSurface; dy++) {
+				for (int dx = -1; dx <= 1 && !nearSurface; dx++) {
+					int nx = vx + dx;
+					int ny = vy + dy;
+					int nz = vz + dz;
+
+					if (nx >= 0 && nx < grid.dimX &&
+						ny >= 0 && ny < grid.dimY &&
+						nz >= 0 && nz < grid.dimZ)
+					{
+						int nidx = nx + ny * grid.dimX + nz * (grid.dimX * grid.dimY);
+						if (nidx >= 0 && nidx < grid.data.size() && grid.data[nidx] == VoxelState::FILLED) {
+							nearSurface = true;
+						}
+					}
+				}
+			}
+		}
+
+		// Adaptive step size - use smaller steps near surfaces
+		T += nearSurface ? stepSize * 0.25f : stepSize;
+	}
+
+	return false; // No building voxel found along the ray
+}
 
 // Enhanced generateTestVolume: Multi-shell Sphere
 static std::vector<float> generateTestVolume(int dimX, int dimY, int dimZ) {
@@ -298,6 +424,63 @@ struct Assignment4 : public CallbackInterface {
 		}
 		if (button == GLFW_MOUSE_BUTTON_LEFT) {
 			leftMouseDown = (action == GLFW_PRESS);
+
+			if (action == GLFW_PRESS && currentMode == RenderMode::VolumeRaycast) {
+				// Let's do a carve or paint operation:
+				// 1) Raycast to find building voxel
+				if (raycastRendererPtr) {
+					// call our helper
+					glm::vec3 hitPos;
+					bool foundVoxel = intersectBuildingVoxel(
+						camera,
+						float(mouseOldX), // the last known cursor pos
+						float(mouseOldY),
+						lastWindowWidth, lastWindowHeight,
+						raycastRendererPtr->getBoxMin(),
+						raycastRendererPtr->getBoxMax(),
+						*(raycastRendererPtr->getGridPtr()), // deref the pointer
+						hitPos,
+						aspect
+					);
+					// print the value of intersectBuildingVoxel
+					std::cout << "intersectBuildingVoxel: " << foundVoxel << std::endl;
+
+					if (foundVoxel) {
+						std::cout << "Carve at (" << hitPos.x << ", "
+							<< hitPos.y << ", " << hitPos.z << ")\n";
+
+						try {
+							std::cout << "Step 1: Creating RadiationPoint" << std::endl;
+							RadiationPoint rp;
+							rp.worldPos = hitPos;
+							rp.radius = 0.5f; // Even smaller radius for testing
+
+							std::cout << "Step 2: Clearing radiation volume" << std::endl;
+							//raycastRendererPtr->clearRadiationVolume();
+
+							std::cout << "Step 3: Creating vector" << std::endl;
+							tmp.push_back(rp);
+
+							std::cout << "Step 4: Updating splat points" << std::endl;
+							raycastRendererPtr->updateSplatPoints(tmp);
+
+							std::cout << "Step 5: Dispatching compute" << std::endl;
+							raycastRendererPtr->dispatchRadiationCompute();
+
+							std::cout << "All steps completed successfully" << std::endl;
+						}
+						catch (const std::exception& e) {
+							std::cerr << "Exception: " << e.what() << std::endl;
+						}
+						catch (...) {
+							std::cerr << "Unknown exception caught" << std::endl;
+						}
+					}
+					else {
+						std::cout << "No building found under cursor.\n";
+					}
+				}
+			}
 		}
 	}
 
@@ -333,6 +516,7 @@ struct Assignment4 : public CallbackInterface {
 	bool showOctreeWire;
 	RenderMode currentMode;
 	RenderMode oldMode;
+	std::vector<RadiationPoint> tmp;
 
 	Camera camera;
 	float aspect;
@@ -352,6 +536,11 @@ struct Assignment4 : public CallbackInterface {
 	// Some geometry for CPU-based modes:
 	CPU_Geometry cpuGeom;
 	GPU_Geometry gpuGeom;
+
+	VolumeRaycastRenderer* raycastRendererPtr = nullptr;  // Pointer to the volume raycast
+
+	// Possibly store a "carve radius"
+	float carveRadius = 2.0f;
 };
 
 int main() {
@@ -495,6 +684,9 @@ int main() {
 	static VolumeRaycastRenderer pointRadRenderer;
 	std::cout << "Before createComputeShader()" << std::endl;
 	pointRadRenderer.init(grid);
+	pointRadRenderer.setOctreeRoot(root);
+	pointRadRenderer.m_enableOctreeSkip = true;
+	app->raycastRendererPtr = &pointRadRenderer;
 	std::cout << "After createComputeShader()" << std::endl;
 
 	std::vector<MCTriangle> triCache;

@@ -28,6 +28,11 @@ glm::vec3 Camera::getPos() const {
 	return eye;
 }
 
+glm::mat4 Camera::getProj(float aspect) const {
+	return glm::perspective(glm::radians(45.0f), aspect, 0.1f, 5000.f);
+}
+
+
 float Camera::getTheta() const {
 	return theta;
 }
