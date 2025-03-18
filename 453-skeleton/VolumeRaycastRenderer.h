@@ -49,7 +49,11 @@ private:
 	void createRaycastProgram();
 	void createFullscreenQuad();
 	void bindRaycastUniforms(float aspect);
-	void debugReadbackRadiationTexture(int x, int y, int z);
+
+	void createAmbientOcclusionTexture();
+	void createIndirectLightTexture();
+	void createIndirectLightingComputeShader();
+	void updateIndirectLighting();
 
 private:
 	float m_timeValue;
@@ -66,6 +70,10 @@ private:
 	GLuint m_gradientDirTex;  // Texture for gradient direction
 	GLuint m_edgeFactorTex;   // Texture for edge factors
 	bool m_precomputeNeeded;  // Flag for when precomputation is needed
+
+	GLuint m_ambientOcclusionTex;
+	GLuint m_indirectLightTex;
+	GLuint m_indirectLightingComputeProg = 0;
 
 	// grid info
 	int m_dimX, m_dimY, m_dimZ;

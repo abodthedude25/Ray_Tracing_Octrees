@@ -27,6 +27,8 @@ public:
 	float getPhi() const;
 	float getR() const;
 	glm::mat4 getProj(float aspect) const;
+
+	glm::vec3 getViewDir() const;
     
     // Pan the camera (this changes the target).
     void pan(float dx, float dy);

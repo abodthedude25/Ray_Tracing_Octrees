@@ -59,7 +59,6 @@ private:
 	GLuint m_computeProg;
 	GLuint m_fsqProg;
 
-	// Helper
-	// BFS/flatten, store in SSBO, etc.
+	
 
 };

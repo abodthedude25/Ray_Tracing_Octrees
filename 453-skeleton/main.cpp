@@ -685,8 +685,9 @@ int main() {
 	std::cout << "Before createComputeShader()" << std::endl;
 	pointRadRenderer.init(grid);
 	pointRadRenderer.setOctreeRoot(root);
-	pointRadRenderer.m_enableOctreeSkip = true;
+	pointRadRenderer.m_enableOctreeSkip = false;
 	app->raycastRendererPtr = &pointRadRenderer;
+	pointRadRenderer.setCamera(&app->camera);
 	std::cout << "After createComputeShader()" << std::endl;
 
 	std::vector<MCTriangle> triCache;

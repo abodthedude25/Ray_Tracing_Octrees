@@ -88,3 +88,8 @@ void Camera::setTarget(const glm::vec3& newTarget) {
 const glm::vec3& Camera::getTarget() const {
 	return target;
 }
+
+glm::vec3 Camera::getViewDir() const {
+	// Calculate view direction from eye position to target
+	return glm::normalize(target - getPos());
+}
