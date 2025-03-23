@@ -549,6 +549,12 @@ int getSubcubeIndex(int x, int y, int z,
 	return idx;
 }
 
+// Unified, consistent version (x<<20, y<<10, z<<0):
+long long buildKey(int x, int y, int z) {
+	return ((long long)x << 20) | ((long long)y << 10) | (long long)z;
+}
+
+
 // A simple function to retrieve 6 face neighbors
 // (We skip edge/corner neighbors for simplicity)
 std::vector<OctreeNode*> getNeighbors(OctreeNode* node,
@@ -558,14 +564,6 @@ std::vector<OctreeNode*> getNeighbors(OctreeNode* node,
 	if (!node) {
 		return neighbors;
 	}
-
-	// A 64-bit key builder
-	auto buildKey = [&](int xx, int yy, int zz) {
-		long long k = ((long long)xx << 20) |
-			((long long)yy << 10) |
-			(long long)zz;
-		return k;
-		};
 
 	// For face neighbors, we offset by ±(node->size) in each dimension:
 	// +X
@@ -712,7 +710,7 @@ OctreeNode* buildOctreeRec(const VoxelGrid& grid,
 	OctreeNode* node = new OctreeNode(x0, y0, z0, size);
 
 	// Build the key and add to the map (assuming you already fixed the key issues).
-	long long key = ((long long)x0 << 40) | ((long long)y0 << 20) | (long long)z0;
+	long long key = buildKey(x0, y0, z0);
 	nodeMap[key] = node;
 
 	// If the cell is of size 1, it is a leaf.
@@ -880,6 +878,7 @@ std::vector<MCTriangle> localMC(const VoxelGrid& grid, int x0, int y0, int z0, i
 
 	return results;
 }
+
 void freeOctree(OctreeNode* node)
 {
 	if (!node) return;

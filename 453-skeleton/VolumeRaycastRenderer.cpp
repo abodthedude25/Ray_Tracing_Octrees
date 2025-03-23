@@ -965,7 +965,7 @@ void main() {
     // If it's empty or carved, calculate light bounced from nearby surfaces
     if (density < 0.5 || radiation > 0.1) {
         // Define search radius for light gathering (in voxels)
-        const int radius = 12;
+        const int radius = 8;
         
         // Accumulate light from nearby lit voxels
         for (int dz = -radius; dz <= radius; dz++) {

@@ -150,8 +150,7 @@ bool isPointInTriangle(const glm::vec3& p, const glm::vec3& a, const glm::vec3& 
 }
 
 
-VoxelGrid loadCSVDataIntoVoxelGrid(const std::string& vertsFilename, const std::string& facesFilename, float voxelSize) {
-	voxelSize = 20.0f; // Increased voxel size for better memory management
+VoxelGrid loadCSVDataIntoVoxelGrid(const std::string& vertsFilename, const std::string& facesFilename, float voxelSize = 5.0f) {
 	VoxelGrid grid;
 
 	std::vector<CSVVertex> csvVerts = loadCSVVertices(vertsFilename);
