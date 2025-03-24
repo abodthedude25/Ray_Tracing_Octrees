@@ -6,6 +6,7 @@
 #include <unordered_set>
 #include <algorithm>
 #include <cmath>
+#include <immintrin.h> // For AVX/SSE instructions
 
 // Forward declaration of global octree map (from your existing code)
 extern std::unordered_map<long long, OctreeNode*> g_octreeMap;
@@ -333,6 +334,11 @@ glm::vec3 QEFSolver::solve(const glm::vec3& cellCenter, float cellSize) {
 		return masspoint;
 	}
 
+	// For small cells, just use masspoint - skip expensive calculations
+	if (cellSize < 0.1f) {
+		return masspoint;
+	}
+
 	// First try with SVD (most accurate for well-conditioned systems)
 	glm::vec3 svdSolution = solveSVD(cellCenter);
 
@@ -397,17 +403,58 @@ glm::vec3 QEFSolver::solve(const glm::vec3& cellCenter, float cellSize) {
 }
 
 
-// AdaptiveDualContouringRenderer implementation
+// In AdaptiveDualContouringRenderer constructor
 AdaptiveDualContouringRenderer::AdaptiveDualContouringRenderer() {
+	// Auto-detect thread count, but leave one core free
+	m_threadCount = std::max(1, (int)std::thread::hardware_concurrency() - 1);
+
+	// Adaptive parameters based on hardware
+	if (m_threadCount >= 16) {
+		// Many-core system
+		m_detailThreshold = 0.15f;  // Be more aggressive with LOD
+	}
+	else if (m_threadCount >= 8) {
+		// Mid-range system
+		m_detailThreshold = 0.12f;
+	}
+	else {
+		// Lower-end system
+		m_detailThreshold = 0.1f;
+	}
+
+	// Adjust cache sizes based on thread count
+	m_cacheSize = 20000 * m_threadCount;
+}
+
+// Then when clearing caches:
+void AdaptiveDualContouringRenderer::clearCaches() {
+	std::lock_guard<std::mutex> lock(m_cacheMutex);
+	edgeIntersectionCache.clear();
+	edgeIntersectionCache.reserve(m_cacheSize * 10);
+
+	dualVertexCache.clear();
+	dualVertexCache.reserve(m_cacheSize);
 }
 
 AdaptiveDualContouringRenderer::~AdaptiveDualContouringRenderer() {
+	// Make sure thread pool is shut down
+	shutdownThreadPool();
 	clearCaches();
 }
 
-void AdaptiveDualContouringRenderer::clearCaches() {
-	edgeIntersectionCache.clear();
-	dualVertexCache.clear();
+void AdaptiveDualContouringRenderer::setThreadCount(int count) {
+	// Must shutdown pool before changing thread count
+	bool wasActive = m_threadPoolActive;
+	if (wasActive) {
+		shutdownThreadPool();
+	}
+
+	m_threadCount = count;
+
+	// Restart pool if it was active
+	if (wasActive) {
+		initThreadPool();
+	}
 }
 
 glm::vec3 AdaptiveDualContouringRenderer::gridToWorld(const VoxelGrid& grid, int x, int y, int z) {
@@ -431,10 +478,13 @@ HermitePoint AdaptiveDualContouringRenderer::calculateIntersection(
 	// Create a key for this edge
 	EdgeKey key = { x1, y1, z1, x2, y2, z2 };
 
-	// Check if we've already computed this intersection
-	auto it = edgeIntersectionCache.find(key);
-	if (it != edgeIntersectionCache.end()) {
-		return it->second;
+	// Thread-safe cache lookup - use a single lock for both read and potential write
+	{
+		std::lock_guard<std::mutex> lock(m_cacheMutex);
+		auto it = edgeIntersectionCache.find(key);
+		if (it != edgeIntersectionCache.end()) {
+			return it->second;
+		}
 	}
 
 	// Safety bounds check
@@ -446,6 +496,21 @@ HermitePoint AdaptiveDualContouringRenderer::calculateIntersection(
 		HermitePoint defaultHP;
 		defaultHP.position = gridToWorld(grid, (x1 + x2) / 2, (y1 + y2) / 2, (z1 + z2) / 2);
 		defaultHP.normal = glm::normalize(glm::vec3(x2 - x1, y2 - y1, z2 - z1));
+
+		// Cache the result
+		{
+			std::lock_guard<std::mutex> lock(m_cacheMutex);
+			// Double-check that another thread hasn't added it
+			auto it = edgeIntersectionCache.find(key);
+			if (it == edgeIntersectionCache.end()) {
+				edgeIntersectionCache[key] = defaultHP;
+			}
+			else {
+				// Use the cached value
+				return it->second;
+			}
+		}
+
 		return defaultHP;
 	}
 
@@ -464,6 +529,19 @@ HermitePoint AdaptiveDualContouringRenderer::calculateIntersection(
 		HermitePoint defaultHP;
 		defaultHP.position = gridToWorld(grid, (x1 + x2) / 2, (y1 + y2) / 2, (z1 + z2) / 2);
 		defaultHP.normal = glm::normalize(glm::vec3(x2 - x1, y2 - y1, z2 - z1));
+
+		// Cache the result
+		{
+			std::lock_guard<std::mutex> lock(m_cacheMutex);
+			auto it = edgeIntersectionCache.find(key);
+			if (it == edgeIntersectionCache.end()) {
+				edgeIntersectionCache[key] = defaultHP;
+			}
+			else {
+				return it->second;
+			}
+		}
+
 		return defaultHP;
 	}
 
@@ -482,7 +560,6 @@ HermitePoint AdaptiveDualContouringRenderer::calculateIntersection(
 	glm::vec3 edgeDir = glm::normalize(p2 - p1);
 
 	// Determine which voxel contains the intersection point
-	// This is important for getting a more accurate normal
 	int ix, iy, iz;
 	if (t <= 0.5f) {
 		ix = x1;
@@ -522,9 +599,21 @@ HermitePoint AdaptiveDualContouringRenderer::calculateIntersection(
 		normal = -normal;
 	}
 
-	// Create and cache the hermite point
+	// Create the hermite point
 	HermitePoint hp = { position, normal };
-	edgeIntersectionCache[key] = hp;
+
+	// Cache the result with thread safety - use a single lock
+	{
+		std::lock_guard<std::mutex> lock(m_cacheMutex);
+		// Double-check that another thread hasn't added it
+		auto it = edgeIntersectionCache.find(key);
+		if (it == edgeIntersectionCache.end()) {
+			edgeIntersectionCache[key] = hp;
+		}
+		else {
+			return it->second;
+		}
+	}
 
 	return hp;
 }
@@ -1052,6 +1141,14 @@ std::vector<MCTriangle> AdaptiveDualContouringRenderer::createTriangles(
 		return triangles;
 	}
 
+	// Calculate cell size in world space
+	float cellSizeWorld = size * grid.voxelSize;
+
+	// Check if this cell is worth processing in detail
+	if (!isCellImportant(grid, x0, y0, z0, size, cellSizeWorld)) {
+		return triangles;
+	}
+
 	// If the node doesn't contain the surface, no triangles to generate
 	if (!cellContainsSurface(grid, x0, y0, z0, size)) {
 		return triangles;
@@ -1069,14 +1166,24 @@ std::vector<MCTriangle> AdaptiveDualContouringRenderer::createTriangles(
 	glm::vec3 cellCenter = gridToWorld(grid, x0, y0, z0) +
 		glm::vec3(size * 0.5f * grid.voxelSize);
 
-	// Create or retrieve the dual vertex for this cell
+	// Create or retrieve the dual vertex for this cell in a thread-safe manner
 	long long cellKey = ((long long)x0 << 20) | ((long long)y0 << 10) | (long long)z0;
 
-	if (dualVertexCache.find(cellKey) == dualVertexCache.end()) {
-		dualVertexCache[cellKey] = generateDualVertex(hermiteData, cellCenter, size * grid.voxelSize);
+	glm::vec3 cellVertex;
+	{
+		std::lock_guard<std::mutex> lock(m_cacheMutex);
+		auto it = dualVertexCache.find(cellKey);
+		if (it == dualVertexCache.end()) {
+			// Not in cache, generate and store it
+			glm::vec3 newVertex = generateDualVertex(hermiteData, cellCenter, size * grid.voxelSize);
+			dualVertexCache[cellKey] = newVertex;
+			cellVertex = newVertex;
+		}
+		else {
+			// Use cached value
+			cellVertex = it->second;
+		}
 	}
-
-	glm::vec3 cellVertex = dualVertexCache[cellKey];
 
 	// Enhanced edge processing for dual contouring
 	// The 12 edges of a cell are:
@@ -1119,6 +1226,7 @@ std::vector<MCTriangle> AdaptiveDualContouringRenderer::createTriangles(
 		{-1, -1, 0} // Cell to left and below
 	};
 
+	// Process each edge
 	for (int e = 0; e < 12; e++) {
 		// Get actual grid coordinates of the edge endpoints
 		int x1 = x0 + edgeStartX[e] * size;
@@ -1165,18 +1273,30 @@ std::vector<MCTriangle> AdaptiveDualContouringRenderer::createTriangles(
 			}
 
 			long long cellId = ((long long)cx << 20) | ((long long)cy << 10) | (long long)cz;
-			auto nodeIt = g_octreeMap.find(cellId);
 
+			// Thread-safe access to g_octreeMap (assuming it's externally synchronized)
+			auto nodeIt = g_octreeMap.find(cellId);
 			if (nodeIt == g_octreeMap.end() || !nodeIt->second->isLeaf) {
 				continue;
 			}
 
-			// Find or compute the dual vertex
+			// Find or compute the dual vertex in a thread-safe manner
 			glm::vec3 vertex;
-			if (dualVertexCache.find(cellId) != dualVertexCache.end()) {
-				vertex = dualVertexCache[cellId];
+			bool needsComputation = false;
+
+			{
+				std::lock_guard<std::mutex> lock(m_cacheMutex);
+				auto cacheIt = dualVertexCache.find(cellId);
+				if (cacheIt != dualVertexCache.end()) {
+					vertex = cacheIt->second;
+				}
+				else {
+					needsComputation = true;
+				}
 			}
-			else {
+
+			if (needsComputation) {
+				// Compute dual vertex outside the lock
 				glm::vec3 center = gridToWorld(grid, cx, cy, cz) +
 					glm::vec3(nodeIt->second->size * 0.5f * grid.voxelSize);
 
@@ -1186,7 +1306,18 @@ std::vector<MCTriangle> AdaptiveDualContouringRenderer::createTriangles(
 				vertex = generateDualVertex(cellHermite, center,
 					nodeIt->second->size * grid.voxelSize);
 
-				dualVertexCache[cellId] = vertex;
+				// Store in cache with thread safety
+				{
+					std::lock_guard<std::mutex> lock(m_cacheMutex);
+					// Double-check in case another thread computed it
+					if (dualVertexCache.find(cellId) == dualVertexCache.end()) {
+						dualVertexCache[cellId] = vertex;
+					}
+					else {
+						// Use the cached value if another thread already set it
+						vertex = dualVertexCache[cellId];
+					}
+				}
 			}
 
 			cellVertices.push_back(vertex);
@@ -1289,25 +1420,50 @@ std::vector<MCTriangle> AdaptiveDualContouringRenderer::render(
 	const VoxelGrid& grid,
 	int x0, int y0, int z0, int size) {
 
-	std::vector<MCTriangle> triangles;
-
-	// Clear caches at the top level to avoid memory growth between frames
+	// Clear caches at the top level
 	if (x0 == 0 && y0 == 0 && z0 == 0 && size == grid.dimX) {
+		std::lock_guard<std::mutex> lock(m_cacheMutex);
 		clearCaches();
 	}
 
-	// If null node, return empty result
+	// Always use parallel rendering if thread pool is active, not just at the top level
+	if (m_threadPoolActive && size >= 16) { // Lower the threshold from original code
+		return renderParallel(node, grid, x0, y0, z0, size);
+	}
+
+	// Original sequential rendering logic for smaller chunks
+	std::vector<MCTriangle> triangles;
+
+	// Null check
 	if (!node) return triangles;
+
+	// Skip very small cells
+	float cellSizeWorld = size * grid.voxelSize;
+	if (cellSizeWorld < m_detailThreshold * 0.05f && m_useAdaptiveLOD) {
+		return triangles;
+	}
+
+	// Skip cells that are unlikely to contain surfaces, only for larger cells
+	if (!node->isLeaf && !cellContainsSurface(grid, x0, y0, z0, size)) {
+		return triangles;
+	}
 
 	// Process leaf nodes
 	if (node->isLeaf) {
-		// Check for surface intersection
+		// Only apply importance check for very small cells
+		if (cellSizeWorld < m_detailThreshold * 0.2f && m_useAdaptiveLOD) {
+			if (!isCellImportant(grid, x0, y0, z0, size, cellSizeWorld)) {
+				return triangles;
+			}
+		}
+
 		std::vector<MCTriangle> cellTriangles = createTriangles(grid, node, x0, y0, z0, size);
 		triangles.insert(triangles.end(), cellTriangles.begin(), cellTriangles.end());
 	}
-	// For non-leaf nodes, recursively process children
 	else {
+		// Process children
 		int halfSize = size / 2;
+
 		for (int i = 0; i < 8; i++) {
 			if (node->children[i]) {
 				int childX = x0 + ((i & 1) ? halfSize : 0);
@@ -1321,11 +1477,6 @@ std::vector<MCTriangle> AdaptiveDualContouringRenderer::render(
 			}
 		}
 	}
-
-	// at the top level, apply post-processing to improve mesh quality
-	/*if (x0 == 0 && y0 == 0 && z0 == 0 && size == grid.dimX) {
-		triangles = simplifyMesh(triangles);
-	}*/
 
 	return triangles;
 }
@@ -1685,24 +1836,84 @@ std::vector<HermitePoint> AdaptiveDualContouringRenderer::getFaceHermitePoints(
 std::vector<HermitePoint> AdaptiveDualContouringRenderer::gatherHermiteData(
 	const VoxelGrid& grid, int x0, int y0, int z0, int size) {
 
+	// Fast path for small cells
+	float cellSizeWorld = size * grid.voxelSize;
+	if (size <= 2 && cellSizeWorld < m_detailThreshold && m_useAdaptiveLOD) {
+		// For tiny cells, use a simplified approach
+		std::vector<HermitePoint> simplifiedData;
+
+		// Quick check for surface presence
+		bool hasInside = false;
+		bool hasOutside = false;
+		bool foundSurface = false;
+
+		// Boundary checking
+		int maxX = std::min(x0 + size, grid.dimX - 1);
+		int maxY = std::min(y0 + size, grid.dimY - 1);
+		int maxZ = std::min(z0 + size, grid.dimZ - 1);
+		int minX = std::max(x0, 0);
+		int minY = std::max(y0, 0);
+		int minZ = std::max(z0, 0);
+
+		// Check corners first
+		for (int z = minZ; z <= maxZ; z += size) {
+			for (int y = minY; y <= maxY; y += size) {
+				for (int x = minX; x <= maxX; x += size) {
+					bool isFilled = (grid.data[grid.index(x, y, z)] == VoxelState::FILLED);
+					if (isFilled) hasInside = true;
+					else hasOutside = true;
+
+					if (hasInside && hasOutside) {
+						foundSurface = true;
+						break;
+					}
+				}
+				if (foundSurface) break;
+			}
+			if (foundSurface) break;
+		}
+
+		if (foundSurface) {
+			// Add a single representative hermite point
+			HermitePoint hp;
+			hp.position = glm::vec3(
+				grid.minX + (x0 + size * 0.5f) * grid.voxelSize,
+				grid.minY + (y0 + size * 0.5f) * grid.voxelSize,
+				grid.minZ + (z0 + size * 0.5f) * grid.voxelSize
+			);
+
+			// Use a simpler normal estimation for small cells
+			hp.normal = estimateNormal(grid, hp.position, grid.voxelSize);
+			simplifiedData.push_back(hp);
+
+			return simplifiedData;
+		}
+
+		return simplifiedData;  // Empty if no surface found
+	}
+
+	// Existing code for larger cells...
 	// Boundary checking
 	int maxX = std::min(x0 + size, grid.dimX - 1);
 	int maxY = std::min(y0 + size, grid.dimY - 1);
 	int maxZ = std::min(z0 + size, grid.dimZ - 1);
-
 	int minX = std::max(x0, 0);
 	int minY = std::max(y0, 0);
 	int minZ = std::max(z0, 0);
 
 	// First pass: collect all raw hermite points
 	std::vector<HermitePoint> rawPoints;
+	rawPoints.reserve((maxX - minX + 1) * (maxY - minY + 1) * (maxZ - minZ + 1) / 4); // Reasonable estimate
 
-	for (int z = minZ; z <= maxZ; z++) {
-		for (int y = minY; y <= maxY; y++) {
-			for (int x = minX; x <= maxX; x++) {
+	// Process with stride for larger cells
+	int stride = (size > 8) ? size / 4 : 1;
+
+	for (int z = minZ; z <= maxZ; z += stride) {
+		for (int y = minY; y <= maxY; y += stride) {
+			for (int x = minX; x <= maxX; x += stride) {
 				bool isCurrentVoxelFilled = (grid.data[grid.index(x, y, z)] == VoxelState::FILLED);
 
-				// Check all three axis directions
+				// Check X direction
 				if (x < maxX) {
 					bool isNextXFilled = (grid.data[grid.index(x + 1, y, z)] == VoxelState::FILLED);
 					if (isCurrentVoxelFilled != isNextXFilled) {
@@ -1710,6 +1921,7 @@ std::vector<HermitePoint> AdaptiveDualContouringRenderer::gatherHermiteData(
 					}
 				}
 
+				// Check Y direction
 				if (y < maxY) {
 					bool isNextYFilled = (grid.data[grid.index(x, y + 1, z)] == VoxelState::FILLED);
 					if (isCurrentVoxelFilled != isNextYFilled) {
@@ -1717,6 +1929,7 @@ std::vector<HermitePoint> AdaptiveDualContouringRenderer::gatherHermiteData(
 					}
 				}
 
+				// Check Z direction
 				if (z < maxZ) {
 					bool isNextZFilled = (grid.data[grid.index(x, y, z + 1)] == VoxelState::FILLED);
 					if (isCurrentVoxelFilled != isNextZFilled) {
@@ -1727,13 +1940,15 @@ std::vector<HermitePoint> AdaptiveDualContouringRenderer::gatherHermiteData(
 		}
 	}
 
-	// For urban buildings, optimize the hermite data
-	std::vector<HermitePoint> processedPoints;
-
+	// Rest of your existing optimization code for hermite points...
 	// If we have too few points, just return them as is
 	if (rawPoints.size() <= 4) {
 		return rawPoints;
 	}
+
+	// For urban buildings, optimize the hermite data
+	std::vector<HermitePoint> processedPoints;
+	processedPoints.reserve(rawPoints.size() / 2);
 
 	// For urban buildings, we want to recognize dominant planes
 	// Group points by similar normals (within a tolerance)
@@ -1839,4 +2054,259 @@ std::vector<HermitePoint> AdaptiveDualContouringRenderer::gatherHermiteData(
 	}
 
 	return processedPoints;
+}
+
+bool AdaptiveDualContouringRenderer::isCellImportant(
+	const VoxelGrid& grid, int x0, int y0, int z0, int size, float cellSizeWorld) {
+
+	// Always process cells above a certain size - use more permissive threshold
+	if (cellSizeWorld > m_detailThreshold  || size > 8 || !m_useAdaptiveLOD) {
+		return true;
+	}
+
+	// Sample more points to better detect features
+	// Check a grid of points within the cell
+	int sampleSteps = 3; // More samples = better detection
+	float stepSize = size / (float)sampleSteps;
+
+	bool hasInside = false;
+	bool hasOutside = false;
+
+	// Sample more points inside the cell
+	for (int zOffset = 0; zOffset <= sampleSteps; zOffset++) {
+		for (int yOffset = 0; yOffset <= sampleSteps; yOffset++) {
+			for (int xOffset = 0; xOffset <= sampleSteps; xOffset++) {
+				int x = x0 + (int)(xOffset * stepSize);
+				int y = y0 + (int)(yOffset * stepSize);
+				int z = z0 + (int)(zOffset * stepSize);
+
+				if (x < 0 || y < 0 || z < 0 ||
+					x >= grid.dimX || y >= grid.dimY || z >= grid.dimZ) {
+					continue;
+				}
+
+				bool isFilled = (grid.data[grid.index(x, y, z)] == VoxelState::FILLED);
+				if (isFilled) hasInside = true;
+				else hasOutside = true;
+
+				if (hasInside && hasOutside) return true;  // Surface found
+			}
+		}
+	}
+
+	return false;  // No surface found
+}
+
+void AdaptiveDualContouringRenderer::initThreadPool() {
+	if (m_threadPoolActive) return;
+
+	// Auto-detect thread count if not set
+	if (m_threadCount <= 0) {
+		m_threadCount = std::max(1, (int)std::thread::hardware_concurrency());
+	}
+
+	std::cout << "Initializing thread pool with " << m_threadCount << " workers" << std::endl;
+
+	m_shutdownThreads = false;
+	m_threadPoolActive = true;
+
+	// Create worker threads
+	for (int i = 0; i < m_threadCount; i++) {
+		m_workers.emplace_back(&AdaptiveDualContouringRenderer::workerFunction, this);
+	}
+}
+
+void AdaptiveDualContouringRenderer::shutdownThreadPool() {
+	if (!m_threadPoolActive) return;
+
+	std::cout << "Shutting down thread pool" << std::endl;
+
+	{
+		std::unique_lock<std::mutex> lock(m_queueMutex);
+		m_shutdownThreads = true;
+	}
+
+	// Wake up all workers to check shutdown flag
+	m_queueCondition.notify_all();
+
+	// Wait for all workers to finish
+	for (auto& worker : m_workers) {
+		if (worker.joinable()) {
+			worker.join();
+		}
+	}
+
+	m_workers.clear();
+
+	// Clear any remaining tasks
+	{
+		std::unique_lock<std::mutex> lock(m_queueMutex);
+		while (!m_taskQueue.empty()) {
+			auto task = m_taskQueue.front();
+			m_taskQueue.pop();
+
+			// Set exception for any waiting futures
+			try {
+				task->resultPromise.set_exception(
+					std::make_exception_ptr(std::runtime_error("Thread pool shutdown")));
+			}
+			catch (...) {
+				// Promise might have been fulfilled or abandoned
+			}
+		}
+	}
+
+	m_threadPoolActive = false;
+}
+
+void AdaptiveDualContouringRenderer::workerFunction() {
+	while (true) {
+		// Get task from queue
+		std::shared_ptr<RenderTask> task = getNextTask();
+
+		// Check if we should exit
+		if (!task) {
+			break;
+		}
+
+		// Process the task
+		processTask(task);
+	}
+}
+
+std::shared_ptr<AdaptiveDualContouringRenderer::RenderTask>
+AdaptiveDualContouringRenderer::getNextTask() {
+	std::unique_lock<std::mutex> lock(m_queueMutex);
+
+	// Wait until there's a task or shutdown is requested
+	m_queueCondition.wait(lock, [this]() {
+		return !m_taskQueue.empty() || m_shutdownThreads;
+		});
+
+	// Check for shutdown
+	if (m_shutdownThreads && m_taskQueue.empty()) {
+		return nullptr;
+	}
+
+	// Get a task
+	auto task = m_taskQueue.front();
+	m_taskQueue.pop();
+
+	return task;
+}
+
+void AdaptiveDualContouringRenderer::processTask(std::shared_ptr<RenderTask> task) {
+	try {
+		// Process this chunk of the octree
+		std::vector<MCTriangle> result = render(
+			task->node,
+			*(task->grid),
+			task->x0, task->y0, task->z0,
+			task->size
+		);
+
+		// Set the result
+		task->resultPromise.set_value(std::move(result));
+	}
+	catch (const std::exception& e) {
+		// Handle exceptions
+		try {
+			task->resultPromise.set_exception(std::current_exception());
+		}
+		catch (...) {
+			// Promise might be broken, ignore
+		}
+	}
+}
+
+std::future<std::vector<MCTriangle>> AdaptiveDualContouringRenderer::submitTask(
+	const OctreeNode* node,
+	const VoxelGrid* grid,
+	int x0, int y0, int z0, int size) {
+
+	// Create a new task
+	auto task = std::make_shared<RenderTask>();
+	task->node = node;
+	task->grid = grid;
+	task->x0 = x0;
+	task->y0 = y0;
+	task->z0 = z0;
+	task->size = size;
+
+	// Get future before adding to queue
+	std::future<std::vector<MCTriangle>> future = task->resultPromise.get_future();
+
+	// Add to queue
+	{
+		std::unique_lock<std::mutex> lock(m_queueMutex);
+		m_taskQueue.push(task);
+	}
+
+	// Notify one worker
+	m_queueCondition.notify_one();
+
+	return future;
+}
+
+std::vector<MCTriangle> AdaptiveDualContouringRenderer::renderParallel(
+	const OctreeNode* node,
+	const VoxelGrid& grid,
+	int x0, int y0, int z0, int size) {
+	std::vector<MCTriangle> triangles;
+
+	// Early exit if the node is null
+	if (!node) {
+		return triangles;
+	}
+
+	// Process leaf nodes directly
+	if (node->isLeaf) {
+		return createTriangles(grid, node, x0, y0, z0, size);
+	}
+
+	// Non-leaf nodes: process children in parallel
+	std::vector<std::future<std::vector<MCTriangle>>> futures;
+	futures.reserve(8);  // Maximum of 8 child nodes
+
+	int halfSize = size / 2;
+
+	// Lower the threshold for parallelization
+	const int PARALLEL_THRESHOLD = 16; // Was 32 before
+
+	// Submit each child as a separate task
+	for (int i = 0; i < 8; i++) {
+		if (!node->children[i]) continue;
+
+		int childX = x0 + ((i & 1) ? halfSize : 0);
+		int childY = y0 + ((i & 2) ? halfSize : 0);
+		int childZ = z0 + ((i & 4) ? halfSize : 0);
+
+		// Determine if this child should be processed in parallel or in the current thread
+		if (halfSize >= PARALLEL_THRESHOLD) {  // Lower threshold for parallelization
+			futures.push_back(submitTask(
+				node->children[i],
+				&grid,
+				childX, childY, childZ,
+				halfSize
+			));
+		}
+		else {
+			// Process smaller chunks directly to avoid thread overhead
+			std::vector<MCTriangle> childTriangles = render(
+				node->children[i],
+				grid,
+				childX, childY, childZ,
+				halfSize
+			);
+			triangles.insert(triangles.end(), childTriangles.begin(), childTriangles.end());
+		}
+	}
+
+	// Collect results from parallel tasks
+	for (auto& future : futures) {
+		std::vector<MCTriangle> childTriangles = future.get();
+		triangles.insert(triangles.end(), childTriangles.begin(), childTriangles.end());
+	}
+
+	return triangles;
 }

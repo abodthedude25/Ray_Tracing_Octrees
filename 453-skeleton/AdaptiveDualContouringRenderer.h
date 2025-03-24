@@ -7,6 +7,13 @@
 #include <glm/glm.hpp>
 #include <array>
 
+#include <thread>
+#include <mutex>
+#include <atomic>
+#include <condition_variable>
+#include <future>
+#include <queue>
+
 // Hermite data for an intersection point
 struct HermitePoint {
 	glm::vec3 position;
@@ -90,7 +97,26 @@ public:
 		const VoxelGrid& grid,
 		int x0, int y0, int z0, int size) override;
 
+	float m_detailThreshold = 0.1f;
+	bool m_useAdaptiveLOD = true;
+
+	void setThreadCount(int count);
+	int getThreadCount() const { return m_threadCount; }
+
+	// Use this method to start/stop the thread pool
+	void initThreadPool();
+	void shutdownThreadPool();
+
 private:
+	int m_threadCount = 0;
+	bool m_threadPoolActive = false;
+
+	// Add this method for parallel rendering
+	std::vector<MCTriangle> renderParallel(
+		const OctreeNode* node,
+		const VoxelGrid& grid,
+		int x0, int y0, int z0, int size);
+
 	// Cache for edge intersections to avoid redundant calculations
 	std::unordered_map<EdgeKey, HermitePoint> edgeIntersectionCache;
 
@@ -142,4 +168,56 @@ private:
 
 	std::vector<MCTriangle> simplifyMesh(const std::vector<MCTriangle>& input);
 
+	bool isCellImportant(const VoxelGrid& grid, int x0, int y0, int z0, int size, float cellSizeWorld);
+
+	struct RenderTask {
+		const OctreeNode* node;
+		const VoxelGrid* grid;  // pointer to the voxel grid
+		int x0, y0, z0, size;
+
+		std::promise<std::vector<MCTriangle>> resultPromise;
+	};
+
+	// Thread pool members
+	std::vector<std::thread> m_workers;
+	std::queue<std::shared_ptr<RenderTask>> m_taskQueue;
+	std::mutex m_queueMutex;
+	std::mutex m_cacheMutex;
+	std::condition_variable m_queueCondition;
+	std::atomic<bool> m_shutdownThreads{ false };
+
+	// Worker thread function
+	void workerFunction();
+
+	// Task processing
+	std::shared_ptr<RenderTask> getNextTask();
+	void processTask(std::shared_ptr<RenderTask> task);
+	std::future<std::vector<MCTriangle>> submitTask(
+		const OctreeNode* node,
+		const VoxelGrid* grid,
+		int x0, int y0, int z0, int size);
+	int m_cacheSize = 100000; // Default cache size
+
+	static thread_local std::unordered_map<EdgeKey, HermitePoint> tl_edgeCache;
+
+	std::vector<std::mutex> m_cacheMutexes;
+	static const int NUM_MUTEX_SHARDS = 16; // You can tune this number
+
+	// Hash function to determine which mutex to use for a given edge key
+	int getEdgeShardIndex(const EdgeKey& key) const {
+		// Create a hash from the edge key components
+		size_t hash = 0;
+		hash = hash * 31 + key.x1;
+		hash = hash * 31 + key.y1;
+		hash = hash * 31 + key.z1;
+		hash = hash * 31 + key.x2;
+		hash = hash * 31 + key.y2;
+		hash = hash * 31 + key.z2;
+		return hash % m_cacheMutexes.size();
+	}
+
+	// Hash function for vertex cache
+	int getVertexShardIndex(long long cellKey) const {
+		return cellKey % m_cacheMutexes.size();
+	}
 };

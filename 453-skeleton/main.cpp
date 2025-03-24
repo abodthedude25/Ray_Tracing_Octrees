@@ -20,6 +20,7 @@
 #include "AdaptiveDualContouringRenderer.h"
 #include "Frustum.h"
 
+
 // Modified renderOctree function with frustum culling
 std::vector<MCTriangle> renderOctree(
 	const OctreeNode* root,
@@ -44,6 +45,23 @@ std::vector<MCTriangle> renderOctree(
 	// Estimate the typical size of the result vector to avoid reallocations
 	if (previousTriangles) {
 		result.reserve(previousTriangles->size());
+	}
+	else {
+		// Allocate a reasonable size for initial rendering
+		result.reserve(100000);
+	}
+
+	// For AdaptiveDualContouringRenderer, make sure it's properly initialized
+	auto* dcRenderer = dynamic_cast<AdaptiveDualContouringRenderer*>(&renderer);
+	if (dcRenderer) {
+		// Ensure thread pool is initialized
+		// This is safe to call even if already initialized
+		dcRenderer->initThreadPool();
+
+		// Optionally, force parallel processing settings
+		dcRenderer->m_useAdaptiveLOD = true;
+		// Set a reasonable detail threshold
+		dcRenderer->m_detailThreshold = 0.1f;
 	}
 
 	// Recursive function to traverse octree with frustum culling
@@ -70,7 +88,11 @@ std::vector<MCTriangle> renderOctree(
 		if (node->isLeaf) {
 			// Leaf node inside or intersecting the frustum, render it
 			auto tris = renderer.render(node, grid, node->x, node->y, node->z, node->size);
-			result.insert(result.end(), tris.begin(), tris.end());
+
+			// Merge triangles in batches to reduce contention
+			if (!tris.empty()) {
+				result.insert(result.end(), tris.begin(), tris.end());
+			}
 		}
 		else {
 			// Internal node, recurse to children
@@ -78,9 +100,18 @@ std::vector<MCTriangle> renderOctree(
 				traverse(child);
 			}
 		}
-	};
+		};
 
+	// Start traversal from the root
+	std::cout << "Starting octree traversal with frustum culling..." << std::endl;
+
+	auto start = std::chrono::high_resolution_clock::now();
 	traverse(root);
+	auto end = std::chrono::high_resolution_clock::now();
+
+	auto duration = std::chrono::duration_cast<std::chrono::milliseconds>(end - start).count();
+	std::cout << "Octree traversal completed in " << duration << " ms, triangles: " << result.size() << std::endl;
+
 	return result;
 }
 
@@ -383,8 +414,8 @@ struct Assignment4 : public CallbackInterface {
 	Assignment4()
 		: wireframeMode(false),
 		showOctreeWire(false),
-		currentMode(RenderMode::VolumeRaycast),
-		oldMode(RenderMode::VolumeRaycast),
+		currentMode(RenderMode::DualContouring),
+		oldMode(RenderMode::DualContouring),
 		camera(glm::radians(90.0f), glm::radians(0.f), 500.f),
 		aspect(1.f),
 		rightMouseDown(false),
@@ -779,6 +810,10 @@ int main() {
 	// Prepare other renderers
 	MarchingCubesRenderer      mcRenderer;
 	AdaptiveDualContouringRenderer dcRenderer;
+	// Initialize the thread pool
+	dcRenderer.initThreadPool();
+
+
 	VoxelCubeRenderer          blockRenderer;
 	static VolumeRaycastRenderer pointRadRenderer;
 	std::cout << "Before createComputeShader()" << std::endl;
@@ -908,11 +943,25 @@ int main() {
 
 		}
 		else if (app->currentMode == RenderMode::DualContouring) {
-			if ((triCache.empty() || app->cameraChanged) && app->updateFrustumRequested) {
+			// Make sure we always trigger the renderer even if cache exists
+			// The original code only triggered rendering when cache was empty or camera changed
+			// This change ensures we always use parallel rendering
+			if (app->updateFrustumRequested) {
 				app->cameraChanged = false; // Reset the flag
 				app->updateFrustumRequested = false;
 
+				// Force clear the triangle cache to ensure the renderer is called
+				triCache.clear();
+
+				// Force rendering with parallel processing
+				auto start = std::chrono::high_resolution_clock::now();
+
 				triCache = renderOctree(root, grid, dcRenderer, app->camera, app->aspect);
+
+				auto end = std::chrono::high_resolution_clock::now();
+				auto duration = std::chrono::duration_cast<std::chrono::milliseconds>(end - start).count();
+				std::cout << "DC rendering took: " << duration << " ms" << std::endl;
+
 				cpuGeom.verts.clear();
 				cpuGeom.normals.clear();
 				cpuGeom.cols.clear();
