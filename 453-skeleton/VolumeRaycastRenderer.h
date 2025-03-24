@@ -1,11 +1,16 @@
+// VolumeRaycastRenderer.h
 #pragma once
-#include "Renderer.h"
-#include <vector>
-#include <glm/glm.hpp>
-#include "OctreeVoxel.h" // for VoxelGrid
-#include "Camera.h"      // for the Camera reference
 
-// Structure for point-radiation (unchanged)
+#include <glad/glad.h>
+#include <GLFW/glfw3.h>
+#include <glm/glm.hpp>
+#include <vector>
+#include <unordered_map>
+#include "Camera.h"
+#include "Frustum.h"
+#include "OctreeVoxel.h"
+
+// Radiation point for splatting
 struct RadiationPoint {
 	glm::vec3 worldPos;
 	float radius;
@@ -16,75 +21,124 @@ public:
 	VolumeRaycastRenderer();
 	~VolumeRaycastRenderer();
 
+	// Initialize with a voxel grid
 	void init(const VoxelGrid& grid);
-	void setCamera(const Camera* camPtr) { m_cameraPtr = camPtr; }
 
-	// point radiation usage
+	// Render the volume with raycasting
+	void drawRaycast(float aspect);
+
+	// Setters for camera and octree
+	void setCamera(Camera* cam);
+	void setOctreeRoot(OctreeNode* root);
+
+	// Getters for bounds and grid
+	const glm::vec3& getBoxMin() const;
+	const glm::vec3& getBoxMax() const;
+	const VoxelGrid* getGridPtr() const;
+
+	// Methods for radiation (carving)
 	void clearRadiationVolume();
 	void updateSplatPoints(const std::vector<RadiationPoint>& pts);
 	void dispatchRadiationCompute();
-	void dispatchPrecompute();
 
-	// final volume raycast
-	void drawRaycast(float aspect);
+	// Methods for frustum culling
+	void setUpdateFrustumRequested(bool update);
+	bool getUpdateFrustumRequested() const;
+	void toggleFrustumCulling();
+	void updateFrustumCulling(float aspect);
 
-	bool isInitialized() const { return m_inited; }
-
-	glm::vec3 getBoxMin() const { return m_boxMin; }
-	glm::vec3 getBoxMax() const { return m_boxMax; }
-	// Provide read-only pointer to the voxel grid
-	const VoxelGrid* getGridPtr() const { return m_gridPtr; }
-	bool m_enableOctreeSkip = false;
-	OctreeNode* m_octreeRoot = nullptr;
-	void setOctreeRoot(OctreeNode* root) {
-		m_octreeRoot = root;
-	}
+	// For octree-based ray skipping
+	bool m_enableOctreeSkip;
 
 private:
+	// Create/initialize various textures and shaders
 	void createVolumeTexture(const VoxelGrid& grid);
 	void createRadiationTexture();
-	void createComputeShader();
-	void createPrecomputeShader();
 	void createPrecomputeTextures();
-	void createRaycastProgram();
-	void createFullscreenQuad();
-	void bindRaycastUniforms(float aspect);
-
 	void createAmbientOcclusionTexture();
 	void createIndirectLightTexture();
+
+	// Create compute shaders
+	void createComputeShader();
+	void createPrecomputeShader();
 	void createIndirectLightingComputeShader();
+
+	// Create final rendering components
+	void createRaycastProgram();
+	void createFullscreenQuad();
+
+	// Precompute and update operations
+	void dispatchPrecompute();
 	void updateIndirectLighting();
+	void bindRaycastUniforms(float aspect);
 
-private:
-	float m_timeValue;
+	// Frustum culling helpers
+	void markOctreeNodesInFrustum(
+		const OctreeNode* node,
+		const Frustum& frustum,
+		const VoxelGrid& grid,
+		int x0, int y0, int z0,
+		int size,
+		float extraMargin);
 
-	// GL IDs
-	GLuint m_volumeTex;
-	GLuint m_radiationTex;
-	GLuint m_computeProg;
-	GLuint m_raycastProg;
-	GLuint m_quadVAO, m_quadVBO;
+	void markAllDescendantsVisible(
+		const OctreeNode* node,
+		int x0, int y0, int z0,
+		int size);
 
-	GLuint m_precomputeProg;  // The precompute shader program
-	GLuint m_gradientMagTex;  // Texture for gradient magnitude
-	GLuint m_gradientDirTex;  // Texture for gradient direction
-	GLuint m_edgeFactorTex;   // Texture for edge factors
-	bool m_precomputeNeeded;  // Flag for when precomputation is needed
+	void markAllDescendantsInvisible(
+		const OctreeNode* node,
+		int x0, int y0, int z0,
+		int size);
 
-	GLuint m_ambientOcclusionTex;
-	GLuint m_indirectLightTex;
-	GLuint m_indirectLightingComputeProg = 0;
+	void updateWorkingVolumeWithVisibility();
 
-	// grid info
+	// OpenGL texture handles
+	GLuint m_volumeTex;          // Original volume texture
+	GLuint m_workingVolumeTex;   // Volume texture with frustum culling applied
+	GLuint m_radiationTex;       // For storing carving/radiation values
+	GLuint m_gradientMagTex;     // Gradient magnitude texture
+	GLuint m_gradientDirTex;     // Gradient direction (normal) texture
+	GLuint m_edgeFactorTex;      // Edge factor texture
+	GLuint m_ambientOcclusionTex; // Ambient occlusion texture  
+	GLuint m_indirectLightTex;    // Indirect lighting texture
+
+	// OpenGL shader programs
+	GLuint m_computeProg;        // Compute shader for point radiation
+	GLuint m_precomputeProg;     // Compute shader for precomputing gradient
+	GLuint m_raycastProg;        // Fragment shader for raycasting
+	GLuint m_indirectLightingComputeProg; // Compute shader for indirect lighting
+
+	// Quad for fullscreen rendering
+	GLuint m_quadVAO;
+	GLuint m_quadVBO;
+
+	// Volume dimensions
 	int m_dimX, m_dimY, m_dimZ;
-	glm::vec3 m_boxMin, m_boxMax;
-	const VoxelGrid* m_gridPtr;
 
-	// for point-splats
+	// Volume bounds
+	glm::vec3 m_boxMin;
+	glm::vec3 m_boxMax;
+
+	// References to external data
+	const VoxelGrid* m_gridPtr;
+	Camera* m_cameraPtr;
+	OctreeNode* m_octreeRoot;
+
+	// State flags
+	bool m_inited;
+	bool m_precomputeNeeded;
+	bool m_useFrustumCulling;
+	bool m_updateFrustumRequested;
+	bool m_needsInitialFrustumCulling;
+
+	// Parameters
+	float m_timeValue;
+	float m_frustumMargin;
+
+	// Radiation splatting points
 	std::vector<RadiationPoint> m_splatPoints;
 
-	// camera pointer
-	const Camera* m_cameraPtr = nullptr;
-
-	bool m_inited;
+	// Frustum culling data
+	std::unordered_map<const OctreeNode*, bool> m_nodeVisibility;
 };

@@ -217,7 +217,8 @@ RayTracerBVH::RayTracerBVH()
 	m_computeProg(0),
 	m_fsqProg(0),
 	m_nodeSSBO(0),
-	m_numNodes(0)
+	m_numNodes(0),
+	m_frustumCullingEnabled(true)
 {
 }
 
@@ -521,4 +522,218 @@ void RayTracerBVH::renderSceneCompute(const Camera& camera,
 	// Unbind
 	glBindImageTexture(0, 0, 0, GL_FALSE, 0, GL_WRITE_ONLY, GL_RGBA32F);
 	glUseProgram(0);
+}
+
+void RayTracerBVH::renderSceneComputeWithCulling(
+	const Camera& camera,
+	int width, int height,
+	float aspect,
+	float fovDeg,
+	bool updateFrustum)
+{
+	if (!m_computeInited || m_computeProg == 0 || m_fsqProg == 0) {
+		std::cerr << "[RayTracerBVH] Compute pipeline not initialized or failed.\n";
+		return;
+	}
+
+	// If we have no data, skip
+	if (m_numNodes <= 0) {
+		printf("No nodes to render.\n");
+		return;
+	}
+
+	// Update the frustum culling if requested
+	if (updateFrustum) {
+		std::cout << "Applying frustum update with camera at position: ("
+			<< camera.getPos().x << ", "
+			<< camera.getPos().y << ", "
+			<< camera.getPos().z << ")" << std::endl;
+
+		// Create the frustum from the camera's view-projection matrix
+		glm::mat4 view = camera.getView();
+		glm::mat4 proj = glm::perspective(glm::radians(fovDeg), aspect, 0.01f, 5000.f);
+		Frustum frustum(proj * view);
+
+		// Clear the visible nodes list
+		m_visibleNodes.clear();
+
+		// First pass: Determine which nodes are visible
+		std::vector<bool> isVisible(m_flatNodes.size(), false);
+		int visibleCount = 0;
+
+		for (size_t i = 0; i < m_flatNodes.size(); i++) {
+			const auto& node = m_flatNodes[i];
+
+			// Calculate node bounds in world space
+			glm::vec3 minPoint(
+				m_grid.minX + node.x * m_grid.voxelSize,
+				m_grid.minY + node.y * m_grid.voxelSize,
+				m_grid.minZ + node.z * m_grid.voxelSize
+			);
+			glm::vec3 maxPoint = minPoint + glm::vec3(node.size * m_grid.voxelSize);
+
+			// Test against frustum with margin
+			int frustumTest = frustum.testAABB(minPoint, maxPoint, 150.0f);
+
+			// If not completely outside, include it
+			if (frustumTest != -1) {
+				isVisible[i] = true;
+				visibleCount++;
+			}
+		}
+
+		// Create mapping from old indices to new indices
+		std::vector<int> oldToNewIndex(m_flatNodes.size(), -1);
+		int newIndex = 0;
+
+		for (size_t i = 0; i < m_flatNodes.size(); i++) {
+			if (isVisible[i]) {
+				oldToNewIndex[i] = newIndex++;
+			}
+		}
+
+		// Second pass: Build visible nodes list with remapped child indices
+		m_visibleNodes.resize(visibleCount);
+		newIndex = 0;
+
+		for (size_t i = 0; i < m_flatNodes.size(); i++) {
+			if (isVisible[i]) {
+				// Copy the node
+				m_visibleNodes[newIndex] = m_flatNodes[i];
+
+				// Remap child indices
+				if (!m_flatNodes[i].isLeaf) {
+					for (int c = 0; c < 8; c++) {
+						int oldChildIndex = m_flatNodes[i].child[c];
+
+						// If child is visible, update its index
+						if (oldChildIndex >= 0 && oldChildIndex < static_cast<int>(m_flatNodes.size()) &&
+							isVisible[oldChildIndex]) {
+							m_visibleNodes[newIndex].child[c] = oldToNewIndex[oldChildIndex];
+						}
+						else {
+							// Child not visible, mark as invalid
+							m_visibleNodes[newIndex].child[c] = -1;
+						}
+					}
+				}
+
+				newIndex++;
+			}
+		}
+
+		// Debug output
+		std::cout << "Frustum culling: " << m_numNodes << " -> " << visibleCount
+			<< " nodes (" << (visibleCount * 100 / m_numNodes) << "%)\n";
+
+		// Update the GPU buffer with visible nodes
+		glBindBuffer(GL_SHADER_STORAGE_BUFFER, m_nodeSSBO);
+		glBufferData(GL_SHADER_STORAGE_BUFFER,
+			m_visibleNodes.size() * sizeof(GPUNodes),
+			m_visibleNodes.data(), GL_DYNAMIC_DRAW);
+	}
+
+	// Resize or create output image
+	if (!m_outputTex) {
+		glGenTextures(1, &m_outputTex);
+	}
+	glActiveTexture(GL_TEXTURE0);
+	glBindTexture(GL_TEXTURE_2D, m_outputTex);
+
+	// Allocate or re-allocate as RGBA32F
+	glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA32F, width, height,
+		0, GL_RGBA, GL_FLOAT, nullptr);
+	glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
+	glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
+
+	// Bind SSBO
+	glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 1, m_nodeSSBO);
+
+	// Use compute shader
+	glUseProgram(m_computeProg);
+
+	// Bind image for output
+	glBindImageTexture(0, m_outputTex, 0, GL_FALSE, 0, GL_WRITE_ONLY, GL_RGBA32F);
+
+	// Set uniforms
+	GLint locNumNodes = glGetUniformLocation(m_computeProg, "numNodes");
+	GLint locGridMin = glGetUniformLocation(m_computeProg, "gridMin");
+	GLint locVoxelSize = glGetUniformLocation(m_computeProg, "voxelSize");
+	GLint locInvVP = glGetUniformLocation(m_computeProg, "invVP");
+	GLint locViewMat = glGetUniformLocation(m_computeProg, "viewMat");
+	GLint locCamPos = glGetUniformLocation(m_computeProg, "cameraPos");
+	GLint locAspect = glGetUniformLocation(m_computeProg, "aspect");
+	GLint locFov = glGetUniformLocation(m_computeProg, "fov");
+	GLint locWidth = glGetUniformLocation(m_computeProg, "imageWidth");
+	GLint locHeight = glGetUniformLocation(m_computeProg, "imageHeight");
+
+	// Pass the number of visible nodes
+	int nodeCount = updateFrustum ? m_visibleNodes.size() : m_numNodes;
+
+	glUniform1i(locNumNodes, nodeCount);
+	glUniform3f(locGridMin, m_grid.minX, m_grid.minY, m_grid.minZ);
+	glUniform1f(locVoxelSize, m_grid.voxelSize);
+
+	// Calculate view and projection matrices
+	glm::mat4 view = camera.getView();
+	glm::mat4 invVP = glm::inverse(glm::perspective(glm::radians(fovDeg), aspect, 0.01f, 5000.f) * view);
+
+	glUniformMatrix4fv(locInvVP, 1, GL_FALSE, &invVP[0][0]);
+	glUniformMatrix4fv(locViewMat, 1, GL_FALSE, &view[0][0]);
+
+	glm::vec3 camPos = camera.getPos();
+	glUniform3f(locCamPos, camPos.x, camPos.y, camPos.z);
+	glUniform1f(locAspect, aspect);
+	glUniform1f(locFov, fovDeg);
+	glUniform1i(locWidth, width);
+	glUniform1i(locHeight, height);
+
+	// Dispatch
+	int gx = (width + 7) / 8;   // match local_size_x=8
+	int gy = (height + 7) / 8;   // match local_size_y=8
+	glDispatchCompute(gx, gy, 1);
+
+	// Wait for compute
+	glMemoryBarrier(GL_SHADER_IMAGE_ACCESS_BARRIER_BIT);
+
+	// Now draw a fullscreen quad to show the result
+	glUseProgram(m_fsqProg);
+
+	// Our texture is bound to GL_TEXTURE0, so set the sampler uniform
+	GLint locTex = glGetUniformLocation(m_fsqProg, "tex");
+	glUniform1i(locTex, 0); // texture unit 0
+
+	glBindVertexArray(m_fullscreenVAO);
+	glDrawArrays(GL_TRIANGLE_STRIP, 0, 4);
+	glBindVertexArray(0);
+
+	// Unbind
+	glBindImageTexture(0, 0, 0, GL_FALSE, 0, GL_WRITE_ONLY, GL_RGBA32F);
+	glUseProgram(0);
+}
+
+void RayTracerBVH::updateNodesWithFrustumCulling(const Frustum& frustum, float extraMargin) {
+	m_visibleNodes.clear();
+
+	// Reserve space for efficiency
+	m_visibleNodes.reserve(m_flatNodes.size());
+
+	// Go through all nodes and check visibility
+	for (const auto& node : m_flatNodes) {
+		// Calculate node bounds in world space
+		glm::vec3 minPoint(
+			m_grid.minX + node.x * m_grid.voxelSize,
+			m_grid.minY + node.y * m_grid.voxelSize,
+			m_grid.minZ + node.z * m_grid.voxelSize
+		);
+		glm::vec3 maxPoint = minPoint + glm::vec3(node.size * m_grid.voxelSize);
+
+		// Test against frustum with margin
+		int frustumTest = frustum.testAABB(minPoint, maxPoint, extraMargin);
+
+		// If not completely outside, include it
+		if (frustumTest != -1) {
+			m_visibleNodes.push_back(node);
+		}
+	}
 }

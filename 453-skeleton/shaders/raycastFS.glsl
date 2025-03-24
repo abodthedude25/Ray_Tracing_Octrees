@@ -13,9 +13,10 @@ uniform sampler3D radiationTex;
 uniform sampler3D gradientMagTex;
 uniform sampler3D gradientDirTex;
 uniform sampler3D edgeFactorTex;
-uniform sampler3D ambientOcclusionTex;  // New ambient occlusion texture
-uniform sampler3D indirectLightTex;     // New indirect lighting texture
+uniform sampler3D ambientOcclusionTex;  // Ambient occlusion texture
+uniform sampler3D indirectLightTex;     // Indirect lighting texture
 uniform float timeValue; // For temporal jittering
+uniform bool useFrustumCulling;
 
 // Lighting parameters
 const vec3 mainLightDir = normalize(vec3(0.5, 0.9, 0.4)); // Primary light direction
@@ -241,7 +242,7 @@ vec3 calculateShading(vec3 pos, vec3 normal, vec3 rayDir, float edgeDist) {
     }
     
     // Combine all lighting with color and effects
-	vec3 finalColor = baseColor * (directLight + skyLight + groundLight + indirectLight * 3.0) * ao * edgeDarkening + rimLight;
+    vec3 finalColor = baseColor * (directLight + skyLight + groundLight + indirectLight * 3.0) * ao * edgeDarkening + rimLight;
     
     return finalColor;
 }
@@ -330,7 +331,7 @@ vec4 traceRay(vec2 coord) {
         // Current sample position
         vec3 posWorld = camPos + rayDir * T;
         vec3 uvw = (posWorld - boxMin) / (boxMax - boxMin);
-        
+
         // Skip if outside volume
         if (any(lessThan(uvw, vec3(0.0))) || any(greaterThan(uvw, vec3(1.0)))) {
             T += baseStep * 2.0;
@@ -350,6 +351,13 @@ vec4 traceRay(vec2 coord) {
             den = smoothDensitySample(uvw);
         } else {
             den = texture(volumeTex, uvw).r;
+        }
+        
+        // If the voxel is empty (either naturally or due to frustum culling),
+        // take a larger step and continue
+        if (den < 0.01) {
+            T += baseStep * 2.0;
+            continue;
         }
         
         // Edge detection
@@ -430,26 +438,7 @@ vec4 traceRay(vec2 coord) {
     return vec4(finalColor, 1.0);
 }
 
-vec4 debugView(vec2 coord) {
-    vec3 uvw = vec3(coord, 0.5); // Show the middle slice
-    
-    // Choose what to visualize
-    int visualizationMode = 2; // 0=normal, 1=AO, 2=indirect light
-    
-    if (visualizationMode == 1) {
-        float ao = texture(ambientOcclusionTex, uvw).r;
-        return vec4(vec3(1.0 - ao), 1.0); // Visualize AO (white=no occlusion, black=occluded)
-    }
-    else if (visualizationMode == 2) {
-        vec3 indirect = texture(indirectLightTex, uvw).rgb * 5.0; // Amplify for visibility
-        return vec4(indirect, 1.0); // Visualize indirect lighting
-    }
-    
-    // Default: normal render
-    return traceRay(coord);
-}
-
 void main() {
-    // Call the debug function instead
+    // Call ray tracer with texture coordinates
     FragColor = traceRay(vTexCoord);
 }

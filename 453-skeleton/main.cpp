@@ -17,7 +17,72 @@
 #include "RayTracerBVH.h"
 #include "VolumeRaycastRenderer.h"
 #include "CacheUtils.h"
+#include "AdaptiveDualContouringRenderer.h"
+#include "Frustum.h"
 
+// Modified renderOctree function with frustum culling
+std::vector<MCTriangle> renderOctree(
+	const OctreeNode* root,
+	const VoxelGrid& grid,
+	Renderer& renderer,
+	const Camera& camera,
+	float aspect,
+	float extraMargin = 50.0f,
+	const std::vector<MCTriangle>* previousTriangles = nullptr)  // Added parameter for incremental updates
+{
+	std::vector<MCTriangle> result;
+	if (!root) return result;
+
+	// Create view and projection matrices
+	glm::mat4 V = camera.getView();
+	glm::mat4 P = glm::perspective(glm::radians(45.f), aspect, 0.01f, 5000.f);
+	glm::mat4 VP = P * V;
+
+	// Create frustum from view-projection matrix
+	Frustum frustum(VP);
+
+	// Estimate the typical size of the result vector to avoid reallocations
+	if (previousTriangles) {
+		result.reserve(previousTriangles->size());
+	}
+
+	// Recursive function to traverse octree with frustum culling
+	std::function<void(const OctreeNode*)> traverse = [&](const OctreeNode* node) {
+		if (!node) return;
+
+		// Calculate world-space bounds of this octree node
+		float voxelSize = grid.voxelSize;
+		glm::vec3 minPoint(
+			grid.minX + node->x * voxelSize,
+			grid.minY + node->y * voxelSize,
+			grid.minZ + node->z * voxelSize
+		);
+		glm::vec3 maxPoint = minPoint + glm::vec3(node->size * voxelSize);
+
+		// Test if this node is visible in the frustum
+		int frustumTest = frustum.testAABB(minPoint, maxPoint, extraMargin);
+
+		if (frustumTest == -1) {
+			// Completely outside frustum, skip this node and its children
+			return;
+		}
+
+		if (node->isLeaf) {
+			// Leaf node inside or intersecting the frustum, render it
+			auto tris = renderer.render(node, grid, node->x, node->y, node->z, node->size);
+			result.insert(result.end(), tris.begin(), tris.end());
+		}
+		else {
+			// Internal node, recurse to children
+			for (auto child : node->children) {
+				traverse(child);
+			}
+		}
+	};
+
+	traverse(root);
+	return result;
+}
 
 static bool intersectBuildingVoxel(
 	const Camera& cam,
@@ -184,28 +249,6 @@ static std::vector<float> generateTestVolume(int dimX, int dimY, int dimZ) {
 	return volume;
 }
 
-// A helper that traverses an octree and collects triangles from a given renderer
-std::vector<MCTriangle> renderOctree(const OctreeNode* root,
-	const VoxelGrid& grid,
-	Renderer& renderer) {
-	std::vector<MCTriangle> result;
-	if (!root) return result;
-
-	std::function<void(const OctreeNode*)> traverse = [&](const OctreeNode* node) {
-		if (!node) return;
-		if (node->isLeaf) {
-			auto tris = renderer.render(node, grid, node->x, node->y, node->z, node->size);
-			result.insert(result.end(), tris.begin(), tris.end());
-		}
-		else {
-			for (auto child : node->children) {
-				traverse(child);
-			}
-		}
-		};
-	traverse(root);
-	return result;
-}
 
 // A function that re-centers the voxel grid around its filled region
 static void recenterFilledVoxels(VoxelGrid& grid) {
@@ -279,8 +322,29 @@ static void generateOctreeWireframe(const VoxelGrid& grid,
 	const OctreeNode* node,
 	int x0, int y0, int z0,
 	int size,
-	std::vector<glm::vec3>& lines) {
+	std::vector<glm::vec3>& lines,
+	const Frustum& frustum,
+	float extraMargin = 50.0f) {
+
 	if (!node) return;
+
+	// Calculate world-space bounds
+	float voxelSize = grid.voxelSize;
+	glm::vec3 minPoint(
+		grid.minX + x0 * voxelSize,
+		grid.minY + y0 * voxelSize,
+		grid.minZ + z0 * voxelSize
+	);
+	glm::vec3 maxPoint = minPoint + glm::vec3(size * voxelSize);
+
+	// Test if this node is visible in the frustum
+	int frustumTest = frustum.testAABB(minPoint, maxPoint, extraMargin);
+
+	if (frustumTest == -1) {
+		// Completely outside frustum, skip this node and its children
+		return;
+	}
+
 	if (node->isLeaf) {
 		std::array<glm::vec3, 8> corners;
 		getCubeCorners(grid, x0, y0, z0, size, corners);
@@ -295,6 +359,7 @@ static void generateOctreeWireframe(const VoxelGrid& grid,
 		}
 		return;
 	}
+
 	int half = size / 2;
 	for (int i = 0; i < 8; i++) {
 		int ox = x0 + ((i & 1) ? half : 0);
@@ -302,7 +367,7 @@ static void generateOctreeWireframe(const VoxelGrid& grid,
 		int oz = z0 + ((i & 4) ? half : 0);
 		generateOctreeWireframe(grid, node->children[i],
 			ox, oy, oz, half,
-			lines);
+			lines, frustum, extraMargin);
 	}
 }
 
@@ -327,9 +392,13 @@ struct Assignment4 : public CallbackInterface {
 		mouseOldX(0.0), mouseOldY(0.0),
 		buildingCenter(0.f),
 		peelPlaneZ(0.0f),
-		renderModeToggle(0)
+		renderModeToggle(0),
+		cameraChanged(true),
+		updateFrustumRequested(true) 
+
 	{
 		camera.pan(0.f, 100.f);
+		lastViewMatrix = camera.getView(); // Initialize last view matrix
 	}
 
 	// ----------- KEY CALLBACK -------------
@@ -341,7 +410,12 @@ struct Assignment4 : public CallbackInterface {
 			else if (key == GLFW_KEY_S) {
 				showOctreeWire = !showOctreeWire;
 			}
+			if (key == GLFW_KEY_F) {
+				updateFrustumRequested = true;
+			}
 			else if (key == GLFW_KEY_R) {
+				cameraChanged = true;
+				updateFrustumRequested = true;
 				// First store the old mode
 				oldMode = currentMode;
 
@@ -410,9 +484,11 @@ struct Assignment4 : public CallbackInterface {
 		if (rightMouseDown) {
 			camera.incrementTheta(ypos - mouseOldY);
 			camera.incrementPhi(xpos - mouseOldX);
+			cameraChanged = true; // Mark camera as changed
 		}
 		if (leftMouseDown) {
 			camera.pan(xpos - mouseOldX, ypos - mouseOldY);
+			cameraChanged = true; // Mark camera as changed
 		}
 		mouseOldX = xpos;
 		mouseOldY = ypos;
@@ -486,6 +562,7 @@ struct Assignment4 : public CallbackInterface {
 
 	void scrollCallback(double xoffset, double yoffset) override {
 		camera.incrementR(yoffset);
+		cameraChanged = true; // Mark camera as changed
 	}
 
 	void windowSizeCallback(int width, int height) override {
@@ -510,6 +587,24 @@ struct Assignment4 : public CallbackInterface {
 		glUniformMatrix4fv(uM, 1, GL_FALSE, &M[0][0]);
 		glUniformMatrix4fv(uV, 1, GL_FALSE, &V[0][0]);
 		glUniformMatrix4fv(uP, 1, GL_FALSE, &P[0][0]);
+	}
+
+	bool hasCameraChanged() {
+		glm::mat4 currentView = camera.getView();
+
+		// Check if view matrix has changed significantly
+		for (int i = 0; i < 4; i++) {
+			for (int j = 0; j < 4; j++) {
+				/*printf("currentView[%d][%d]: %f\n", i, j, currentView[i][j]);
+				printf("lastViewMatrix[%d][%d]: %f\n", i, j, lastViewMatrix[i][j]);*/
+				if (std::abs(currentView[i][j] - lastViewMatrix[i][j]) > 0.0001f) {
+					lastViewMatrix = currentView;
+					return true;
+				}
+			}
+		}
+
+		return false;
 	}
 
 	bool wireframeMode;
@@ -541,6 +636,10 @@ struct Assignment4 : public CallbackInterface {
 
 	// Possibly store a "carve radius"
 	float carveRadius = 2.0f;
+
+	glm::mat4 lastViewMatrix;
+	bool cameraChanged;
+	bool updateFrustumRequested;
 };
 
 int main() {
@@ -594,7 +693,7 @@ int main() {
 
 	bool useGDB = true;
 	int dim = 256;
-	float voxelSize = 0.025f;
+	float voxelSize = 10.0f;
 	std::string cacheFilename = "sceneCache.bin";
 
 	VoxelGrid grid;
@@ -688,6 +787,7 @@ int main() {
 	pointRadRenderer.m_enableOctreeSkip = false;
 	app->raycastRendererPtr = &pointRadRenderer;
 	pointRadRenderer.setCamera(&app->camera);
+	pointRadRenderer.updateFrustumCulling(app->aspect);
 	std::cout << "After createComputeShader()" << std::endl;
 
 	std::vector<MCTriangle> triCache;
@@ -701,7 +801,6 @@ int main() {
 	CPU_Geometry cpuWire;
 	GPU_Geometry gpuWireGeom;
 	std::vector<glm::vec3> wireLines;
-	generateOctreeWireframe(grid, root, 0, 0, 0, grid.dimX, wireLines);
 	if (!wireLines.empty()) {
 		cpuWire.verts = wireLines;
 		gpuWireGeom.bind();
@@ -754,25 +853,34 @@ int main() {
 		}
 
 		if (app->currentMode == RenderMode::VolumeRaycast) {
+			// Apply frustum update if requested
+			if (app->updateFrustumRequested && app->cameraChanged) {
+				pointRadRenderer.setUpdateFrustumRequested(true);
+				app->updateFrustumRequested = false;
+				app->cameraChanged = false;
+			}
+
 			// REPLACED the old volRenderer code with new pointRad usage
 			glDisable(GL_DEPTH_TEST);
 			glEnable(GL_BLEND);
 			glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
 
 			// Clear
-			glClearColor(0.2f, 0.f, 0.f, 1.f);
+			glClearColor(0.6f, 0.6f, 0.3f, 1.f);
 			glClear(GL_COLOR_BUFFER_BIT);
 
 			// If we want to keep camera updates:
-			pointRadRenderer.setCamera(&app->camera);
 			pointRadRenderer.drawRaycast(app->aspect);
 
 			glDisable(GL_BLEND);
 			glEnable(GL_DEPTH_TEST);
 		}
 		else if (app->currentMode == RenderMode::MarchingCubes) {
-			if (triCache.empty()) {
-				triCache = renderOctree(root, grid, mcRenderer);
+			if ((triCache.empty() || app->cameraChanged) && app->updateFrustumRequested) {
+				app->cameraChanged = false; // Reset the flag
+				app->updateFrustumRequested = false;
+
+				triCache = renderOctree(root, grid, mcRenderer, app->camera, app->aspect);
 				cpuGeom.verts.clear();
 				cpuGeom.normals.clear();
 				cpuGeom.cols.clear();
@@ -800,8 +908,11 @@ int main() {
 
 		}
 		else if (app->currentMode == RenderMode::DualContouring) {
-			if (triCache.empty()) {
-				triCache = renderOctree(root, grid, dcRenderer);
+			if ((triCache.empty() || app->cameraChanged) && app->updateFrustumRequested) {
+				app->cameraChanged = false; // Reset the flag
+				app->updateFrustumRequested = false;
+
+				triCache = renderOctree(root, grid, dcRenderer, app->camera, app->aspect);
 				cpuGeom.verts.clear();
 				cpuGeom.normals.clear();
 				cpuGeom.cols.clear();
@@ -809,7 +920,7 @@ int main() {
 					for (int i = 0; i < 3; i++) {
 						cpuGeom.verts.push_back(t.v[i]);
 						cpuGeom.normals.push_back(t.normal[i]);
-						cpuGeom.cols.push_back({ 0.8f, 0.8f, 0.8f });
+						cpuGeom.cols.push_back(glm::vec3(0.7f, 0.7f, 0.9f)); // Slightly different color for DC
 					}
 				}
 				gpuGeom.bind();
@@ -826,11 +937,13 @@ int main() {
 			gpuGeom.bind();
 			glDrawArrays(GL_TRIANGLES, 0, (GLsizei)cpuGeom.verts.size());
 			glPolygonMode(GL_FRONT_AND_BACK, GL_FILL);
-
 		}
 		else if (app->currentMode == RenderMode::VoxelBlocks) {
-			if (triCache.empty()) {
-				triCache = renderOctree(root, grid, blockRenderer);
+			if ((triCache.empty() || app->cameraChanged) && app->updateFrustumRequested) {
+				app->cameraChanged = false; // Reset the flag
+				app->updateFrustumRequested = false;
+
+				triCache = renderOctree(root, grid, blockRenderer, app->camera, app->aspect);
 				cpuGeom.verts.clear();
 				cpuGeom.normals.clear();
 				cpuGeom.cols.clear();
@@ -859,15 +972,42 @@ int main() {
 		}
 		else if (app->currentMode == RenderMode::BVHRayTrace) {
 			// --- GPU BVH Ray Tracing via compute shader ---
-			bvhRayTracer.renderSceneCompute(app->camera,
+			 // Render with frustum culling - pass the updateFrustumRequested flag
+			bvhRayTracer.renderSceneComputeWithCulling(
+				app->camera,
 				app->lastWindowWidth,
 				app->lastWindowHeight,
 				app->aspect,
-				/*fov=*/45.0f);
+				/*fov=*/45.0f,
+				(app->updateFrustumRequested && app->cameraChanged));
+			if (app->updateFrustumRequested && app->cameraChanged) {
+				// Reset the flag after it's been used
+				app->updateFrustumRequested = false;
+				app->cameraChanged = false;
+			}
 		}
-
 		// Possibly draw octree wireframe
 		if (app->showOctreeWire) {
+			if (wireLines.empty() || app->updateFrustumRequested) {
+
+				// Create frustum for culling
+				glm::mat4 V = app->camera.getView();
+				glm::mat4 P = glm::perspective(glm::radians(45.f), app->aspect, 0.01f, 5000.f);
+				Frustum frustum(P * V);
+
+				// Clear previous wireframe
+				wireLines.clear();
+
+				// Generate wireframe with frustum culling
+				generateOctreeWireframe(grid, root, 0, 0, 0, grid.dimX, wireLines, frustum);
+
+				if (!wireLines.empty()) {
+					cpuWire.verts = wireLines;
+					gpuWireGeom.bind();
+					gpuWireGeom.setVerts(cpuWire.verts);
+				}
+			}
+
 			shader.use();
 			app->viewPipeline(shader);
 			GLint uColor = glGetUniformLocation(shader, "overrideColor");
@@ -877,6 +1017,7 @@ int main() {
 			glUniform3f(uColor, 1.f, 1.f, 1.f); // reset
 		}
 
+		app->cameraChanged = app->cameraChanged || app->hasCameraChanged();
 		// Swap buffers
 		window.swapBuffers();
 

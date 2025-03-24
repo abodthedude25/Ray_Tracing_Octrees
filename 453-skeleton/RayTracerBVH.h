@@ -5,6 +5,7 @@
 #include "Camera.h"
 #include <glad/glad.h>
 #include <unordered_map>
+#include "Frustum.h"
 
 // Forward declarations
 class OctreeNode;
@@ -41,6 +42,14 @@ public:
 		float aspect,
 		float fovDeg);
 
+	// Method to set frustum culling state
+	void setFrustumCullingEnabled(bool enabled) { m_frustumCullingEnabled = enabled; }
+
+	// Method to render with explicit frustum culling
+	void renderSceneComputeWithCulling(const Camera& camera, int width, int height,
+		float aspect, float fovDeg, bool updateFrustum);
+
+
 private:
 	// Scene data
 	OctreeNode* m_octreeRoot;
@@ -59,6 +68,13 @@ private:
 	GLuint m_computeProg;
 	GLuint m_fsqProg;
 
-	
+	// Flag to manage frustum culling for BVH
+	bool m_frustumCullingEnabled;
+
+	// Method to update nodes based on frustum culling
+	void updateNodesWithFrustumCulling(const Frustum& frustum, float extraMargin = 150.0f);
+
+	// Storage for visible nodes
+	std::vector<GPUNodes> m_visibleNodes;
 
 };
