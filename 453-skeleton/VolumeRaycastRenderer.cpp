@@ -240,116 +240,45 @@ void VolumeRaycastRenderer::toggleFrustumCulling() {
     std::cout << "Frustum culling " << (m_useFrustumCulling ? "enabled" : "disabled") << "\n";
 }
 
-//==================== INIT ====================
-void VolumeRaycastRenderer::init(const VoxelGrid& grid) {
-    if (m_inited) return;
-
-    m_gridPtr = &grid;
-    m_dimX = grid.dimX;
-    m_dimY = grid.dimY;
-    m_dimZ = grid.dimZ;
-
-    m_boxMin = glm::vec3(grid.minX, grid.minY, grid.minZ);
-    m_boxMax = glm::vec3(
-        grid.minX + grid.dimX * grid.voxelSize,
-        grid.minY + grid.dimY * grid.voxelSize,
-        grid.minZ + grid.dimZ * grid.voxelSize
-    );
-
-    // 1) Create volume texture from voxel data
-    createVolumeTexture(grid);
-
-    // 2) Create radiation texture (for carving masks)
-    createRadiationTexture();
-
-    // 3) Create precompute textures
-    createPrecomputeTextures();
-
-    // 4) Create ambient occlusion texture
-    createAmbientOcclusionTexture();
-
-    // 5) Create indirect lighting texture
-    createIndirectLightTexture();
-
-    // 6) Create indirect lighting compute shader
-    createIndirectLightingComputeShader();
-
-    // 7) Compile compute shader for point radiation
-    createComputeShader();
-
-    // 8) Compile precompute shader for gradient/edge factor
-    createPrecomputeShader();
-
-    // 9) Build the raycasting shader program
-    createRaycastProgram();
-
-    // 10) Create fullscreen quad for final pass
-    createFullscreenQuad();
-
-    m_precomputeNeeded = true;
-    m_inited = true;
-}
-
-//==================== createVolumeTexture ====================
+// In your initialization
 void VolumeRaycastRenderer::createVolumeTexture(const VoxelGrid& grid) {
-    // Build a CPU buffer of floats
-    std::vector<float> volumeData(m_dimX * m_dimY * m_dimZ, 0.0f);
+	// Generate texture
+	glGenTextures(1, &m_volumeTex);
+	glBindTexture(GL_TEXTURE_3D, m_volumeTex);
 
-    for (int z = 0; z < m_dimZ; z++) {
-        for (int y = 0; y < m_dimY; y++) {
-            for (int x = 0; x < m_dimX; x++) {
-                int idx = x + y * m_dimX + z * (m_dimX * m_dimY);
-                if (grid.data[idx] == VoxelState::FILLED) {
-                    volumeData[idx] = 1.0f;
-                }
-            }
-        }
-    }
+	// Simple texture parameters WITHOUT mip-mapping
+	glTexParameteri(GL_TEXTURE_3D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+	glTexParameteri(GL_TEXTURE_3D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+	glTexParameteri(GL_TEXTURE_3D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+	glTexParameteri(GL_TEXTURE_3D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+	glTexParameteri(GL_TEXTURE_3D, GL_TEXTURE_WRAP_R, GL_CLAMP_TO_EDGE);
 
-    // Create the original volume texture
-    glGenTextures(1, &m_volumeTex);
-    glBindTexture(GL_TEXTURE_3D, m_volumeTex);
+	// Store dimensions
+	m_dimX = grid.dimX;
+	m_dimY = grid.dimY;
+	m_dimZ = grid.dimZ;
 
-    glTexImage3D(GL_TEXTURE_3D, 0, GL_R32F, m_dimX, m_dimY, m_dimZ,
-        0, GL_RED, GL_FLOAT, volumeData.data());
+	// Fill volume data
+	std::vector<float> volumeData(m_dimX * m_dimY * m_dimZ);
+	for (int z = 0; z < m_dimZ; z++) {
+		for (int y = 0; y < m_dimY; y++) {
+			for (int x = 0; x < m_dimX; x++) {
+				int idx = x + y * m_dimX + z * (m_dimX * m_dimY);
+				volumeData[idx] = (grid.data[idx] == VoxelState::FILLED) ? 1.0f : 0.0f;
+			}
+		}
+	}
 
-    glTexParameteri(GL_TEXTURE_3D, GL_TEXTURE_MIN_FILTER, GL_LINEAR_MIPMAP_LINEAR);
-    glTexParameteri(GL_TEXTURE_3D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
-    glTexParameteri(GL_TEXTURE_3D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
-    glTexParameteri(GL_TEXTURE_3D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
-    glTexParameteri(GL_TEXTURE_3D, GL_TEXTURE_WRAP_R, GL_CLAMP_TO_EDGE);
+	// Upload data
+	glTexImage3D(GL_TEXTURE_3D, 0, GL_R8, m_dimX, m_dimY, m_dimZ, 0, GL_RED, GL_FLOAT, volumeData.data());
 
-    glGenerateMipmap(GL_TEXTURE_3D);
-
-    // Enable anisotropic filtering if supported
-    GLfloat maxAniso = 0.0f;
-    glGetFloatv(GL_MAX_TEXTURE_MAX_ANISOTROPY_EXT, &maxAniso);
-    if (maxAniso > 0.0f) {
-        glTexParameterf(GL_TEXTURE_3D, GL_TEXTURE_MAX_ANISOTROPY_EXT, std::min(4.0f, maxAniso));
-    }
-    
-    // Now create a working copy texture for frustum culling
-    glGenTextures(1, &m_workingVolumeTex);
-    glBindTexture(GL_TEXTURE_3D, m_workingVolumeTex);
-    
-    // Use the same parameters as the original volume texture
-    glTexImage3D(GL_TEXTURE_3D, 0, GL_R32F, m_dimX, m_dimY, m_dimZ,
-        0, GL_RED, GL_FLOAT, volumeData.data()); // Start with the same data
-    
-    glTexParameteri(GL_TEXTURE_3D, GL_TEXTURE_MIN_FILTER, GL_LINEAR_MIPMAP_LINEAR);
-    glTexParameteri(GL_TEXTURE_3D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
-    glTexParameteri(GL_TEXTURE_3D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
-    glTexParameteri(GL_TEXTURE_3D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
-    glTexParameteri(GL_TEXTURE_3D, GL_TEXTURE_WRAP_R, GL_CLAMP_TO_EDGE);
-    
-    glGenerateMipmap(GL_TEXTURE_3D);
-    
-    if (maxAniso > 0.0f) {
-        glTexParameterf(GL_TEXTURE_3D, GL_TEXTURE_MAX_ANISOTROPY_EXT, std::min(4.0f, maxAniso));
-    }
-
-    glBindTexture(GL_TEXTURE_3D, 0);
-    checkGLError("createVolumeTexture");
+	// Set bounds
+	m_boxMin = glm::vec3(grid.minX, grid.minY, grid.minZ);
+	m_boxMax = glm::vec3(
+		grid.minX + grid.dimX * grid.voxelSize,
+		grid.minY + grid.dimY * grid.voxelSize,
+		grid.minZ + grid.dimZ * grid.voxelSize
+	);
 }
 
 //==================== createRadiationTexture ====================
@@ -1040,8 +969,16 @@ void VolumeRaycastRenderer::bindRaycastUniforms(float aspect) {
     glUniformMatrix4fv(locInvProj, 1, GL_FALSE, glm::value_ptr(invP));
 
     if (m_cameraPtr) {
-        glm::vec3 cpos = m_cameraPtr->getPos();
-        glUniform3fv(glGetUniformLocation(m_raycastProg, "camPos"), 1, glm::value_ptr(cpos));
+		glm::vec3 cpos = m_cameraPtr->getPos();
+		glm::vec3 cdir = m_cameraPtr->getLookDir(); // Get the camera direction
+
+		glUniform3fv(glGetUniformLocation(m_raycastProg, "camPos"), 1, glm::value_ptr(cpos));
+		glUniform3fv(glGetUniformLocation(m_raycastProg, "previousCamPos"), 1, glm::value_ptr(m_previousCamPos));
+		glUniform3fv(glGetUniformLocation(m_raycastProg, "previousViewDir"), 1, glm::value_ptr(m_previousViewDir));
+
+		// Store current values for next frame
+		m_previousCamPos = cpos;
+		m_previousViewDir = cdir;
     }
 
     glUniform3fv(glGetUniformLocation(m_raycastProg, "boxMin"), 1, glm::value_ptr(m_boxMin));
@@ -1087,150 +1024,390 @@ void VolumeRaycastRenderer::bindRaycastUniforms(float aspect) {
     GLint locUseFrustumCulling = glGetUniformLocation(m_raycastProg, "useFrustumCulling");
     glUniform1i(locUseFrustumCulling, m_useFrustumCulling ? 1 : 0);
 
+	GLint uOctreeSkipTex = glGetUniformLocation(m_raycastProg, "octreeSkipTex");
+	glUniform1i(uOctreeSkipTex, 7); // Use texture unit 7
+	glActiveTexture(GL_TEXTURE7);
+	glBindTexture(GL_TEXTURE_3D, m_octreeSkipTex);
+
+	GLint uMaxMipLevel = glGetUniformLocation(m_raycastProg, "maxMipLevel");
+	glUniform1i(uMaxMipLevel, m_maxMipLevel);
+
+	GLint uUseMipMappedSkipping = glGetUniformLocation(m_raycastProg, "useMipMappedSkipping");
+	glUniform1i(uUseMipMappedSkipping, m_useMipMappedSkipping ? 1 : 0);
+
+
     checkGLError("bindRaycastUniforms");
 }
 
-// Add this helper function to mark all descendants of a node with a certain visibility
-void VolumeRaycastRenderer::markAllDescendantsVisible(
-    const OctreeNode* node,
-    int x0, int y0, int z0,
-    int size) {
-    
-    if (!node) return;
-    
-    // Mark this node as visible
-    m_nodeVisibility[node] = true;
-    
-    // If not a leaf, mark all children
-    if (!node->isLeaf) {
-        int half = size / 2;
-        for (int i = 0; i < 8; i++) {
-            if (node->children[i]) {
-                int childX = x0 + ((i & 1) ? half : 0);
-                int childY = y0 + ((i & 2) ? half : 0);
-                int childZ = z0 + ((i & 4) ? half : 0);
-                
-                markAllDescendantsVisible(node->children[i], childX, childY, childZ, half);
-            }
-        }
-    }
+// Method 1: Enhanced frustum culling implementation
+void VolumeRaycastRenderer::optimizedFrustumCulling(float aspect) {
+	if (!m_octreeRoot || !m_cameraPtr) return;
+
+	// Store previous camera position and direction for temporal coherence
+	m_previousCamPos = m_cameraPtr->getPos();
+	m_previousViewDir = -glm::normalize(glm::mat3(m_cameraPtr->getView())[2]);
+
+	// Clear previous visibility state
+	m_nodeVisibility.clear();
+
+	// Create view frustum with a slightly wider FOV for stability
+	glm::mat4 V = m_cameraPtr->getView();
+	glm::mat4 P = glm::perspective(glm::radians(48.0f), aspect, 0.01f, 5000.f);
+	Frustum frustum(P * V);
+
+	// Start hierarchical traversal - only process potentially visible nodes
+	markVisibleNodesOnly(m_octreeRoot, frustum, 0, 0, 0, m_dimX, m_frustumMargin);
+
+	// Update the working volume texture with visibility data
+	updateWorkingVolumeWithVisibility();
+
+	// Reset the update request flag
+	m_updateFrustumRequested = false;
+	m_needsInitialFrustumCulling = false;
 }
 
-// Add helper function to mark all descendants as invisible
-void VolumeRaycastRenderer::markAllDescendantsInvisible(
-    const OctreeNode* node,
-    int x0, int y0, int z0,
-    int size) {
-    
-    if (!node) return;
-    
-    // Mark this node as invisible
-    m_nodeVisibility[node] = false;
-    
-    // If not a leaf, mark all children
-    if (!node->isLeaf) {
-        int half = size / 2;
-        for (int i = 0; i < 8; i++) {
-            if (node->children[i]) {
-                int childX = x0 + ((i & 1) ? half : 0);
-                int childY = y0 + ((i & 2) ? half : 0);
-                int childZ = z0 + ((i & 4) ? half : 0);
-                
-                markAllDescendantsInvisible(node->children[i], childX, childY, childZ, half);
-            }
-        }
-    }
+// Method 2: Efficient frustum test
+bool VolumeRaycastRenderer::isNodeInFrustum(const OctreeNode* node, const Frustum& frustum,
+	int x0, int y0, int z0, int size, float extraMargin) {
+	if (!node) return false;
+
+	// Calculate world-space bounds with margin
+	float voxelSize = m_gridPtr->voxelSize;
+	glm::vec3 minPoint(
+		m_gridPtr->minX + x0 * voxelSize - extraMargin,
+		m_gridPtr->minY + y0 * voxelSize - extraMargin,
+		m_gridPtr->minZ + z0 * voxelSize - extraMargin
+	);
+	glm::vec3 maxPoint = minPoint + glm::vec3((size * voxelSize) + 2.0f * extraMargin);
+
+	// Perform frustum test - returns -1 if outside, 0 if partially inside, 1 if fully inside
+	return frustum.testAABB(minPoint, maxPoint, 0.0f) != -1;
 }
 
-// Modified frustum culling function that traverses the entire octree
-void VolumeRaycastRenderer::markOctreeNodesInFrustum(
-    const OctreeNode* node,
-    const Frustum& frustum,
-    const VoxelGrid& grid,
-    int x0, int y0, int z0,
-    int size,
-    float extraMargin) {
+// Method 3: Optimized node marking that only tracks visible nodes
+void VolumeRaycastRenderer::markVisibleNodesOnly(const OctreeNode* node, const Frustum& frustum,
+	int x0, int y0, int z0, int size, float extraMargin) {
+	if (!node) return;
 
-    // If null node, early exit
-    if (!node) return;
+	// Early out test - if not in frustum, entire subtree is invisible
+	if (!isNodeInFrustum(node, frustum, x0, y0, z0, size, extraMargin)) {
+		return;
+	}
 
-    // Calculate world-space bounds of this octree node
-    float voxelSize = grid.voxelSize;
-    glm::vec3 minPoint(
-        grid.minX + x0 * voxelSize,
-        grid.minY + y0 * voxelSize,
-        grid.minZ + z0 * voxelSize
-    );
-    glm::vec3 maxPoint = minPoint + glm::vec3(size * voxelSize);
+	// Node is at least partially visible, mark it
+	m_nodeVisibility[node] = true;
 
-    // Test against frustum with margin
-    int frustumTest = frustum.testAABB(minPoint, maxPoint, extraMargin);
-    
-    // Set visibility in the map based on frustum test
-    // -1 = completely outside (not visible)
-    // 0 = intersecting (visible)
-    // 1 = completely inside (visible)
-    m_nodeVisibility[node] = (frustumTest != -1);
-    
-    // For nodes completely inside the frustum, mark all children as visible without testing
-    if (frustumTest == 1 && !node->isLeaf) {
-        // For entirely inside nodes, all children will be visible
-        int half = size / 2;
-        for (int i = 0; i < 8; i++) {
-            if (node->children[i]) {
-                // Calculate child position
-                int childX = x0 + ((i & 1) ? half : 0);
-                int childY = y0 + ((i & 2) ? half : 0);
-                int childZ = z0 + ((i & 4) ? half : 0);
-                
-                // Mark all descendants as visible recursively
-                markAllDescendantsVisible(node->children[i], childX, childY, childZ, half);
-            }
-        }
-        return; // Skip further processing for this branch
-    }
-    
-    // For nodes completely outside the frustum, mark all children as not visible without testing
-    if (frustumTest == -1 && !node->isLeaf) {
-        // For entirely outside nodes, all children will be invisible
-        int half = size / 2;
-        for (int i = 0; i < 8; i++) {
-            if (node->children[i]) {
-                // Calculate child position
-                int childX = x0 + ((i & 1) ? half : 0);
-                int childY = y0 + ((i & 2) ? half : 0);
-                int childZ = z0 + ((i & 4) ? half : 0);
-                
-                // Mark all descendants as not visible recursively
-                markAllDescendantsInvisible(node->children[i], childX, childY, childZ, half);
-            }
-        }
-        return; // Skip further processing for this branch
-    }
+	// If it's a leaf node, we're done
+	if (node->isLeaf) {
+		return;
+	}
 
-    // For intersecting nodes, check children individually
-    if (!node->isLeaf) {
-        int half = size / 2;
-        for (int i = 0; i < 8; i++) {
-            if (node->children[i]) {
-                // Calculate child position
-                int childX = x0 + ((i & 1) ? half : 0);
-                int childY = y0 + ((i & 2) ? half : 0);
-                int childZ = z0 + ((i & 4) ? half : 0);
-                
-                // Recursively process child
-                markOctreeNodesInFrustum(
-                    node->children[i],
-                    frustum,
-                    grid,
-                    childX, childY, childZ,
-                    half,
-                    extraMargin
-                );
-            }
-        }
-    }
+	// Process children recursively
+	int half = size / 2;
+	for (int i = 0; i < 8; i++) {
+		int ox = x0 + ((i & 1) ? half : 0);
+		int oy = y0 + ((i & 2) ? half : 0);
+		int oz = z0 + ((i & 4) ? half : 0);
+
+		markVisibleNodesOnly(node->children[i], frustum, ox, oy, oz, half, extraMargin);
+	}
 }
+
+// Method 4: Create MIP-mapped volume texture for hierarchical skipping
+void VolumeRaycastRenderer::createMipMappedVolumeTexture(const VoxelGrid& grid) {
+	// Generate texture for the volume data
+	glGenTextures(1, &m_volumeTex);
+	glBindTexture(GL_TEXTURE_3D, m_volumeTex);
+
+	// Set texture parameters for MIP mapping
+	glTexParameteri(GL_TEXTURE_3D, GL_TEXTURE_MIN_FILTER, GL_LINEAR_MIPMAP_LINEAR);
+	glTexParameteri(GL_TEXTURE_3D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+	glTexParameteri(GL_TEXTURE_3D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+	glTexParameteri(GL_TEXTURE_3D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+	glTexParameteri(GL_TEXTURE_3D, GL_TEXTURE_WRAP_R, GL_CLAMP_TO_EDGE);
+
+	// Store dimensions
+	m_dimX = grid.dimX;
+	m_dimY = grid.dimY;
+	m_dimZ = grid.dimZ;
+
+	// Allocate storage for volume data
+	std::vector<float> volumeData(m_dimX * m_dimY * m_dimZ);
+
+	// Fill volume data from grid
+	for (int z = 0; z < m_dimZ; z++) {
+		for (int y = 0; y < m_dimY; y++) {
+			for (int x = 0; x < m_dimX; x++) {
+				int idx = x + y * m_dimX + z * (m_dimX * m_dimY);
+				volumeData[idx] = (grid.data[idx] == VoxelState::FILLED) ? 1.0f : 0.0f;
+			}
+		}
+	}
+
+	// Upload volume data
+	glTexImage3D(GL_TEXTURE_3D, 0, GL_R8, m_dimX, m_dimY, m_dimZ, 0, GL_RED, GL_FLOAT, volumeData.data());
+
+	// Generate MIP maps
+	glGenerateMipmap(GL_TEXTURE_3D);
+
+	// Calculate maximum MIP level
+	m_maxMipLevel = std::floor(std::log2(std::max({ m_dimX, m_dimY, m_dimZ })));
+
+	// Set bounds for raymarching
+	m_boxMin = glm::vec3(grid.minX, grid.minY, grid.minZ);
+	m_boxMax = glm::vec3(
+		grid.minX + grid.dimX * grid.voxelSize,
+		grid.minY + grid.dimY * grid.voxelSize,
+		grid.minZ + grid.dimZ * grid.voxelSize
+	);
+
+	// Create working volume texture as well
+	glGenTextures(1, &m_workingVolumeTex);
+	glBindTexture(GL_TEXTURE_3D, m_workingVolumeTex);
+	glTexParameteri(GL_TEXTURE_3D, GL_TEXTURE_MIN_FILTER, GL_LINEAR_MIPMAP_LINEAR);
+	glTexParameteri(GL_TEXTURE_3D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+	glTexParameteri(GL_TEXTURE_3D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+	glTexParameteri(GL_TEXTURE_3D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+	glTexParameteri(GL_TEXTURE_3D, GL_TEXTURE_WRAP_R, GL_CLAMP_TO_EDGE);
+	glTexImage3D(GL_TEXTURE_3D, 0, GL_R8, m_dimX, m_dimY, m_dimZ, 0, GL_RED, GL_FLOAT, volumeData.data());
+	glGenerateMipmap(GL_TEXTURE_3D);
+}
+
+void VolumeRaycastRenderer::buildSkipDistanceTexture() {
+	// Create a 3D texture for storing skip distances
+	glGenTextures(1, &m_octreeSkipTex);
+	glBindTexture(GL_TEXTURE_3D, m_octreeSkipTex);
+
+	glTexParameteri(GL_TEXTURE_3D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+	glTexParameteri(GL_TEXTURE_3D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+	glTexParameteri(GL_TEXTURE_3D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+	glTexParameteri(GL_TEXTURE_3D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+	glTexParameteri(GL_TEXTURE_3D, GL_TEXTURE_WRAP_R, GL_CLAMP_TO_EDGE);
+
+	// Use a much lower resolution for skip texture - this is a critical optimization
+	// Since we're skipping empty space, we don't need high resolution
+	int skipTexDimX = std::max(m_dimX / 8, 16);
+	int skipTexDimY = std::max(m_dimY / 8, 16);
+	int skipTexDimZ = std::max(m_dimZ / 8, 16);
+
+	std::vector<float> skipData(skipTexDimX * skipTexDimY * skipTexDimZ, 0.0f);
+
+	// Cache octree node state to avoid redundant calculations
+	std::unordered_map<OctreeNode*, float> nodeSkipCache;
+
+	// Build a heightmap-like array for maximum empty space in each column
+	// This is much faster than traversing the octree for every voxel
+	std::vector<int> maxEmptyHeight(skipTexDimX * skipTexDimZ, 0);
+
+	// First pass - calculate empty regions from a 2D top-down view
+	// This dramatically reduces the number of octree traversals needed
+	if (m_octreeRoot) {
+		// Pre-process for faster lookups
+		// Start from the top of the volume and move down
+		for (int z = 0; z < skipTexDimZ; z++) {
+			for (int x = 0; x < skipTexDimX; x++) {
+				int maxHeight = 0;
+				for (int y = 0; y < skipTexDimY; y++) {
+					// Map to original grid coordinates
+					int origX = (x * m_dimX) / skipTexDimX;
+					int origY = (y * m_dimY) / skipTexDimY;
+					int origZ = (z * m_dimZ) / skipTexDimZ;
+
+					// Check if this region is solid
+					if (origX >= 0 && origX < m_dimX &&
+						origY >= 0 && origY < m_dimY &&
+						origZ >= 0 && origZ < m_dimZ) {
+						int idx = origX + origY * m_dimX + origZ * (m_dimX * m_dimY);
+						if (idx >= 0 && idx < m_gridPtr->data.size()) {
+							if (m_gridPtr->data[idx] == VoxelState::FILLED) {
+								// Found solid voxel - store height and break
+								maxHeight = y;
+								break;
+							}
+						}
+					}
+				}
+				maxEmptyHeight[x + z * skipTexDimX] = maxHeight;
+			}
+		}
+	}
+
+	// Second pass - use the heightmap and fill the skip texture
+	for (int z = 0; z < skipTexDimZ; z++) {
+		for (int y = 0; y < skipTexDimY; y++) {
+			for (int x = 0; x < skipTexDimX; x++) {
+				float skipDistance = 0.0f;
+
+				// Map to original grid coordinates
+				int origX = (x * m_dimX) / skipTexDimX;
+				int origY = (y * m_dimY) / skipTexDimY;
+				int origZ = (z * m_dimZ) / skipTexDimZ;
+
+				// Quick empty space check using heightmap
+				if (y < maxEmptyHeight[x + z * skipTexDimX]) {
+					// Estimate skip distance based on empty vertical space
+					float voxelSize = m_gridPtr->voxelSize;
+					float emptyHeight = (maxEmptyHeight[x + z * skipTexDimX] - y) *
+						((float)m_dimY / skipTexDimY) * voxelSize;
+
+					// Apply a conservative factor for safety
+					skipDistance = emptyHeight * 0.8f;
+
+					// Normalize by volume size
+					skipDistance /= (m_boxMax.y - m_boxMin.y);
+				}
+				else {
+					// Detailed check only if we're in potentially occupied space
+					bool isEmpty = true;
+
+					// Simple check - just look at the center voxel
+					if (origX >= 0 && origX < m_dimX &&
+						origY >= 0 && origY < m_dimY &&
+						origZ >= 0 && origZ < m_dimZ) {
+						int idx = origX + origY * m_dimX + origZ * (m_dimX * m_dimY);
+						if (idx >= 0 && idx < m_gridPtr->data.size()) {
+							if (m_gridPtr->data[idx] == VoxelState::FILLED) {
+								isEmpty = false;
+							}
+						}
+					}
+
+					if (isEmpty) {
+						// Use a fixed value for empty spaces - this is faster than
+						// traversing the octree and still gives good performance
+						float voxelSize = m_gridPtr->voxelSize;
+						float blockSize = voxelSize * (m_dimX / skipTexDimX);
+
+						// Normalize by volume size
+						skipDistance = blockSize / std::max({
+							m_boxMax.x - m_boxMin.x,
+							m_boxMax.y - m_boxMin.y,
+							m_boxMax.z - m_boxMin.z
+							});
+					}
+				}
+
+				// Store the skip distance
+				int index = x + y * skipTexDimX + z * (skipTexDimX * skipTexDimY);
+				skipData[index] = skipDistance;
+			}
+		}
+	}
+
+	// Upload texture data
+	glTexImage3D(GL_TEXTURE_3D, 0, GL_R32F, skipTexDimX, skipTexDimY, skipTexDimZ,
+		0, GL_RED, GL_FLOAT, skipData.data());
+
+	// Generate mipmaps for multi-resolution sampling
+	glGenerateMipmap(GL_TEXTURE_3D);
+
+	std::cout << "Skip distance texture built with dimensions: "
+		<< skipTexDimX << "x" << skipTexDimY << "x" << skipTexDimZ << std::endl;
+}
+
+// Method 6: Modify your existing init method to use these new functions
+void VolumeRaycastRenderer::init(const VoxelGrid& grid) {
+	m_inited = true;
+	m_gridPtr = &grid;
+	m_enableOctreeSkip = true;
+	m_useMipMappedSkipping = true;
+	m_precomputeNeeded = true;
+	m_useFrustumCulling = true;
+	m_updateFrustumRequested = true;
+	m_needsInitialFrustumCulling = true;
+	m_frustumMargin = 20.0f;
+	m_timeValue = 0.0f;
+
+	// Use MIP-mapped texture creation
+	createMipMappedVolumeTexture(grid);
+
+	// Build skip distance texture for octree skipping
+	buildSkipDistanceTexture();
+
+	// Create other textures and shaders
+	createRadiationTexture();
+	createPrecomputeTextures();
+	createAmbientOcclusionTexture();
+	createIndirectLightTexture();
+	createComputeShader();
+	createPrecomputeShader();
+	createIndirectLightingComputeShader();
+	createRaycastProgram();
+	createFullscreenQuad();
+
+	// Initial precompute
+	dispatchPrecompute();
+}
+
+// A much simpler frustum culling implementation
+void VolumeRaycastRenderer::updateFrustumCulling(float aspect) {
+	if (!m_useFrustumCulling || !m_cameraPtr) return;
+
+	// Store camera state
+	m_previousCamPos = m_cameraPtr->getPos();
+	m_previousViewDir = -glm::normalize(glm::mat3(m_cameraPtr->getView())[2]);
+
+	// Create view frustum
+	glm::mat4 V = m_cameraPtr->getView();
+	glm::mat4 P = glm::perspective(glm::radians(45.f), aspect, 0.01f, 5000.f);
+	Frustum frustum(P * V);
+
+	// Create a simpler, grid-based culling approach
+	int cellSize = 16; // Larger cells for less overhead
+	std::vector<bool> visibilityGrid((m_dimX / cellSize + 1) * (m_dimY / cellSize + 1) * (m_dimZ / cellSize + 1), false);
+
+	// Mark visible grid cells
+	for (int z = 0; z < m_dimZ; z += cellSize) {
+		for (int y = 0; y < m_dimY; y += cellSize) {
+			for (int x = 0; x < m_dimX; x += cellSize) {
+				float voxelSize = m_gridPtr->voxelSize;
+
+				// Calculate world space bounds
+				glm::vec3 minPoint(
+					m_gridPtr->minX + x * voxelSize,
+					m_gridPtr->minY + y * voxelSize,
+					m_gridPtr->minZ + z * voxelSize
+				);
+				glm::vec3 maxPoint = minPoint + glm::vec3(cellSize * voxelSize);
+
+				// Check if cell is visible
+				int idx = (x / cellSize) + (y / cellSize) * (m_dimX / cellSize + 1) +
+					(z / cellSize) * (m_dimX / cellSize + 1) * (m_dimY / cellSize + 1);
+
+				if (frustum.testAABB(minPoint, maxPoint, m_frustumMargin) != -1) {
+					visibilityGrid[idx] = true;
+				}
+			}
+		}
+	}
+
+	// Update volume texture based on grid visibility (simple approach)
+	glBindTexture(GL_TEXTURE_3D, m_workingVolumeTex);
+	std::vector<float> modifiedVolume(m_dimX * m_dimY * m_dimZ, 0.0f);
+
+	// Copy only visible regions
+	for (int z = 0; z < m_dimZ; z++) {
+		for (int y = 0; y < m_dimY; y++) {
+			for (int x = 0; x < m_dimX; x++) {
+				int voxelIdx = x + y * m_dimX + z * (m_dimX * m_dimY);
+				int gridIdx = (x / cellSize) + (y / cellSize) * (m_dimX / cellSize + 1) +
+					(z / cellSize) * (m_dimX / cellSize + 1) * (m_dimY / cellSize + 1);
+
+				if (visibilityGrid[gridIdx]) {
+					bool isFilled = m_gridPtr->data[voxelIdx] == VoxelState::FILLED;
+					modifiedVolume[voxelIdx] = isFilled ? 1.0f : 0.0f;
+				}
+			}
+		}
+	}
+
+	// Update texture with new visibility
+	glTexSubImage3D(GL_TEXTURE_3D, 0, 0, 0, 0, m_dimX, m_dimY, m_dimZ,
+		GL_RED, GL_FLOAT, modifiedVolume.data());
+
+	m_updateFrustumRequested = false;
+}
+
 
 void VolumeRaycastRenderer::updateWorkingVolumeWithVisibility() {
 	if (!m_volumeTex || !m_workingVolumeTex || !m_gridPtr) return;
@@ -1330,58 +1507,6 @@ void VolumeRaycastRenderer::updateWorkingVolumeWithVisibility() {
 	std::cout << "Texture dimensions: " << m_dimX << "x" << m_dimY << "x" << m_dimZ << std::endl;
 }
 
-// Update frustum culling based on camera
-void VolumeRaycastRenderer::updateFrustumCulling(float aspect) {
-    if (!m_cameraPtr || !m_gridPtr || !m_octreeRoot) {
-        return;
-    }
-    
-    // Clear visibility map
-    m_nodeVisibility.clear();
-    
-    // Create frustum and mark visible nodes
-    glm::mat4 V = m_cameraPtr->getView();
-    glm::mat4 P = glm::perspective(glm::radians(45.0f), aspect, 0.1f, 5000.0f);
-    glm::mat4 VP = P * V;
-    
-    Frustum frustum(VP);
-    
-    // Mark nodes as visible based on frustum test
-    markOctreeNodesInFrustum(m_octreeRoot, frustum, *m_gridPtr, 0, 0, 0, m_gridPtr->dimX, m_frustumMargin);
-    
-    // Count visible nodes for debugging
-    int visibleNodes = 0;
-    int totalNodes = 0;
-    int smallNodes = 0;  // Count small nodes (size <= 8)
-    int largeNodes = 0;  // Count large nodes (size > 8)
-    int visibleSmall = 0;
-    int visibleLarge = 0;
-    
-    for (const auto& pair : m_nodeVisibility) {
-        const OctreeNode* node = pair.first;
-        bool isVisible = pair.second;
-        totalNodes++;
-        
-        if (node->size <= 8) {
-            smallNodes++;
-            if (isVisible) visibleSmall++;
-        } else {
-            largeNodes++;
-            if (isVisible) visibleLarge++;
-        }
-        
-        if (isVisible) visibleNodes++;
-    }
-    
-    std::cout << "Frustum culling stats:\n"
-              << "  Total nodes: " << totalNodes << "\n"
-              << "  Visible nodes: " << visibleNodes << " (" << (100.0f * visibleNodes / totalNodes) << "%)\n"
-              << "  Small nodes (<=8): " << smallNodes << ", visible: " << visibleSmall << " (" << (100.0f * visibleSmall / smallNodes) << "%)\n"
-              << "  Large nodes (>8): " << largeNodes << ", visible: " << visibleLarge << " (" << (100.0f * visibleLarge / largeNodes) << "%)\n";
-              
-    // Update the working volume texture with visibility information
-    updateWorkingVolumeWithVisibility();
-}
 
 //==================== drawRaycast ====================
 void VolumeRaycastRenderer::drawRaycast(float aspect) {
@@ -1546,7 +1671,7 @@ void main() {
     // If it's empty or carved, calculate light bounced from nearby surfaces
     if (density < 0.5 || radiation > 0.1) {
         // Define search radius for light gathering (in voxels)
-        const int radius = 10;
+        const int radius = 6;
         
         // Accumulate light from nearby lit voxels
         for (int dz = -radius; dz <= radius; dz++) {

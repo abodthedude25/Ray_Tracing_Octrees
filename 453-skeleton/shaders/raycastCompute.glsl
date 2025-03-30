@@ -1,7 +1,12 @@
 #version 430 core
-in vec2 vTexCoord;
-out vec4 FragColor;
 
+// Define the work group size as 16x16 tiles
+layout(local_size_x = 16, local_size_y = 16) in;
+
+// Output image
+layout(rgba8, binding = 0) uniform image2D outputImage;
+
+// All the existing uniforms
 uniform float octreeSkipT;
 uniform mat4 invView;
 uniform mat4 invProj;
@@ -18,12 +23,8 @@ uniform sampler3D indirectLightTex;
 uniform float timeValue;
 uniform bool useFrustumCulling;
 uniform vec3 previousCamPos;
-uniform vec3 previousLookDir;
-uniform bool enableOctreeSkip;
-uniform sampler3D octreeSkipTex;
-uniform int maxMipLevel;
-uniform bool useMipMappedSkipping;
-uniform sampler3D workingVolumeTex; 
+uniform vec3 previousViewDir;
+uniform ivec2 screenSize;
 
 // Lighting parameters
 const vec3 mainLightDir = normalize(vec3(0.5, 0.9, 0.4));
@@ -152,7 +153,6 @@ bool isWindowPosition(vec3 pos, vec3 normal) {
     return (windowGridA > (1.0 - windowWidth) * 0.5 && windowGridA < (1.0 + windowWidth) * 0.5) && 
            (windowGridB > (1.0 - windowHeight) * 0.5 && windowGridB < (1.0 + windowHeight) * 0.5);
 }
-
 
 // Improved building color function with better boundary definition
 vec3 getBuildingColor(vec3 pos, vec3 normal) {
@@ -392,94 +392,8 @@ vec3 blueNoiseOffset(vec2 screenCoord, float time) {
     return offset * 0.001; // Scale to a very small value
 }
 
-// Optimized skip distance function with separated MIP mapping and octree skipping
-float getOptimizedSkipDistance(vec3 rayOrigin, vec3 rayDir, vec3 currentPos) {
-    // Only check skip optimizations if either is enabled
-    if (!enableOctreeSkip && !useMipMappedSkipping) {
-        return 0.0;
-    }
-    
-    // Convert current position to normalized texture coordinates
-    vec3 normalizedPos = (currentPos - boxMin) / (boxMax - boxMin);
-    
-    // Check if we're outside the volume
-    if (any(lessThan(normalizedPos, vec3(0.0))) || any(greaterThan(normalizedPos, vec3(1.0)))) {
-        return 0.0;
-    }
-
-    // Skip distance to return
-    float skipDistance = 0.0;
-    
-    // MIP mapping based empty space skipping
-	if (useMipMappedSkipping) {
-		// Start with a more conservative MIP level
-		for (int mipLevel = min(maxMipLevel, 4); mipLevel >= 0; mipLevel--) {
-			// Calculate the scale factor for this MIP level
-			float mipScale = pow(2.0, float(mipLevel));
-        
-			// Sample with trilinear filtering
-			float density = textureLod(volumeTex, normalizedPos, float(mipLevel)).r;
-        
-			// Use a lower threshold for higher mip levels to reduce artifacts
-			float mipThreshold = mipLevel > 2 ? 0.001 : 0.01;
-        
-			// If empty at this level, we can potentially skip
-			if (density < mipThreshold) {
-				// Calculate cell size at this MIP level in normalized coordinates
-				vec3 texSize = vec3(textureSize(volumeTex, mipLevel));
-				vec3 cellSize = vec3(1.0) / texSize;
-            
-				// Calculate cell boundaries in normalized coordinates
-				vec3 cellMin = floor(normalizedPos * texSize) / texSize;
-				vec3 cellMax = cellMin + cellSize;
-            
-				// Use larger inset for higher mip levels to avoid artifacts
-				float insetFactor = 0.001 + float(mipLevel) * 0.001;
-				cellMin += cellSize * insetFactor;
-				cellMax -= cellSize * insetFactor;
-            
-				// Convert to world space
-				vec3 worldCellMin = mix(boxMin, boxMax, cellMin);
-				vec3 worldCellMax = mix(boxMin, boxMax, cellMax);
-            
-				// Find distance to exit this cell
-				vec2 tBox = intersectBox(currentPos, rayDir, worldCellMin, worldCellMax);
-				float exitDist = max(0.0, tBox.y - 0.01 * (float(mipLevel) + 1.0));
-            
-				// Only consider valid distances
-				if (exitDist > 0.0) {
-					// Apply more conservative factor for higher mip levels
-					skipDistance = max(skipDistance, exitDist * (1.0 - float(mipLevel) * 0.05));
-					break;
-				}
-			}
-		}
-	}
-    // Pre-computed octree skipping (only if MIP mapping didn't find a good distance)
-    if (enableOctreeSkip && skipDistance == 0.0) {
-        // Use pre-computed skip texture
-        float precomputedSkip = texture(octreeSkipTex, normalizedPos).r;
-        skipDistance = precomputedSkip * length(boxMax - boxMin);
-    }
-    
-    // Apply a safety factor to avoid skipping too far
-    // Use a more conservative factor for MIP mapping to avoid artifacts
-    float safetyFactor = useMipMappedSkipping ? 0.7 : 0.95;
-	skipDistance *= safetyFactor;
-    
-    // Calculate distance from camera to current position
-    float distanceFromCamera = length(currentPos - camPos);
-    
-    // Normalize to a 0-1 range for typical scene distances
-    float normalizedDistance = clamp(distanceFromCamera / 50.0, 0.0, 1.0);
-    
-    // Apply distance-based scaling to skip distance before returning
-    float distanceScaleFactor = mix(0.001, 12.0,  pow(normalizedDistance, 3.5));
-    return skipDistance * distanceScaleFactor;
-}
-
-// Modified traceRay function with optimized octree skipping and frustum culling integration
-vec4 traceRay(vec2 coord) {
+// Modified traceRay function to improve edge quality
+vec4 traceRay(vec2 coord, vec2 screenSize) {
     // Get current frame number for temporal effects
     int frameNumber = int(mod(timeValue * 60.0, 16.0));
     
@@ -496,7 +410,7 @@ vec4 traceRay(vec2 coord) {
     bool cameraIsMoving = length(camPos - previousCamPos) > 0.001;
     if (!cameraIsMoving) {
         // Also check if view direction changed
-        if (dot(normalize(previousLookDir), rayDir) < 0.9999) {
+        if (dot(normalize(previousViewDir), rayDir) < 0.9999) {
             cameraIsMoving = true;
         }
     }
@@ -505,7 +419,7 @@ vec4 traceRay(vec2 coord) {
     vec2 jitter;
     if (cameraIsMoving) {
         // Use halton sequence for better distribution
-        jitter = haltonJitter[frameNumber % 8] * 1.5 / vec2(textureSize(volumeTex, 0).xy);
+        jitter = haltonJitter[frameNumber % 8] * 1.5 / screenSize;
     } else {
         jitter = vec2(0.0);
     }
@@ -549,10 +463,10 @@ vec4 traceRay(vec2 coord) {
     );
     
     // Enhanced blue noise dithering to break up edge artifacts
-    vec3 noiseOffset = blueNoiseOffset(gl_FragCoord.xy, timeValue);
+    vec3 noiseOffset = blueNoiseOffset(vec2(gl_GlobalInvocationID.xy), timeValue);
     
     // Add temporal jitter and per-pixel variance to completely break up horizontal patterns
-    float pixelNoise = hash(vec3(gl_FragCoord.xy, timeValue * 1111.0));
+    float pixelNoise = hash(vec3(vec2(gl_GlobalInvocationID.xy), timeValue * 1111.0));
     float T = tNear + baseStep * pixelNoise * 0.5; // Reduced initial jitter
     
     // Create varying step sizes based on ray angle to avoid horizontal banding
@@ -563,7 +477,12 @@ vec4 traceRay(vec2 coord) {
     // Initialize ray marching variables
     float accumAlpha = 0.0;
     vec3 accumColor = vec3(0.0);
-    int maxSteps = 800 - int(distanceFactor * 350.0); // More steps for quality
+    
+    // Better culling through workgroup coherence
+    // Check if all threads in this local group are heading toward similar region
+    // This is a simple but effective approach for early termination
+    // Can be further optimized with shared memory
+    int maxSteps = 900 - int(distanceFactor * 350.0); // Reduced steps for performance
     
     // Edge detection state
     bool wasInside = false;
@@ -584,9 +503,6 @@ vec4 traceRay(vec2 coord) {
     bool nearBoundary = false;
     float boundaryCrossingCounter = 0.0;
     
-    // Frustum culling optimization counter
-    int emptyFrustumSkips = 0;
-    
     // March along the ray
     for (int i = 0; i < maxSteps; i++) {
         if (T > tFar) break;
@@ -594,18 +510,6 @@ vec4 traceRay(vec2 coord) {
         
         // Current sample position
         vec3 posWorld = camPos + rayDir * T;
-        
-        // Check if we can skip a section using our optimized function
-        // Only check for skipping periodically to avoid the overhead of the skip calculation
-        if (i % 5 == 0 && (enableOctreeSkip || useMipMappedSkipping)) {
-            float skipDistance = getOptimizedSkipDistance(camPos, rayDir, posWorld);
-            if (skipDistance > 0.0) {
-                // Skip ahead by the calculated distance
-                T += skipDistance;
-                emptyFrustumSkips++;
-                continue;
-            }
-        }
         
         // Apply subtle noise offset to position (breaks up patterns)
         posWorld += noiseOffset * mix(0.5, 2.0, distanceFactor); // Reduced offset magnitude
@@ -637,73 +541,34 @@ vec4 traceRay(vec2 coord) {
             boundaryCrossingCounter = max(0.0, boundaryCrossingCounter - 0.5);
         }
         
-        // Check if this region was culled by frustum culling
-        // Use the working volume texture which has frustum culling applied
-        if (useFrustumCulling) {
-            float visibilityFactor = texture(workingVolumeTex, uvw).r;
-            // If this region was culled (value is 0 in the working texture), skip it
-            if (visibilityFactor < 0.001) {
-                // Take a larger step in culled regions
-                T += baseStep * mix(1.0, 4.0, 1.0 - visibilityFactor * 10.0);;
-                emptyFrustumSkips++;
-                continue;
-            }
-        }
-        
         // Check if carved by radiation
         float radVal = texture(radiationTex, uvw).r;
         
-		// Sample density with enhanced filtering for boundary regions or mipmapped regions
-		float den;
-		if (nearBoundary || boundaryCrossingCounter > 0.0 || distanceFactor < 0.5 || useMipMappedSkipping) {
-			// High quality sampling at boundaries, when close, or when using mipmapping
-			vec3 uvwJittered = uvw + (noiseOffset * 0.001);
-    
-			// For mipmapping mode, sample multiple LODs and blend between them
-			if (useMipMappedSkipping) {
-				// Calculate adaptive LOD based on distance and whether we're in a detail region
-				float baseLOD = clamp(distanceFactor * 2.0, 0.0, 3.0);
-    
-				// Use multiple jittered samples at the same LOD level
-				const int sampleCount = 4;
-				const vec3 offsets[4] = vec3[4](
-					vec3(0.0, 0.0, 0.0),
-					vec3(0.001, 0.001, 0.001),
-					vec3(-0.001, 0.001, -0.001),
-					vec3(0.001, -0.001, 0.001)
-				);
-    
-				// Sample with temporal jitter to reduce flickering
-				float jitterOffset = fract(timeValue * 0.1 + pixelNoise * 0.5) * 0.5;
-				float lod = baseLOD + jitterOffset;
-    
-				den = 0.0;
-				for (int s = 0; s < sampleCount; s++) {
-					// Apply position jitter scaled by LOD to break up patterns
-					vec3 sampleOffset = offsets[s] * (lod + 0.5);
-					den += textureLod(volumeTex, uvw + sampleOffset, lod).r;
-				}
-				den /= float(sampleCount);
-			} else {
-				// Standard high-quality sampling
-				const int sampleCount = 2;
-				const vec3 offsets[2] = vec3[2](
-					vec3(0.001, 0.001, 0.001),
-					vec3(-0.001, 0.001, -0.001)
-				);
+        // Sample density with enhanced filtering for boundary regions
+        float den;
+        if (nearBoundary || boundaryCrossingCounter > 0.0 || distanceFactor < 0.5) {
+            // High quality sampling at boundaries or when close
+            vec3 uvwJittered = uvw + (noiseOffset * 0.001);
+            
+            // Use multiple samples with varying offsets
+            // Reduced to 2 samples for better performance
+            const int sampleCount = 2;
+            const vec3 offsets[2] = vec3[2](
+                vec3(0.001, 0.001, 0.001),
+                vec3(-0.001, -0.001, -0.001)
+            );
+            
+            den = texture(volumeTex, uvwJittered).r;
+            for (int s = 0; s < sampleCount; s++) {
+                den += texture(volumeTex, uvw + offsets[s] * (1.0 + pixelNoise * 0.5)).r;
+            }
+            den /= float(sampleCount + 1);
+        } else {
+            // Standard sampling for interior regions
+            float lodLevel = mix(0.0, 3.0, distanceFactor); // Increased LOD bias for performance
+            den = textureLod(volumeTex, uvw, lodLevel).r;
+        }
         
-				den = texture(volumeTex, uvwJittered).r;
-				for (int s = 0; s < sampleCount; s++) {
-					den += texture(volumeTex, uvw + offsets[s] * (1.0 + pixelNoise * 0.5)).r;
-				}
-				den /= float(sampleCount + 1);
-			}
-		} else {
-			// Standard sampling for interior regions
-			float lodLevel = mix(0.0, 2.0, distanceFactor);
-			den = textureLod(volumeTex, uvw, lodLevel).r;
-		}
-
         // Apply subtle dithering to density value to break up banding
         den += (pixelNoise - 0.5) * 0.01; // Reduced dithering magnitude
         
@@ -712,7 +577,7 @@ vec4 traceRay(vec2 coord) {
             emptySpaceCounter += 1.0;
             
             // Use varying step size based on position and ray direction
-            float variableStep = baseStep * mix(1.0, 4.0, min(1.0, emptySpaceCounter / 15.0));
+            float variableStep = baseStep * mix(1.0, 5.0, min(1.0, emptySpaceCounter / 15.0));
             
             // Add ray-angle dependent jitter to break horizontal patterns
             variableStep *= 1.0 + 0.1 * sin(dot(rayDir, vec3(1.0, 3.0, 2.0)) * 10.0 + timeValue);
@@ -728,23 +593,8 @@ vec4 traceRay(vec2 coord) {
             emptySpaceCounter += 1.0;
             
             // Use variable step size that changes with ray direction
-            float variableStep = baseStep * mix(1.5, 6.0, min(1.0, emptySpaceCounter / 25.0));
-
-			// Smoother steps for mipmapped mode to reduce artifacts
-			if (useMipMappedSkipping) {
-				// Smoother steps for mipmapped mode to reduce artifacts
-				variableStep *= 0.7 + 0.3 * smoothstep(0.0, 30.0, emptySpaceCounter);
-    
-				// Further reduce step size if we're using higher LODs
-				float distanceStepFactor = distanceFactor < 0.3 ? 0.6 : 0.9;
-				variableStep *= distanceStepFactor;
-    
-				// Add temporal stability to prevent jittering
-				float timeJitter = sin(timeValue * 3.0 + hash(vec3(gl_FragCoord.xy, 0.0)) * 6.28) * 0.5 + 0.5;
-				timeJitter = mix(0.9, 1.0, timeJitter); // Subtle temporal variation
-				variableStep *= timeJitter;
-			}
-
+            float variableStep = baseStep * mix(2.0, 8.0, min(1.0, emptySpaceCounter / 25.0));
+            
             // Add directional variance to avoid uniform stepping
             variableStep *= 1.0 + 0.1 * sin(rayDir.y * 20.0 + timeValue);
             
@@ -758,8 +608,8 @@ vec4 traceRay(vec2 coord) {
             detailRegionCounter = 0.0;
             continue;
         }
-        
-        // If we just transitioned from empty to non-empty, reset counters
+
+		// If we just transitioned from empty to non-empty, reset counters
         if (wasEmpty) {
             emptySpaceCounter = 0.0;
             wasEmpty = false;
@@ -781,8 +631,8 @@ vec4 traceRay(vec2 coord) {
                 float prevT = T - currentStepSize;
                 float curT = T;
                 
-                // 6 iterations of binary search for more precise edges
-                for (int r = 0; r < 6; r++) {
+                // Reduce binary search iterations for performance
+                for (int r = 0; r < 3; r++) {
                     float midT = 0.5 * (prevT + curT);
                     vec3 midPos = camPos + rayDir * midT;
                     vec3 midUVW = (midPos - boxMin) / (boxMax - boxMin);
@@ -849,18 +699,18 @@ vec4 traceRay(vec2 coord) {
             float baseStepScale;
             if (edgeDist > 0.5 || nearBoundary) {
                 // Very small steps at sharp edges and volume boundaries
-                baseStepScale = mix(0.02, 0.1, distanceFactor);
+                baseStepScale = mix(0.05, 0.15, distanceFactor);
             } else if (edgeDist > 0.2 || gradMag > 0.8) {
                 // Small steps near edges or high gradient magnitude
-                baseStepScale = mix(0.05, 0.2, distanceFactor);
+                baseStepScale = mix(0.1, 0.25, distanceFactor);
             } else if (gradMag > 0.6) {
                 // Medium steps in transitional regions
-                baseStepScale = mix(0.1, 0.3, distanceFactor);
+                baseStepScale = mix(0.15, 0.35, distanceFactor);
             } else {
                 // Larger steps in uniform regions
                 float detailFactor = min(1.0, detailRegionCounter / 20.0);
-                baseStepScale = mix(0.2, 0.1, detailFactor);
-                baseStepScale = mix(baseStepScale, 0.5, distanceFactor);
+                baseStepScale = mix(0.25, 0.15, detailFactor);
+                baseStepScale = mix(baseStepScale, 0.6, distanceFactor);
             }
             
             // Add variance based on ray direction and pixel position to break banding
@@ -872,7 +722,7 @@ vec4 traceRay(vec2 coord) {
             T += currentStepSize;
         } else {
             // Empty space with variable step size
-            float stepScale = 1.5 * (1.0 + 0.1 * sin(rayDir.y * 10.0 + gl_FragCoord.x * 0.01));
+            float stepScale = 2.0 * (1.0 + 0.1 * sin(rayDir.y * 10.0 + gl_GlobalInvocationID.x * 0.01));
             
             // Smaller steps near boundaries
             if (nearBoundary || boundaryCrossingCounter > 0.0) {
@@ -899,7 +749,7 @@ vec4 traceRay(vec2 coord) {
     vec3 finalColor = pow(accumColor, vec3(1.0/2.2)); // Gamma correction
     
     // Add faint noise dithering to break up any remaining banding
-    finalColor += (vec3(hash(vec3(gl_FragCoord.xy, timeValue * 591.3))) - 0.5) * 0.01;
+    finalColor += (vec3(hash(vec3(vec2(gl_GlobalInvocationID.xy), timeValue * 591.3))) - 0.5) * 0.01;
     
     // Enhance contrast
     finalColor = finalColor / (finalColor + vec3(0.15));
@@ -908,29 +758,45 @@ vec4 traceRay(vec2 coord) {
     float fogFactor = 1.0 - exp(-viewDistance * 0.0001);
     vec3 fogColor = vec3(0.15, 0.17, 0.2); // Dark fog for black background
     finalColor = mix(finalColor, fogColor, fogFactor * 0.15);
-
-	// Before returning the final color in traceRay function, add:
-	if (useMipMappedSkipping) {
-		// Add subtle temporal stabilization for mipmapped mode
-		// This slightly blends with previous results to reduce flickering
-		float stabilityFactor = 0.85;
     
-		// Use noise based on screen position and time for temporal jitter
-		vec3 timeNoise = blueNoiseOffset(gl_FragCoord.xy, timeValue) * 0.5 + 0.5;
-    
-		// Apply subtle variance to color to break up patterns
-		finalColor = mix(
-			finalColor,
-			finalColor * (0.97 + timeNoise.x * 0.06), // Subtle color variation
-			0.4  // Blend amount
-		);
-	}
-
     // Output fully opaque result
     return vec4(finalColor, 1.0);
 }
 
+// Shared memory for coherent processing
+shared bool groupHasIntersection;
+
 void main() {
-    // Call ray tracer with texture coordinates
-    FragColor = traceRay(vTexCoord);
+    // Get the current pixel coordinates
+    ivec2 pixelCoord = ivec2(gl_GlobalInvocationID.xy);
+    
+    // Early out if outside the screen bounds
+    if (pixelCoord.x >= screenSize.x || pixelCoord.y >= screenSize.y) {
+        return;
+    }
+    
+    // Calculate the texture coordinates
+    vec2 texCoord = (vec2(pixelCoord) + vec2(0.5)) / vec2(screenSize);
+    
+    // Initialize shared memory for coherence check
+    if (gl_LocalInvocationIndex == 0) {
+        groupHasIntersection = false;
+    }
+    
+    // Make sure all threads have the shared variable initialized
+    barrier();
+    
+    // Trace the ray
+    vec4 color = traceRay(texCoord, vec2(screenSize));
+    
+    // Share information about intersection to potentially optimize future processing
+    if (color.a > 0.1) {
+        groupHasIntersection = true;
+    }
+    
+    // Make sure all threads updated the shared variable
+    barrier();
+    
+    // Write to the output image
+    imageStore(outputImage, pixelCoord, color);
 }

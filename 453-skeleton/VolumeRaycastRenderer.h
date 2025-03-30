@@ -49,6 +49,7 @@ public:
 
 	// For octree-based ray skipping
 	bool m_enableOctreeSkip;
+	bool m_useMipMappedSkipping;  // Flag for enabling MIP mapped skipping
 
 private:
 	// Create/initialize various textures and shaders
@@ -72,24 +73,19 @@ private:
 	void updateIndirectLighting();
 	void bindRaycastUniforms(float aspect);
 
-	// Frustum culling helpers
-	void markOctreeNodesInFrustum(
-		const OctreeNode* node,
-		const Frustum& frustum,
-		const VoxelGrid& grid,
-		int x0, int y0, int z0,
-		int size,
-		float extraMargin);
+	void optimizedFrustumCulling(float aspect);
+	bool isNodeInFrustum(const OctreeNode* node, const Frustum& frustum,
+		int x0, int y0, int z0, int size, float extraMargin);
+	void markVisibleNodesOnly(const OctreeNode* node, const Frustum& frustum,
+		int x0, int y0, int z0, int size, float extraMargin);
 
-	void markAllDescendantsVisible(
-		const OctreeNode* node,
-		int x0, int y0, int z0,
-		int size);
+	// Hierarchical octree skipping
+	void createMipMappedVolumeTexture(const VoxelGrid& grid);
+	void buildSkipDistanceTexture();
 
-	void markAllDescendantsInvisible(
-		const OctreeNode* node,
-		int x0, int y0, int z0,
-		int size);
+	// New member variables
+	GLuint m_octreeSkipTex;       // Texture for storing skip
+	int m_maxMipLevel;            // Maximum MIP level for hierarchical skipping
 
 	void updateWorkingVolumeWithVisibility();
 
@@ -141,4 +137,7 @@ private:
 
 	// Frustum culling data
 	std::unordered_map<const OctreeNode*, bool> m_nodeVisibility;
+
+	glm::vec3 m_previousCamPos = glm::vec3(0.0f);
+	glm::vec3 m_previousViewDir = glm::vec3(0.0f, 0.0f, -1.0f);
 };

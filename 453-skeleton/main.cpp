@@ -425,7 +425,7 @@ struct Assignment4 : public CallbackInterface {
 		peelPlaneZ(0.0f),
 		renderModeToggle(0),
 		cameraChanged(true),
-		updateFrustumRequested(true) 
+		updateFrustumRequested(true)
 
 	{
 		camera.pan(0.f, 100.f);
@@ -599,12 +599,32 @@ struct Assignment4 : public CallbackInterface {
 
 	void windowSizeCallback(int width, int height) override {
 		if (height < 1) height = 1;
+
+		// Track aspect ratio changes
+		float oldAspect = aspect;
 		aspect = float(width) / float(height);
+
 		lastWindowWidth = width;
 		lastWindowHeight = height;
 
-		// Tell OpenGL to match the new window size:
+		// Update viewport
 		glViewport(0, 0, width, height);
+
+		// Resize framebuffer textures without full recreation
+		if (framebufferInitialized) {
+			resizeFramebufferTextures();
+		}
+
+		// Only mark camera as changed if aspect ratio changed significantly
+		if (std::abs(aspect - oldAspect) > 0.001f) {
+			updateFrustumRequested = true;
+			cameraChanged = true;
+
+			// Force a full redraw after resize
+			if (currentMode == RenderMode::VolumeRaycast && raycastRendererPtr) {
+				raycastRendererPtr->setUpdateFrustumRequested(true);
+			}
+		}
 	}
 
 	void viewPipeline(ShaderProgram& sp) {
@@ -639,6 +659,7 @@ struct Assignment4 : public CallbackInterface {
 		return false;
 	}
 
+	// Keep the original initialization function for first-time setup
 	void initializeFramebufferCache() {
 		if (framebufferInitialized) return;
 
@@ -675,6 +696,30 @@ struct Assignment4 : public CallbackInterface {
 		glBindFramebuffer(GL_FRAMEBUFFER, 0);
 
 		framebufferInitialized = true;
+	}
+
+	// Add a new function specifically for resizing framebuffer textures
+	void resizeFramebufferTextures() {
+		if (!framebufferInitialized) {
+			initializeFramebufferCache();
+			return;
+		}
+
+		// Just resize the existing textures without recreating the framebuffer
+		glBindTexture(GL_TEXTURE_2D, frameTexture);
+		glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, lastWindowWidth, lastWindowHeight, 0, GL_RGBA, GL_UNSIGNED_BYTE, NULL);
+
+		glBindTexture(GL_TEXTURE_2D, frameDepthTexture);
+		glTexImage2D(GL_TEXTURE_2D, 0, GL_DEPTH_COMPONENT24, lastWindowWidth, lastWindowHeight, 0, GL_DEPTH_COMPONENT, GL_FLOAT, NULL);
+
+		// No need to rebind them to the framebuffer as the textures are the same objects
+
+		// Make sure everything is OK
+		glBindFramebuffer(GL_FRAMEBUFFER, framebufferCache);
+		if (glCheckFramebufferStatus(GL_FRAMEBUFFER) != GL_FRAMEBUFFER_COMPLETE) {
+			std::cerr << "Framebuffer incomplete after resize!" << std::endl;
+		}
+		glBindFramebuffer(GL_FRAMEBUFFER, 0);
 	}
 
 	// Add this method to draw the cached frame
@@ -955,7 +1000,8 @@ int main() {
 	std::cout << "Before createComputeShader()" << std::endl;
 	pointRadRenderer.init(grid);
 	pointRadRenderer.setOctreeRoot(root);
-	pointRadRenderer.m_enableOctreeSkip = false;
+	pointRadRenderer.m_enableOctreeSkip = true;
+	pointRadRenderer.m_useMipMappedSkipping = false;
 	app->raycastRendererPtr = &pointRadRenderer;
 	pointRadRenderer.setCamera(&app->camera);
 	pointRadRenderer.updateFrustumCulling(app->aspect);
@@ -987,6 +1033,7 @@ int main() {
 	auto lastTime = clock_t::now();
 	int frameCount = 0;
 	int rayCastCounter = 0;
+	int rayTraceCounter = 0;
 
 	std::cout << "Entering main loop...\n";
 
@@ -1032,11 +1079,13 @@ int main() {
 				app->cameraChanged = false;
 			}
 
-			// Initialize framebuffer if needed
-			app->initializeFramebufferCache();
+			// Initialize framebuffer if needed - only once
+			if (!app->framebufferInitialized) {
+				app->initializeFramebufferCache();
+			}
 
 			// Only render to the framebuffer on select frames
-			if (rayCastCounter % 6 == 0) {
+			if (rayCastCounter % 7 == 0) {
 				// Render to framebuffer
 				glBindFramebuffer(GL_FRAMEBUFFER, app->framebufferCache);
 
@@ -1173,20 +1222,41 @@ int main() {
 
 		}
 		else if (app->currentMode == RenderMode::BVHRayTrace) {
-			// --- GPU BVH Ray Tracing via compute shader ---
-			 // Render with frustum culling - pass the updateFrustumRequested flag
-			bvhRayTracer.renderSceneComputeWithCulling(
-				app->camera,
-				app->lastWindowWidth,
-				app->lastWindowHeight,
-				app->aspect,
-				/*fov=*/45.0f,
-				(app->updateFrustumRequested && app->cameraChanged));
-			if (app->updateFrustumRequested && app->cameraChanged) {
-				// Reset the flag after it's been used
-				app->updateFrustumRequested = false;
-				app->cameraChanged = false;
+			// Initialize framebuffer if needed
+			app->initializeFramebufferCache();
+
+			// Only render to the framebuffer on select frames
+			if (rayTraceCounter % 6 == 0 || (app->updateFrustumRequested && app->cameraChanged)) {
+				// Render to framebuffer
+				glBindFramebuffer(GL_FRAMEBUFFER, app->framebufferCache);
+
+				// Clear the framebuffer
+				glClearColor(0.0f, 0.0f, 0.0f, 1.0f);
+				glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT);
+
+				// Render with frustum culling
+				bvhRayTracer.renderSceneComputeWithCulling(
+					app->camera,
+					app->lastWindowWidth,
+					app->lastWindowHeight,
+					app->aspect,
+					/*fov=*/45.0f,
+					(app->updateFrustumRequested && app->cameraChanged));
+
+				// Reset flags after they've been used
+				if (app->updateFrustumRequested && app->cameraChanged) {
+					app->updateFrustumRequested = false;
+					app->cameraChanged = false;
+				}
+
+				// Restore default framebuffer
+				glBindFramebuffer(GL_FRAMEBUFFER, 0);
 			}
+
+			// Always draw the cached frame to the screen
+			app->drawCachedFrame();
+
+			rayTraceCounter++; // Increment the counter
 		}
 		// Possibly draw octree wireframe
 		if (app->showOctreeWire) {
