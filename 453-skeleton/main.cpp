@@ -507,6 +507,20 @@ struct Assignment4 : public CallbackInterface {
 			else if (key == GLFW_KEY_X) {
 				renderModeToggle = renderModeToggle == 0 ? 1 : 0;
 			}
+			else if (key == GLFW_KEY_O && currentMode == RenderMode::VolumeRaycast) {
+				octreeSkipEnabled = !octreeSkipEnabled;
+				if (raycastRendererPtr) {
+					raycastRendererPtr->m_enableOctreeSkip = octreeSkipEnabled;
+				}
+				std::cout << "Octree Skip " << (octreeSkipEnabled ? "Enabled" : "Disabled") << std::endl;
+			}
+			else if (key == GLFW_KEY_M && currentMode == RenderMode::VolumeRaycast) {
+				mipmappedSkippingEnabled = !mipmappedSkippingEnabled;
+				if (raycastRendererPtr) {
+					raycastRendererPtr->m_useMipMappedSkipping = mipmappedSkippingEnabled;
+				}
+				std::cout << "Mipmapped Skipping " << (mipmappedSkippingEnabled ? "Enabled" : "Disabled") << std::endl;
+			}
 		}
 	}
 
@@ -852,6 +866,8 @@ struct Assignment4 : public CallbackInterface {
 	glm::mat4 lastViewMatrix;
 	bool cameraChanged;
 	bool updateFrustumRequested;
+	bool octreeSkipEnabled = false;  
+	bool mipmappedSkippingEnabled = true; 
 };
 
 int main() {
@@ -1000,8 +1016,8 @@ int main() {
 	std::cout << "Before createComputeShader()" << std::endl;
 	pointRadRenderer.init(grid);
 	pointRadRenderer.setOctreeRoot(root);
-	pointRadRenderer.m_enableOctreeSkip = true;
-	pointRadRenderer.m_useMipMappedSkipping = false;
+	pointRadRenderer.m_enableOctreeSkip = app->octreeSkipEnabled;     
+	pointRadRenderer.m_useMipMappedSkipping = true;
 	app->raycastRendererPtr = &pointRadRenderer;
 	pointRadRenderer.setCamera(&app->camera);
 	pointRadRenderer.updateFrustumCulling(app->aspect);

@@ -464,8 +464,11 @@ float getOptimizedSkipDistance(vec3 rayOrigin, vec3 rayDir, vec3 currentPos) {
     
     // Apply a safety factor to avoid skipping too far
     // Use a more conservative factor for MIP mapping to avoid artifacts
-    float safetyFactor = useMipMappedSkipping ? 0.7 : 0.95;
+    float safetyFactor = useMipMappedSkipping ? 0.9 : 0.95;
 	skipDistance *= safetyFactor;
+	if (!enableOctreeSkip && useMipMappedSkipping){
+		return skipDistance;
+	}
     
     // Calculate distance from camera to current position
     float distanceFromCamera = length(currentPos - camPos);
