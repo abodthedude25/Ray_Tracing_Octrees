@@ -414,8 +414,8 @@ struct Assignment4 : public CallbackInterface {
 	Assignment4()
 		: wireframeMode(false),
 		showOctreeWire(false),
-		currentMode(RenderMode::DualContouring),
-		oldMode(RenderMode::DualContouring),
+		currentMode(RenderMode::VolumeRaycast),
+		oldMode(RenderMode::VolumeRaycast),
 		camera(glm::radians(90.0f), glm::radians(0.f), 500.f),
 		aspect(1.f),
 		rightMouseDown(false),
@@ -566,10 +566,11 @@ struct Assignment4 : public CallbackInterface {
 							//raycastRendererPtr->clearRadiationVolume();
 
 							std::cout << "Step 3: Creating vector" << std::endl;
-							tmp.push_back(rp);
+							std::vector<RadiationPoint> singlePoint;
+							singlePoint.push_back(rp);
 
 							std::cout << "Step 4: Updating splat points" << std::endl;
-							raycastRendererPtr->updateSplatPoints(tmp);
+							raycastRendererPtr->updateSplatPoints(singlePoint);
 
 							std::cout << "Step 5: Dispatching compute" << std::endl;
 							raycastRendererPtr->dispatchRadiationCompute();
@@ -637,6 +638,141 @@ struct Assignment4 : public CallbackInterface {
 
 		return false;
 	}
+
+	void initializeFramebufferCache() {
+		if (framebufferInitialized) return;
+
+		// Create a framebuffer
+		glGenFramebuffers(1, &framebufferCache);
+		glBindFramebuffer(GL_FRAMEBUFFER, framebufferCache);
+
+		// Create texture to render to
+		glGenTextures(1, &frameTexture);
+		glBindTexture(GL_TEXTURE_2D, frameTexture);
+		glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, lastWindowWidth, lastWindowHeight, 0, GL_RGBA, GL_UNSIGNED_BYTE, NULL);
+		glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+		glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+		glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+		glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+
+		// Create depth buffer
+		glGenTextures(1, &frameDepthTexture);
+		glBindTexture(GL_TEXTURE_2D, frameDepthTexture);
+		glTexImage2D(GL_TEXTURE_2D, 0, GL_DEPTH_COMPONENT24, lastWindowWidth, lastWindowHeight, 0, GL_DEPTH_COMPONENT, GL_FLOAT, NULL);
+		glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+		glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+
+		// Attach textures to framebuffer
+		glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, frameTexture, 0);
+		glFramebufferTexture2D(GL_FRAMEBUFFER, GL_DEPTH_ATTACHMENT, GL_TEXTURE_2D, frameDepthTexture, 0);
+
+		// Check if framebuffer is complete
+		if (glCheckFramebufferStatus(GL_FRAMEBUFFER) != GL_FRAMEBUFFER_COMPLETE) {
+			std::cerr << "Framebuffer not complete!" << std::endl;
+		}
+
+		// Unbind framebuffer
+		glBindFramebuffer(GL_FRAMEBUFFER, 0);
+
+		framebufferInitialized = true;
+	}
+
+	// Add this method to draw the cached frame
+	void drawCachedFrame() {
+		// Ensure we're drawing to the default framebuffer
+		glBindFramebuffer(GL_FRAMEBUFFER, 0);
+
+		// Set up a fullscreen draw
+		glDisable(GL_DEPTH_TEST);
+
+		// Use a simple shader to draw the texture
+		static bool shaderInitialized = false;
+		static GLuint frameCopyProgram = 0;
+		static GLuint quadVAO = 0;
+
+		if (!shaderInitialized) {
+			// Create a simple shader for copying the texture
+			const char* vertSrc =
+				"#version 330 core\n"
+				"layout(location=0) in vec2 aPos;\n"
+				"out vec2 texCoord;\n"
+				"void main() {\n"
+				"    texCoord = aPos * 0.5 + 0.5;\n"
+				"    gl_Position = vec4(aPos, 0.0, 1.0);\n"
+				"}\n";
+
+			const char* fragSrc =
+				"#version 330 core\n"
+				"in vec2 texCoord;\n"
+				"out vec4 FragColor;\n"
+				"uniform sampler2D screenTexture;\n"
+				"void main() {\n"
+				"    FragColor = texture(screenTexture, texCoord);\n"
+				"}\n";
+
+			// Compile vertex shader
+			GLuint vertShader = glCreateShader(GL_VERTEX_SHADER);
+			glShaderSource(vertShader, 1, &vertSrc, NULL);
+			glCompileShader(vertShader);
+
+			// Compile fragment shader
+			GLuint fragShader = glCreateShader(GL_FRAGMENT_SHADER);
+			glShaderSource(fragShader, 1, &fragSrc, NULL);
+			glCompileShader(fragShader);
+
+			// Link shaders
+			frameCopyProgram = glCreateProgram();
+			glAttachShader(frameCopyProgram, vertShader);
+			glAttachShader(frameCopyProgram, fragShader);
+			glLinkProgram(frameCopyProgram);
+
+			// Delete shaders
+			glDeleteShader(vertShader);
+			glDeleteShader(fragShader);
+
+			// Create a quad
+			float quadVertices[] = {
+				-1.0f,  1.0f,
+				-1.0f, -1.0f,
+				 1.0f, -1.0f,
+				 1.0f, -1.0f,
+				 1.0f,  1.0f,
+				-1.0f,  1.0f
+			};
+
+			glGenVertexArrays(1, &quadVAO);
+			GLuint quadVBO;
+			glGenBuffers(1, &quadVBO);
+
+			glBindVertexArray(quadVAO);
+			glBindBuffer(GL_ARRAY_BUFFER, quadVBO);
+			glBufferData(GL_ARRAY_BUFFER, sizeof(quadVertices), quadVertices, GL_STATIC_DRAW);
+			glEnableVertexAttribArray(0);
+			glVertexAttribPointer(0, 2, GL_FLOAT, GL_FALSE, 2 * sizeof(float), (void*)0);
+
+			shaderInitialized = true;
+		}
+
+		// Draw the texture
+		glUseProgram(frameCopyProgram);
+		glActiveTexture(GL_TEXTURE0);
+		glBindTexture(GL_TEXTURE_2D, frameTexture);
+		glUniform1i(glGetUniformLocation(frameCopyProgram, "screenTexture"), 0);
+
+		glBindVertexArray(quadVAO);
+		glDrawArrays(GL_TRIANGLES, 0, 6);
+
+		// Reset state
+		glBindVertexArray(0);
+		glUseProgram(0);
+		glEnable(GL_DEPTH_TEST);
+	}
+
+
+	GLuint framebufferCache = 0;
+	GLuint frameTexture = 0;
+	GLuint frameDepthTexture = 0;
+	bool framebufferInitialized = false;
 
 	bool wireframeMode;
 	bool showOctreeWire;
@@ -850,6 +986,7 @@ int main() {
 	using clock_t = std::chrono::high_resolution_clock;
 	auto lastTime = clock_t::now();
 	int frameCount = 0;
+	int rayCastCounter = 0;
 
 	std::cout << "Entering main loop...\n";
 
@@ -895,20 +1032,36 @@ int main() {
 				app->cameraChanged = false;
 			}
 
-			// REPLACED the old volRenderer code with new pointRad usage
-			glDisable(GL_DEPTH_TEST);
-			glEnable(GL_BLEND);
-			glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
+			// Initialize framebuffer if needed
+			app->initializeFramebufferCache();
 
-			// Clear
-			glClearColor(0.6f, 0.6f, 0.3f, 1.f);
-			glClear(GL_COLOR_BUFFER_BIT);
+			// Only render to the framebuffer on select frames
+			if (rayCastCounter % 6 == 0) {
+				// Render to framebuffer
+				glBindFramebuffer(GL_FRAMEBUFFER, app->framebufferCache);
 
-			// If we want to keep camera updates:
-			pointRadRenderer.drawRaycast(app->aspect);
+				// Standard setup
+				glDisable(GL_DEPTH_TEST);
+				glEnable(GL_BLEND);
+				glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
 
-			glDisable(GL_BLEND);
-			glEnable(GL_DEPTH_TEST);
+				// Clear the framebuffer
+				glClearColor(0.0f, 0.0f, 0.0f, 1.0f);
+				glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT);
+
+				// Render to the framebuffer
+				pointRadRenderer.drawRaycast(app->aspect);
+
+				// Restore state
+				glDisable(GL_BLEND);
+				glEnable(GL_DEPTH_TEST);
+				glBindFramebuffer(GL_FRAMEBUFFER, 0);
+			}
+
+			// Always draw the cached frame to the screen
+			app->drawCachedFrame();
+
+			rayCastCounter++; // Fixed the syntax error here
 		}
 		else if (app->currentMode == RenderMode::MarchingCubes) {
 			if ((triCache.empty() || app->cameraChanged) && app->updateFrustumRequested) {

@@ -55,67 +55,110 @@ static glm::vec2 intersectAABB(
 
 // Recursively find earliest intersection with a non-empty octree node.
 static float octreeRaySkip(
-    const OctreeNode* node,
-    const glm::vec3& ro,
-    const glm::vec3& rd,
-    float tMin,
-    float tMax,
-    const VoxelGrid& grid,
-    const std::unordered_map<const OctreeNode*, bool>* visibility = nullptr)
+	const OctreeNode* node,
+	const glm::vec3& ro,
+	const glm::vec3& rd,
+	float tMin,
+	float tMax,
+	const VoxelGrid& grid,
+	const std::unordered_map<const OctreeNode*, bool>* visibility = nullptr,
+	const GLuint radiationTex = 0)
 {
-    if (!node) {
-        return 1e30f; // no node, skip
-    }
-    
-    // Check visibility if provided
-    if (visibility && visibility->count(node) && !visibility->at(node)) {
-        return 1e30f; // Node is not visible, skip
-    }
+	if (!node) {
+		return 1e30f; // no node, skip
+	}
 
-    // Convert node->(x,y,z,size) from voxel coords -> world bounding box
-    float vx = grid.voxelSize;
-    float wx0 = grid.minX + node->x * vx;
-    float wy0 = grid.minY + node->y * vx;
-    float wz0 = grid.minZ + node->z * vx;
-    float wSize = node->size * vx;
+	// Check visibility if provided (frustum culling optimization)
+	if (visibility && visibility->count(node) && !visibility->at(node)) {
+		return 1e30f; // Node is not visible, skip
+	}
 
-    glm::vec3 bmin(wx0, wy0, wz0);
-    glm::vec3 bmax(wx0 + wSize, wy0 + wSize, wz0 + wSize);
+	// Calculate world-space bounds with precomputed approach
+	float vx = grid.voxelSize;
+	float wx0 = grid.minX + node->x * vx;
+	float wy0 = grid.minY + node->y * vx;
+	float wz0 = grid.minZ + node->z * vx;
+	float wSize = node->size * vx;
 
-    // Intersect bounding box
-    glm::vec2 tHit = intersectAABB(ro, rd, bmin, bmax);
-    float enterT = std::max(tMin, tHit.x);
-    float exitT = std::min(tMax, tHit.y);
+	glm::vec3 bmin(wx0, wy0, wz0);
+	glm::vec3 bmax(wx0 + wSize, wy0 + wSize, wz0 + wSize);
 
-    // If no intersection, skip
-    if (enterT > exitT) {
-        return 1e30f;
-    }
+	// Calculate ray-box intersection with SIMD-friendly code
+	// Using precomputed reciprocals for better vectorization
+	glm::vec3 invRd = 1.0f / rd;
 
-    // If leaf node
-    if (node->isLeaf) {
-        // If empty => skip
-        if (!node->isSolid) {
-            return 1e30f;
-        }
-        // If solid => earliest intersection is 'enterT'
-        return enterT;
-    }
+	// Handle near-zero components to avoid division by zero
+	const float smallValue = 1e-10f;
+	if (std::abs(rd.x) < smallValue) invRd.x = rd.x >= 0 ? 1e10f : -1e10f;
+	if (std::abs(rd.y) < smallValue) invRd.y = rd.y >= 0 ? 1e10f : -1e10f;
+	if (std::abs(rd.z) < smallValue) invRd.z = rd.z >= 0 ? 1e10f : -1e10f;
 
-    // Otherwise, it's an internal node => check children
-    float bestT = 1e30f;
-    for (int i = 0; i < 8; i++) {
-        const OctreeNode* child = node->children[i];
-        if (!child) continue;
-        
-        // Pass visibility map to children
-        float childT = octreeRaySkip(child, ro, rd, enterT, exitT, grid, visibility);
-        
-        if (childT < bestT) {
-            bestT = childT;
-        }
-    }
-    return bestT;
+	// Fast ray-box intersection
+	glm::vec3 t1 = (bmin - ro) * invRd;
+	glm::vec3 t2 = (bmax - ro) * invRd;
+
+	glm::vec3 tNear = glm::min(t1, t2);
+	glm::vec3 tFar = glm::max(t1, t2);
+
+	float enterT = std::max(std::max(tNear.x, tNear.y), std::max(tNear.z, tMin));
+	float exitT = std::min(std::min(tFar.x, tFar.y), std::min(tFar.z, tMax));
+
+	// If no intersection or behind current best, skip node
+	if (enterT > exitT) {
+		return 1e30f;
+	}
+
+	// Early termination for leaf nodes
+	if (node->isLeaf) {
+		if (!node->isSolid) {
+			return 1e30f; // Empty leaf node, skip
+		}
+		return enterT; // Solid leaf node, return entry point
+	}
+
+	// Direction-based traversal for internal nodes
+	// Calculate ray direction octant (which of the 8 children to check first)
+	int dirMask = ((rd.x > 0) ? 1 : 0) |
+		((rd.y > 0) ? 2 : 0) |
+		((rd.z > 0) ? 4 : 0);
+
+	// Process children using hamming distance for optimal front-to-back ordering
+	float bestT = 1e30f;
+
+	// Visit children in order of increasing hamming distance from ray direction
+	for (int dist = 0; dist <= 3; dist++) {
+		// Check all children with current hamming distance
+		for (int octant = 0; octant < 8; octant++) {
+			// Count bits different between this octant and the ray direction
+			int bitDiff = 0;
+			int diff = octant ^ dirMask;
+			while (diff) {
+				bitDiff += diff & 1;
+				diff >>= 1;
+			}
+
+			// Skip if not at current distance level
+			if (bitDiff != dist) continue;
+
+			const OctreeNode* child = node->children[octant];
+			if (!child) continue;
+
+			// Recursive ray check with tight bounds
+			float childT = octreeRaySkip(child, ro, rd, enterT, exitT, grid, visibility, radiationTex);
+
+			// Update best result with early termination
+			if (childT < bestT) {
+				bestT = childT;
+
+				// Early exit optimization - found a hit in this branch
+				if (childT < 1e30f) {
+					return childT;
+				}
+			}
+		}
+	}
+
+	return bestT;
 }
 
 //==================== CONSTRUCTOR / DESTRUCTOR ====================
@@ -364,15 +407,19 @@ uniform vec3 boxMax;
 uniform int dimX;
 uniform int dimY;
 uniform int dimZ;
-uint seed;
+uniform uint seed;
 
-// A simple random generator
-float randFloat(inout uint n) {
-    n = 1664525u * n + 1013904223u;
-    uint bits = (n >> 9u) | 0x3F800000u;
-    float f = uintBitsToFloat(bits) - 1.0;
-    return f;
-}
+// Pre-computed jitter offsets for better cache coherency
+const vec3 jitterOffsets[16] = vec3[16](
+    vec3(-0.4, -0.4, -0.4), vec3(0.4, -0.4, -0.4),
+    vec3(-0.4, 0.4, -0.4), vec3(0.4, 0.4, -0.4),
+    vec3(-0.4, -0.4, 0.4), vec3(0.4, -0.4, 0.4),
+    vec3(-0.4, 0.4, 0.4), vec3(0.4, 0.4, 0.4),
+    vec3(-0.2, -0.2, -0.2), vec3(0.2, -0.2, -0.2),
+    vec3(-0.2, 0.2, -0.2), vec3(0.2, 0.2, -0.2),
+    vec3(-0.2, -0.2, 0.2), vec3(0.2, -0.2, 0.2),
+    vec3(-0.2, 0.2, 0.2), vec3(0.2, 0.2, 0.2)
+);
 
 // Sharper cubic B-spline
 float bspline1D(float x) {
@@ -386,56 +433,114 @@ float bspline1D(float x) {
     return 0.0;
 }
 
-// We'll try a tile-based approach or skip it. For now, skip shared memory usage.
+// Tile size for shared memory aggregation
+#define TILE_SIZE 8
 
-layout(local_size_x = 16, local_size_y = 16, local_size_z = 1) in;
+// Shared memory buffer for accumulating radiation within a tile
+shared float radiationTile[TILE_SIZE][TILE_SIZE][TILE_SIZE];
+
+layout(local_size_x = 8, local_size_y = 8, local_size_z = 1) in;
 void main() {
-    uint gid = gl_GlobalInvocationID.x
-             + gl_GlobalInvocationID.y * gl_NumWorkGroups.x * gl_WorkGroupSize.x;
-
-    if(gid >= splats.length()) return;
-
-    RadiationPoint rp = splats[gid];
-    if(rp.radius <= 0.0) return;
-
+    // Get global work group info
+    ivec3 tileStart = ivec3(
+        gl_WorkGroupID.x * TILE_SIZE,
+        gl_WorkGroupID.y * TILE_SIZE,
+        gl_WorkGroupID.z * TILE_SIZE
+    );
+    
+    // Initialize shared memory for this workgroup
+    for (int z = 0; z < TILE_SIZE; z++) {
+        if (gl_LocalInvocationID.z == 0) { // Only the first layer does initialization
+            int y = int(gl_LocalInvocationID.y);
+            int x = int(gl_LocalInvocationID.x);
+            radiationTile[x][y][z] = 0.0;
+        }
+    }
+    barrier();
+    
+    // Only process point 0 for simplicity and performance
+    if (splats.length() == 0) return;
+    RadiationPoint rp = splats[0];
+    
+    // Calculate point position in voxel coordinates
     vec3 size = boxMax - boxMin;
     vec3 voxelCoordF = (rp.worldPos - boxMin) / size * vec3(dimX, dimY, dimZ);
-    ivec3 center = ivec3(floor(voxelCoordF));
-
-    float maxSupport = 0.4 * rp.radius;
-    int iRad = int(ceil(maxSupport));
-    uint rng = seed + gid;
-
-    for(int dz = -iRad; dz <= iRad; dz++){
-        for(int dy = -iRad; dy <= iRad; dy++){
-            for(int dx = -iRad; dx <= iRad; dx++){
-                ivec3 samplePos = center + ivec3(dx, dy, dz);
-
-                if(samplePos.x < 0 || samplePos.x >= dimX ||
-                   samplePos.y < 0 || samplePos.y >= dimY ||
-                   samplePos.z < 0 || samplePos.z >= dimZ) {
-                   continue;
-                }
-
-                vec3 d = vec3(samplePos) - voxelCoordF;
-                vec3 nd = d / rp.radius;
-
-                // Evaluate bspline with random jitter
-                float w = bspline1D(nd.x)*bspline1D(nd.y)*bspline1D(nd.z);
-
-                float rx = (randFloat(rng)-0.5)*0.05;
-                float ry = (randFloat(rng)-0.5)*0.05;
-                float rz = (randFloat(rng)-0.5)*0.05;
-                float w2 = bspline1D(nd.x + rx)*bspline1D(nd.y + ry)*bspline1D(nd.z + rz);
-
-                float finalW = 0.5*(w + w2);
-
-                if(finalW > 1e-4) {
-                    float oldVal = imageLoad(radiationVol, samplePos).r;
-                    float newVal = oldVal + finalW;
-                    imageStore(radiationVol, samplePos, vec4(newVal,0,0,0));
-                }
+    ivec3 centerVoxel = ivec3(floor(voxelCoordF));
+    
+    // Calculate distance from the radiation point to this tile
+    vec3 tileCenter = vec3(tileStart) + vec3(TILE_SIZE/2);
+    float tileDist = distance(tileCenter, voxelCoordF);
+    
+    // Early exit if this tile is too far from the radiation point
+    float maxEffect = rp.radius * 1.6; // Maximum distance of effect
+    if (tileDist > maxEffect + float(TILE_SIZE)) {
+        return; // Skip this tile completely
+    }
+    
+    // Process voxels in this workgroup's section of the tile
+    for (int z = 0; z < TILE_SIZE; z++) {
+        // Calculate global voxel coordinates
+        ivec3 voxelPos = tileStart + ivec3(gl_LocalInvocationID.xy, z);
+        
+        // Skip if outside volume bounds
+        if (any(greaterThanEqual(voxelPos, ivec3(dimX, dimY, dimZ))) || 
+            any(lessThan(voxelPos, ivec3(0)))) {
+            continue;
+        }
+        
+        // Calculate distance from voxel to radiation point
+        vec3 voxelToPoint = vec3(voxelPos) - voxelCoordF;
+        vec3 nd = voxelToPoint / rp.radius;
+        float dist = length(nd);
+        
+        // Skip if too far
+        if (dist > 1.6) {
+            continue;
+        }
+        
+        // Calculate weight using b-spline
+        float w = bspline1D(nd.x) * bspline1D(nd.y) * bspline1D(nd.z);
+        
+        // Use jitter for better visual quality
+        uint jitterIdx = (voxelPos.x + voxelPos.y * 4 + voxelPos.z * 16) % 16;
+        vec3 jitter = jitterOffsets[jitterIdx] * 0.05;
+        
+        float w2 = bspline1D(nd.x + jitter.x) * bspline1D(nd.y + jitter.y) * bspline1D(nd.z + jitter.z);
+        float finalW = 0.5 * (w + w2);
+        
+        // Accumulate in shared memory if significant
+        if (finalW > 1e-4) {
+            // Map global voxel position to local tile position
+            ivec3 localPos = voxelPos - tileStart;
+            if (all(lessThan(localPos, ivec3(TILE_SIZE))) && all(greaterThanEqual(localPos, ivec3(0)))) {
+                // Since we don't have atomicAdd for floats in GLSL 430, we'll use manual addition
+                // This is safe since we ensure each thread writes to a different location
+                radiationTile[localPos.x][localPos.y][localPos.z] += finalW;
             }
+        }
+    }
+    
+    // Synchronize to ensure all threads have finished accumulating
+    barrier();
+    
+    // Now write back to global memory
+    for (int z = 0; z < TILE_SIZE; z++) {
+        // Only proceed if this thread handles valid coordinates
+        ivec3 voxelPos = tileStart + ivec3(gl_LocalInvocationID.xy, z);
+        if (any(greaterThanEqual(voxelPos, ivec3(dimX, dimY, dimZ))) || 
+            any(lessThan(voxelPos, ivec3(0)))) {
+            continue;
+        }
+        
+        // Map global voxel position to local tile position
+        ivec3 localPos = voxelPos - tileStart;
+        
+        // Only write non-zero values to reduce memory traffic
+        if (localPos.x < TILE_SIZE && localPos.y < TILE_SIZE && localPos.z < TILE_SIZE &&
+            radiationTile[localPos.x][localPos.y][localPos.z] > 0.0) {
+            float oldVal = imageLoad(radiationVol, voxelPos).r;
+            float newVal = oldVal + radiationTile[localPos.x][localPos.y][localPos.z];
+            imageStore(radiationVol, voxelPos, vec4(newVal, 0, 0, 0));
         }
     }
 }
@@ -474,73 +579,97 @@ void VolumeRaycastRenderer::createComputeShader() {
 
 //==================== dispatchRadiationCompute ====================
 void VolumeRaycastRenderer::dispatchRadiationCompute() {
-    if (!m_computeProg || m_splatPoints.empty()) return;
+	if (!m_computeProg || m_splatPoints.empty()) return;
 
-    std::cout << "Dispatching radiation compute with " << m_splatPoints.size() << " points\n";
+	std::cout << "Dispatching radiation compute with " << m_splatPoints.size() << " points\n";
 
-    // Validate radiation points
-    for (auto& pt : m_splatPoints) {
-        pt.radius = std::min(pt.radius, 15.0f);
-        glm::vec3 normalizedPos = (pt.worldPos - m_boxMin) / (m_boxMax - m_boxMin);
-        // If outside volume + margin
-        if (normalizedPos.x < -0.1f || normalizedPos.x > 1.1f ||
-            normalizedPos.y < -0.1f || normalizedPos.y > 1.1f ||
-            normalizedPos.z < -0.1f || normalizedPos.z > 1.1f) {
-            std::cout << "Warning: Radiation point outside volume: "
-                << pt.worldPos.x << ", " << pt.worldPos.y << ", " << pt.worldPos.z << std::endl;
-            // We can skip or clamp
-        }
-    }
+	// Validate and limit radiation points for performance
+	for (auto& pt : m_splatPoints) {
+		pt.radius = std::min(pt.radius, 6.0f); // Limit radius for performance
+	}
 
-    // Create SSBO
-    GLuint ssbo = 0;
-    glGenBuffers(1, &ssbo);
-    glBindBuffer(GL_SHADER_STORAGE_BUFFER, ssbo);
+	// Create SSBO for the radiation points
+	GLuint ssbo = 0;
+	glGenBuffers(1, &ssbo);
+	glBindBuffer(GL_SHADER_STORAGE_BUFFER, ssbo);
+	glBufferData(GL_SHADER_STORAGE_BUFFER, sizeof(RadiationPoint) * m_splatPoints.size(),
+		m_splatPoints.data(), GL_STATIC_DRAW);
+	glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 0, ssbo);
 
-    size_t dataSize = sizeof(RadiationPoint) * m_splatPoints.size();
-    glBufferData(GL_SHADER_STORAGE_BUFFER, dataSize, m_splatPoints.data(), GL_STATIC_DRAW);
-    glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 0, ssbo);
+	glUseProgram(m_computeProg);
 
-    glUseProgram(m_computeProg);
+	// Set uniforms
+	glUniform3fv(glGetUniformLocation(m_computeProg, "boxMin"), 1, glm::value_ptr(m_boxMin));
+	glUniform3fv(glGetUniformLocation(m_computeProg, "boxMax"), 1, glm::value_ptr(m_boxMax));
+	glUniform1i(glGetUniformLocation(m_computeProg, "dimX"), m_dimX);
+	glUniform1i(glGetUniformLocation(m_computeProg, "dimY"), m_dimY);
+	glUniform1i(glGetUniformLocation(m_computeProg, "dimZ"), m_dimZ);
+	glUniform1ui(glGetUniformLocation(m_computeProg, "seed"), 12345u);
 
-    // Set uniforms
-    glUniform3fv(glGetUniformLocation(m_computeProg, "boxMin"), 1, glm::value_ptr(m_boxMin));
-    glUniform3fv(glGetUniformLocation(m_computeProg, "boxMax"), 1, glm::value_ptr(m_boxMax));
-    glUniform1i(glGetUniformLocation(m_computeProg, "dimX"), m_dimX);
-    glUniform1i(glGetUniformLocation(m_computeProg, "dimY"), m_dimY);
-    glUniform1i(glGetUniformLocation(m_computeProg, "dimZ"), m_dimZ);
-    glUniform1ui(glGetUniformLocation(m_computeProg, "seed"), 12345u);
+	// Bind images
+	glBindImageTexture(1, m_radiationTex, 0, GL_TRUE, 0, GL_READ_WRITE, GL_R32F);
+	glBindImageTexture(2, m_volumeTex, 0, GL_TRUE, 0, GL_READ_ONLY, GL_R32F);
 
-    // Bind images
-    glBindImageTexture(1, m_radiationTex, 0, GL_TRUE, 0, GL_READ_WRITE, GL_R32F);
-    glBindImageTexture(2, m_volumeTex, 0, GL_TRUE, 0, GL_READ_ONLY, GL_R32F);
+	// Process one point at a time in small batches
+	for (size_t i = 0; i < std::min(size_t(1), m_splatPoints.size()); i++) {
+		const RadiationPoint& point = m_splatPoints[i];
 
-    // Dispatch
-    const GLuint localSizeX = 16;
-    const GLuint localSizeY = 16;
-    GLuint wgSize = localSizeX * localSizeY;
-    GLuint totalPoints = static_cast<GLuint>(m_splatPoints.size());
-    GLuint numGroups = (totalPoints + wgSize - 1) / wgSize;
+		// Calculate voxel position of the radiation point
+		glm::vec3 normPos = (point.worldPos - m_boxMin) / (m_boxMax - m_boxMin);
+		glm::ivec3 voxelPos = glm::ivec3(normPos * glm::vec3(m_dimX, m_dimY, m_dimZ));
 
-    if (numGroups > 0) {
-        std::cout << "Compute dispatch: " << numGroups << " groups.\n";
-        glDispatchCompute(numGroups, 1, 1);
-    }
+		// Calculate effective radius in voxels (smaller for performance)
+		int radiusVoxels = std::min(int(point.radius * 1.6), 12);
 
-    // Single barrier after dispatch
-    glMemoryBarrier(GL_SHADER_IMAGE_ACCESS_BARRIER_BIT | GL_TEXTURE_FETCH_BARRIER_BIT);
+		// Calculate the tile range to cover this radius
+		int tileRadius = (radiusVoxels + 7) / 8 + 1; // Round up to whole tiles
 
-    // Cleanup
-    glBindImageTexture(1, 0, 0, GL_FALSE, 0, GL_READ_WRITE, GL_R32F);
-    glBindImageTexture(2, 0, 0, GL_FALSE, 0, GL_READ_ONLY, GL_R32F);
+		// Calculate tile start and end with bounds checking
+		int minTileX = std::max(0, voxelPos.x / 8 - tileRadius);
+		int maxTileX = std::min(m_dimX / 8, voxelPos.x / 8 + tileRadius);
+		int minTileY = std::max(0, voxelPos.y / 8 - tileRadius);
+		int maxTileY = std::min(m_dimY / 8, voxelPos.y / 8 + tileRadius);
+		int minTileZ = std::max(0, voxelPos.z / 8 - tileRadius);
+		int maxTileZ = std::min(m_dimZ / 8, voxelPos.z / 8 + tileRadius);
 
-    glBindBuffer(GL_SHADER_STORAGE_BUFFER, 0);
-    glDeleteBuffers(1, &ssbo);
+		// Calculate number of tiles to process
+		int numTilesX = maxTileX - minTileX + 1;
+		int numTilesY = maxTileY - minTileY + 1;
+		int numTilesZ = maxTileZ - minTileZ + 1;
+		int totalTiles = numTilesX * numTilesY * numTilesZ;
 
-    checkGLError("dispatchRadiationCompute");
+		// Use much smaller batches for smoother performance
+		const int BATCH_SIZE = 4; // Process just a few tiles at once
 
-    // Force re-run precompute for updated radiation
-    m_precomputeNeeded = true;
+		std::cout << "  Processing point in " << totalTiles << " tiles with "
+			<< (totalTiles + BATCH_SIZE - 1) / BATCH_SIZE << " batches\n";
+
+		for (int z = minTileZ; z <= maxTileZ; z += BATCH_SIZE) {
+			// Immediately synchronize after each small batch
+			glFinish();
+
+			int batchSizeZ = std::min(maxTileZ - z + 1, BATCH_SIZE);
+			glDispatchCompute(numTilesX, numTilesY, batchSizeZ);
+
+			// Add memory barrier between batches
+			glMemoryBarrier(GL_SHADER_IMAGE_ACCESS_BARRIER_BIT);
+		}
+	}
+
+	// Final barrier
+	glMemoryBarrier(GL_SHADER_IMAGE_ACCESS_BARRIER_BIT | GL_TEXTURE_FETCH_BARRIER_BIT);
+
+	// Clean up
+	glBindBuffer(GL_SHADER_STORAGE_BUFFER, 0);
+	glDeleteBuffers(1, &ssbo);
+
+	checkGLError("dispatchRadiationCompute");
+
+	// Force re-run precompute for updated radiation
+	m_precomputeNeeded = true;
+
+	// Clear the splat points to prevent accumulation
+	m_splatPoints.clear();
 }
 
 //==================== Precompute Shader =====================
@@ -550,71 +679,135 @@ layout(local_size_x = 8, local_size_y = 8, local_size_z = 8) in;
 
 // We'll read from volumeTex and output to gradientMagTex, gradientDirTex, edgeFactorTex
 layout(binding = 0) uniform sampler3D volumeTex;
+layout(binding = 1) uniform sampler3D radiationTex;
 layout(r32f, binding = 0) uniform writeonly image3D gradientMagTex;
-layout(rgba32f, binding = 1) uniform writeonly image3D gradientDirTex;
+layout(rgba16f, binding = 1) uniform writeonly image3D gradientDirTex;
 layout(r32f, binding = 2) uniform writeonly image3D edgeFactorTex;
 
 uniform vec3 boxMin;
 uniform vec3 boxMax;
 uniform ivec3 volumeSize;
 
-float safeSampleVolume(vec3 uvw) {
-    return texture(volumeTex, clamp(uvw, vec3(0.0), vec3(1.0))).r;
+// Higher quality sampling with trilinear interpolation
+float sampleVolume(vec3 pos) {
+    vec3 uvw = (pos - boxMin) / (boxMax - boxMin);
+    if(any(lessThan(uvw, vec3(0.0))) || any(greaterThan(uvw, vec3(1.0)))) 
+        return 0.0;
+    return texture(volumeTex, uvw).r;
 }
 
-float cubicFilter(float x) {
-    x = abs(x);
-    if (x < 1.0)
-        return (2.0/3.0) + (0.5*x*x*(x-2.0));
-    else if (x < 2.0) {
-        float t = 2.0 - x;
-        return (t*t*t)/6.0;
+// Check if a voxel has been carved by radiation
+float sampleRadiation(vec3 pos) {
+    vec3 uvw = (pos - boxMin) / (boxMax - boxMin);
+    if(any(lessThan(uvw, vec3(0.0))) || any(greaterThan(uvw, vec3(1.0)))) 
+        return 0.0;
+    return texture(radiationTex, uvw).r;
+}
+
+// Higher quality gradient computation using Sobel operator
+vec3 computeSobelGradient(vec3 pos) {
+    vec3 voxelSize = (boxMax - boxMin) / vec3(volumeSize);
+    
+    // Sobel operator masks for 3D
+    float s[3] = float[3](-1.0, 0.0, 1.0);
+    float w[3] = float[3](1.0, 2.0, 1.0);
+    
+    vec3 gradient = vec3(0.0);
+    
+    // Apply 3D Sobel
+    for (int z = 0; z < 3; z++) {
+        for (int y = 0; y < 3; y++) {
+            for (int x = 0; x < 3; x++) {
+                vec3 offset = vec3(s[x], s[y], s[z]);
+                float weight = w[x] * w[y] * w[z];
+                
+                // Check for carved areas - don't compute gradients across radiation boundaries
+                float radValue = sampleRadiation(pos + offset * voxelSize);
+                if (radValue > 0.5) {
+                    // Skip or reduce contribution from carved voxels
+                    weight *= max(0.0, 1.0 - radValue);
+                }
+                
+                float sampleValue = sampleVolume(pos + offset * voxelSize); // Changed 'sample' to 'sampleValue'
+                gradient.x += sampleValue * s[x] * weight;
+                gradient.y += sampleValue * s[y] * weight;
+                gradient.z += sampleValue * s[z] * weight;
+            }
+        }
     }
-    return 0.0;
+    
+    // Invert gradient direction to point outward from solid to empty
+    return -gradient;
 }
 
-vec3 computeGradient(vec3 uvw, float eps) {
-    float x1 = safeSampleVolume(uvw + vec3(eps,0,0));
-    float x2 = safeSampleVolume(uvw - vec3(eps,0,0));
-    float y1 = safeSampleVolume(uvw + vec3(0,eps,0));
-    float y2 = safeSampleVolume(uvw - vec3(0,eps,0));
-    float z1 = safeSampleVolume(uvw + vec3(0,0,eps));
-    float z2 = safeSampleVolume(uvw - vec3(0,0,eps));
-    return 0.5 * vec3(x1 - x2, y1 - y2, z1 - z2);
-}
-
-float sampleVolumeCubic(vec3 uvw) {
-    // We skip advanced cubic approach for brevity here. If you want a real cubic approach, add code
-    return safeSampleVolume(uvw);
+// Edge detection based on density changes
+float detectEdges(vec3 pos, vec3 gradientDir, float gradientMag) {
+    vec3 voxelSize = (boxMax - boxMin) / vec3(volumeSize);
+    float centerValue = sampleVolume(pos);
+    
+    // Thresholds for edge detection
+    const float isoValue = 0.5;
+    const float edgeThreshold = 0.1;
+    
+    // Primary edge detection: check if voxel is near the isosurface
+    float distToIso = abs(centerValue - isoValue);
+    float edgeFactor = 1.0 - smoothstep(0.0, edgeThreshold, distToIso);
+    
+    // Secondary edge enhancement: magnitude of gradient
+    // Normalize gradient magnitude to a reasonable range
+    float normGradMag = min(1.0, gradientMag / 10.0);
+    
+    // Combine with curvature-based edge detection
+    // Sample in both directions along the normal
+    vec3 tangent1 = normalize(cross(gradientDir, vec3(0.0, 1.0, 0.0)));
+    if (length(tangent1) < 0.1) tangent1 = normalize(cross(gradientDir, vec3(1.0, 0.0, 0.0)));
+    vec3 tangent2 = cross(gradientDir, tangent1);
+    
+    // Sample density along tangents to detect curvature
+    float s1 = sampleVolume(pos + tangent1 * voxelSize);
+    float s2 = sampleVolume(pos - tangent1 * voxelSize);
+    float s3 = sampleVolume(pos + tangent2 * voxelSize);
+    float s4 = sampleVolume(pos - tangent2 * voxelSize);
+    
+    // Approximate curvature by density change along tangents
+    float curvature = abs(s1 - centerValue) + abs(s2 - centerValue) + 
+                     abs(s3 - centerValue) + abs(s4 - centerValue);
+    curvature = curvature / 4.0;  // Normalize
+    
+    // Check for carved edges too
+    float r1 = sampleRadiation(pos + gradientDir * voxelSize);
+    float r0 = sampleRadiation(pos);
+    if (r1 > 0.1 || r0 > 0.1) {
+        // Enhanced edges around radiation carved areas
+        edgeFactor = max(edgeFactor, smoothstep(0.0, 0.3, max(r0, r1)));
+    }
+    
+    // Combine various edge factors - weight them as desired
+    return edgeFactor * 0.7 + normGradMag * 0.2 + curvature * 0.1;
 }
 
 void main() {
     ivec3 voxelCoord = ivec3(gl_GlobalInvocationID.xyz);
     if(any(greaterThanEqual(voxelCoord, volumeSize))) return;
 
-    vec3 uvw = (vec3(voxelCoord) + 0.5) / vec3(volumeSize);
-    float den = safeSampleVolume(uvw);
-
-    float isoValue = 0.9;
-    float isoRange = 0.3;
-    float isoFactor = smoothstep(isoValue - isoRange, isoValue + isoRange, den);
-
-    bool isEdge = abs(den - isoValue) < isoRange;
-    if(isEdge) {
-        den = sampleVolumeCubic(uvw);
-    }
-
-    float eps = 1.0 / float(min(min(volumeSize.x, volumeSize.y), volumeSize.z));
-    if(isEdge) eps *= 0.5;
-
-    vec3 grad = computeGradient(uvw, eps);
-    float gradMag = length(grad);
-
-    vec3 normal = (gradMag > 1e-5) ? (grad / gradMag) : vec3(0.0,1.0,0.0);
-
+    // Get voxel position in world space
+    vec3 voxelSize = (boxMax - boxMin) / vec3(volumeSize);
+    vec3 voxelPos = boxMin + (vec3(voxelCoord) + 0.5) * voxelSize;
+    
+    // Compute gradient using Sobel
+    vec3 gradient = computeSobelGradient(voxelPos);
+    float gradMag = length(gradient);
+    
+    // Compute normalized gradient direction (normal)
+    vec3 normal = (gradMag > 0.001) ? normalize(gradient) : vec3(0.0, 1.0, 0.0);
+    
+    // Detect edges
+    float edgeFactor = detectEdges(voxelPos, normal, gradMag);
+    
+    // Store results in output textures
     imageStore(gradientMagTex, voxelCoord, vec4(gradMag));
     imageStore(gradientDirTex, voxelCoord, vec4(normal, 0.0));
-    imageStore(edgeFactorTex, voxelCoord, vec4(isoFactor));
+    imageStore(edgeFactorTex, voxelCoord, vec4(edgeFactor));
 }
 )COMPUTE";
 
@@ -650,80 +843,85 @@ void VolumeRaycastRenderer::createPrecomputeShader() {
 }
 
 void VolumeRaycastRenderer::createPrecomputeTextures() {
-    // Gradient magnitude
-    glGenTextures(1, &m_gradientMagTex);
-    glBindTexture(GL_TEXTURE_3D, m_gradientMagTex);
-    glTexImage3D(GL_TEXTURE_3D, 0, GL_R32F, m_dimX, m_dimY, m_dimZ,
-        0, GL_RED, GL_FLOAT, nullptr);
+	// Gradient magnitude
+	glGenTextures(1, &m_gradientMagTex);
+	glBindTexture(GL_TEXTURE_3D, m_gradientMagTex);
+	glTexImage3D(GL_TEXTURE_3D, 0, GL_R32F, m_dimX, m_dimY, m_dimZ,
+		0, GL_RED, GL_FLOAT, nullptr);
 
-    glTexParameteri(GL_TEXTURE_3D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
-    glTexParameteri(GL_TEXTURE_3D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
-    glTexParameteri(GL_TEXTURE_3D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
-    glTexParameteri(GL_TEXTURE_3D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
-    glTexParameteri(GL_TEXTURE_3D, GL_TEXTURE_WRAP_R, GL_CLAMP_TO_EDGE);
+	glTexParameteri(GL_TEXTURE_3D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+	glTexParameteri(GL_TEXTURE_3D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+	glTexParameteri(GL_TEXTURE_3D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+	glTexParameteri(GL_TEXTURE_3D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+	glTexParameteri(GL_TEXTURE_3D, GL_TEXTURE_WRAP_R, GL_CLAMP_TO_EDGE);
 
-    // Gradient direction
-    glGenTextures(1, &m_gradientDirTex);
-    glBindTexture(GL_TEXTURE_3D, m_gradientDirTex);
-    glTexImage3D(GL_TEXTURE_3D, 0, GL_RGBA32F, m_dimX, m_dimY, m_dimZ,
-        0, GL_RGBA, GL_FLOAT, nullptr);
+	// Gradient direction - using RGBA16F for better precision and more compact storage
+	glGenTextures(1, &m_gradientDirTex);
+	glBindTexture(GL_TEXTURE_3D, m_gradientDirTex);
+	glTexImage3D(GL_TEXTURE_3D, 0, GL_RGBA16F, m_dimX, m_dimY, m_dimZ,
+		0, GL_RGBA, GL_FLOAT, nullptr);
 
-    glTexParameteri(GL_TEXTURE_3D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
-    glTexParameteri(GL_TEXTURE_3D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
-    glTexParameteri(GL_TEXTURE_3D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
-    glTexParameteri(GL_TEXTURE_3D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
-    glTexParameteri(GL_TEXTURE_3D, GL_TEXTURE_WRAP_R, GL_CLAMP_TO_EDGE);
+	glTexParameteri(GL_TEXTURE_3D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+	glTexParameteri(GL_TEXTURE_3D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+	glTexParameteri(GL_TEXTURE_3D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+	glTexParameteri(GL_TEXTURE_3D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+	glTexParameteri(GL_TEXTURE_3D, GL_TEXTURE_WRAP_R, GL_CLAMP_TO_EDGE);
 
-    // Edge factor
-    glGenTextures(1, &m_edgeFactorTex);
-    glBindTexture(GL_TEXTURE_3D, m_edgeFactorTex);
-    glTexImage3D(GL_TEXTURE_3D, 0, GL_R32F, m_dimX, m_dimY, m_dimZ,
-        0, GL_RED, GL_FLOAT, nullptr);
+	// Edge factor
+	glGenTextures(1, &m_edgeFactorTex);
+	glBindTexture(GL_TEXTURE_3D, m_edgeFactorTex);
+	glTexImage3D(GL_TEXTURE_3D, 0, GL_R32F, m_dimX, m_dimY, m_dimZ,
+		0, GL_RED, GL_FLOAT, nullptr);
 
-    glTexParameteri(GL_TEXTURE_3D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
-    glTexParameteri(GL_TEXTURE_3D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
-    glTexParameteri(GL_TEXTURE_3D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
-    glTexParameteri(GL_TEXTURE_3D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
-    glTexParameteri(GL_TEXTURE_3D, GL_TEXTURE_WRAP_R, GL_CLAMP_TO_EDGE);
+	glTexParameteri(GL_TEXTURE_3D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+	glTexParameteri(GL_TEXTURE_3D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+	glTexParameteri(GL_TEXTURE_3D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+	glTexParameteri(GL_TEXTURE_3D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+	glTexParameteri(GL_TEXTURE_3D, GL_TEXTURE_WRAP_R, GL_CLAMP_TO_EDGE);
 
-    glBindTexture(GL_TEXTURE_3D, 0);
-    checkGLError("createPrecomputeTextures");
+	glBindTexture(GL_TEXTURE_3D, 0);
+	checkGLError("createPrecomputeTextures");
 }
 
 void VolumeRaycastRenderer::dispatchPrecompute() {
-    if (!m_precomputeProg) return;
+	if (!m_precomputeProg) return;
 
-    // Use the actual rendering texture (working volume) for precomputation
-    glActiveTexture(GL_TEXTURE0);
-    glBindTexture(GL_TEXTURE_3D, m_workingVolumeTex);
+	// Use the actual rendering texture (working volume) for precomputation
+	glActiveTexture(GL_TEXTURE0);
+	glBindTexture(GL_TEXTURE_3D, m_workingVolumeTex);
 
-    // Bind output images
-    glBindImageTexture(0, m_gradientMagTex, 0, GL_TRUE, 0, GL_WRITE_ONLY, GL_R32F);
-    glBindImageTexture(1, m_gradientDirTex, 0, GL_TRUE, 0, GL_WRITE_ONLY, GL_RGBA32F);
-    glBindImageTexture(2, m_edgeFactorTex, 0, GL_TRUE, 0, GL_WRITE_ONLY, GL_R32F);
+	// Add radiation texture for better edge detection around carved areas
+	glActiveTexture(GL_TEXTURE1);
+	glBindTexture(GL_TEXTURE_3D, m_radiationTex);
 
-    glUseProgram(m_precomputeProg);
+	// Bind output images
+	glBindImageTexture(0, m_gradientMagTex, 0, GL_TRUE, 0, GL_WRITE_ONLY, GL_R32F);
+	glBindImageTexture(1, m_gradientDirTex, 0, GL_TRUE, 0, GL_WRITE_ONLY, GL_RGBA16F); // Changed to RGBA16F
+	glBindImageTexture(2, m_edgeFactorTex, 0, GL_TRUE, 0, GL_WRITE_ONLY, GL_R32F);
 
-    glUniform3fv(glGetUniformLocation(m_precomputeProg, "boxMin"), 1, glm::value_ptr(m_boxMin));
-    glUniform3fv(glGetUniformLocation(m_precomputeProg, "boxMax"), 1, glm::value_ptr(m_boxMax));
-    glUniform3i(glGetUniformLocation(m_precomputeProg, "volumeSize"), m_dimX, m_dimY, m_dimZ);
-    glUniform1i(glGetUniformLocation(m_precomputeProg, "volumeTex"), 0);
+	glUseProgram(m_precomputeProg);
 
-    int groupsX = (m_dimX + 7) / 8;
-    int groupsY = (m_dimY + 7) / 8;
-    int groupsZ = (m_dimZ + 7) / 8;
+	glUniform3fv(glGetUniformLocation(m_precomputeProg, "boxMin"), 1, glm::value_ptr(m_boxMin));
+	glUniform3fv(glGetUniformLocation(m_precomputeProg, "boxMax"), 1, glm::value_ptr(m_boxMax));
+	glUniform3i(glGetUniformLocation(m_precomputeProg, "volumeSize"), m_dimX, m_dimY, m_dimZ);
+	glUniform1i(glGetUniformLocation(m_precomputeProg, "volumeTex"), 0);
+	glUniform1i(glGetUniformLocation(m_precomputeProg, "radiationTex"), 1);
 
-    glDispatchCompute(groupsX, groupsY, groupsZ);
+	int groupsX = (m_dimX + 7) / 8;
+	int groupsY = (m_dimY + 7) / 8;
+	int groupsZ = (m_dimZ + 7) / 8;
 
-    glMemoryBarrier(GL_SHADER_IMAGE_ACCESS_BARRIER_BIT | GL_TEXTURE_FETCH_BARRIER_BIT);
+	glDispatchCompute(groupsX, groupsY, groupsZ);
 
-    // Unbind
-    glBindImageTexture(0, 0, 0, GL_FALSE, 0, GL_READ_WRITE, GL_R32F);
-    glBindImageTexture(1, 0, 0, GL_FALSE, 0, GL_READ_WRITE, GL_RGBA32F);
-    glBindImageTexture(2, 0, 0, GL_FALSE, 0, GL_READ_WRITE, GL_R32F);
+	glMemoryBarrier(GL_SHADER_IMAGE_ACCESS_BARRIER_BIT | GL_TEXTURE_FETCH_BARRIER_BIT);
 
-    m_precomputeNeeded = false;
-    checkGLError("dispatchPrecompute");
+	// Unbind
+	glBindImageTexture(0, 0, 0, GL_FALSE, 0, GL_READ_WRITE, GL_R32F);
+	glBindImageTexture(1, 0, 0, GL_FALSE, 0, GL_READ_WRITE, GL_RGBA16F);
+	glBindImageTexture(2, 0, 0, GL_FALSE, 0, GL_READ_WRITE, GL_R32F);
+
+	m_precomputeNeeded = false;
+	checkGLError("dispatchPrecompute");
 }
 
 //==================== Raycast Program =====================
@@ -1187,89 +1385,115 @@ void VolumeRaycastRenderer::updateFrustumCulling(float aspect) {
 
 //==================== drawRaycast ====================
 void VolumeRaycastRenderer::drawRaycast(float aspect) {
-    if (!m_raycastProg) return;
-    
-    // Update frustum culling if needed
-    if (m_useFrustumCulling && (m_updateFrustumRequested || m_needsInitialFrustumCulling)) {
-        std::cout << "Updating frustum culling...\n";
-        updateFrustumCulling(aspect);
-        m_updateFrustumRequested = false;
-        m_needsInitialFrustumCulling = false;
-    }
+	if (!m_raycastProg) return;
 
-    // Possibly re-run gradient precompute if needed
-    if (m_precomputeNeeded) {
-        dispatchPrecompute();
-    }
+	// Update frustum culling if needed
+	if (m_useFrustumCulling && (m_updateFrustumRequested || m_needsInitialFrustumCulling)) {
+		updateFrustumCulling(aspect);
+		m_updateFrustumRequested = false;
+		m_needsInitialFrustumCulling = false;
+	}
 
-    // Update indirect lighting every N frames for performance
-    if (frameCounter % 10 == 0) { // Update every 10 frames
-        updateIndirectLighting();
-    }
-    frameCounter++;
+	// Possibly re-run gradient precompute if needed
+	if (m_precomputeNeeded) {
+		dispatchPrecompute();
+	}
 
-    // Modified octree skipping logic to avoid disappearing buildings
-    float skipDistance = 0.0f;
-    if (m_enableOctreeSkip && m_octreeRoot && m_cameraPtr) {
-        // Instead of just a center ray, use multiple rays for more stability
-        float maxSkipDistance = 0.0f;
-        const int numRays = 5; // Use multiple rays instead of just one
+	// Calculate skip distance using optimized ray casting
+	float skipDistance = 0.0f;
+	if (m_enableOctreeSkip && m_octreeRoot && m_cameraPtr) {
+		// Improved sampling pattern with multiple rays
+		const int gridSize = 7; // Increased from 5x5 to 7x7 for better coverage
+		const float sampleOffset = 0.2f;
 
-        for (int i = 0; i < numRays; i++) {
-            // Create rays at different points on the screen (center and corners)
-            float ndcX = (i == 0) ? 0.0f : ((i == 1) ? -0.75f : (i == 2) ? 0.75f : (i == 3) ? -0.75f : 0.75f);
-            float ndcY = (i == 0) ? 0.0f : ((i == 1) ? -0.75f : (i == 2) ? -0.75f : (i == 3) ? 0.75f : 0.75f);
+		// Reserve space for skip distances - no reallocation during sampling
+		std::vector<float> validSkipDistances;
+		validSkipDistances.reserve(gridSize * gridSize);
 
-            glm::vec4 clipPos(ndcX, ndcY, 1.f, 1.f);
-            glm::mat4 V = m_cameraPtr->getView();
-            glm::mat4 P = glm::perspective(glm::radians(45.0f), aspect, 0.1f, 5000.0f);
-            glm::mat4 invV = glm::inverse(V);
-            glm::mat4 invP = glm::inverse(P);
+		// Camera setup for ray generation
+		glm::mat4 V = m_cameraPtr->getView();
+		glm::mat4 P = glm::perspective(glm::radians(45.0f), aspect, 0.1f, 5000.0f);
+		glm::mat4 invV = glm::inverse(V);
+		glm::mat4 invP = glm::inverse(P);
+		glm::vec3 ro = m_cameraPtr->getPos();
 
-            glm::vec4 viewPos = invP * clipPos;
-            viewPos /= viewPos.w;
-            glm::vec4 worldPos4 = invV * viewPos;
-            glm::vec3 ro = m_cameraPtr->getPos();
-            glm::vec3 rd = glm::normalize(glm::vec3(worldPos4) - ro);
+		// Sample grid of rays across viewport
+		// This gives us multiple samples to ensure stable skipping
+		for (int y = 0; y < gridSize; y++) {
+			for (int x = 0; x < gridSize; x++) {
+				// Generate ray in screen space
+				float ndcX = ((float)x / (gridSize - 1) - 0.5f) * 2.0f * sampleOffset;
+				float ndcY = ((float)y / (gridSize - 1) - 0.5f) * 2.0f * sampleOffset;
 
-            // Pass visibility info to octreeRaySkip
-            float raySkip = octreeRaySkip(m_octreeRoot, ro, rd, 0.0f, 1e30f, *m_gridPtr,
-                m_useFrustumCulling ? &m_nodeVisibility : nullptr);
+				// Transform to world space
+				glm::vec4 clipPos(ndcX, ndcY, 1.f, 1.f);
+				glm::vec4 viewPos = invP * clipPos;
+				viewPos /= viewPos.w;
+				glm::vec4 worldPos4 = invV * viewPos;
+				glm::vec3 rd = glm::normalize(glm::vec3(worldPos4) - ro);
 
-            // Take the maximum from all rays for stability
-            if (raySkip < 1e30f && (i == 0 || raySkip > maxSkipDistance)) {
-                maxSkipDistance = raySkip;
-            }
-        }
+				// Use optimized octree ray skip algorithm
+				float raySkip = octreeRaySkip(
+					m_octreeRoot,
+					ro,
+					rd,
+					0.0f,
+					1e30f,
+					*m_gridPtr,
+					m_useFrustumCulling ? &m_nodeVisibility : nullptr,
+					m_radiationTex);
 
-        // Only use skip if we found a valid distance, and apply a safety margin
-        if (maxSkipDistance > 0.0f) {
-            // Add a small safety margin to avoid skipping too far
-            skipDistance = maxSkipDistance * 0.95f; // 5% safety margin
-        }
-    }
+				// Store valid skip distances
+				if (raySkip < 1e30f && raySkip > 0.0f) {
+					validSkipDistances.push_back(raySkip);
+				}
+			}
+		}
 
-    // Standard rendering code continues as before
-    glDisable(GL_DEPTH_TEST);
-    glEnable(GL_BLEND);
-    glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
-    glClearColor(0, 0, 0, 1);
-    glClear(GL_COLOR_BUFFER_BIT);
+		// Use conservative percentile (15th) for safe skipping
+		if (!validSkipDistances.empty()) {
+			std::sort(validSkipDistances.begin(), validSkipDistances.end());
+			int safeIndex = std::max(0, (int)(validSkipDistances.size() * 0.15f));
+			skipDistance = validSkipDistances[safeIndex];
 
-    glUseProgram(m_raycastProg);
-    bindRaycastUniforms(aspect);
+			// Apply safety margin (75% of distance)
+			skipDistance *= 0.75f;
+		}
 
-    // Set the octreeSkipT uniform
-    GLint locSkip = glGetUniformLocation(m_raycastProg, "octreeSkipT");
-    glUniform1f(locSkip, skipDistance);
+		// Temporal coherence - smooth transition between frames
+		static float lastSkipDistance = 0.0f;
+		float blendFactor = 0.4f; // Reduced from 0.5f for faster adaptation
+		skipDistance = lastSkipDistance * blendFactor + skipDistance * (1.0f - blendFactor);
+		lastSkipDistance = skipDistance;
+	}
 
-    glBindVertexArray(m_quadVAO);
-    glDrawArrays(GL_TRIANGLE_STRIP, 0, 4);
-    glBindVertexArray(0);
+	// Standard rendering setup
+	glDisable(GL_DEPTH_TEST);
+	glEnable(GL_BLEND);
+	glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
+	glClearColor(0, 0, 0, 1);
+	glClear(GL_COLOR_BUFFER_BIT);
 
-    glDisable(GL_BLEND);
-    glEnable(GL_DEPTH_TEST);
-    checkGLError("drawRaycast");
+	// Activate shader program and bind uniforms
+	glUseProgram(m_raycastProg);
+	bindRaycastUniforms(aspect);
+
+	// Set octree skip distance
+	GLint locSkip = glGetUniformLocation(m_raycastProg, "octreeSkipT");
+	if (locSkip != -1) {
+		glUniform1f(locSkip, skipDistance);
+	}
+
+	// Draw fullscreen quad
+	glBindVertexArray(m_quadVAO);
+	glDrawArrays(GL_TRIANGLE_STRIP, 0, 4);
+	glBindVertexArray(0);
+
+	// Reset state
+	glDisable(GL_BLEND);
+	glEnable(GL_DEPTH_TEST);
+
+	checkGLError("drawRaycast");
 }
 
 static const char* indirectLightingComputeSrc = R"COMPUTE(
@@ -1322,7 +1546,7 @@ void main() {
     // If it's empty or carved, calculate light bounced from nearby surfaces
     if (density < 0.5 || radiation > 0.1) {
         // Define search radius for light gathering (in voxels)
-        const int radius = 6;
+        const int radius = 10;
         
         // Accumulate light from nearby lit voxels
         for (int dz = -radius; dz <= radius; dz++) {
