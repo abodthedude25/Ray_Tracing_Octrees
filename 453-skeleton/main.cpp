@@ -19,9 +19,80 @@
 #include "CacheUtils.h"
 #include "AdaptiveDualContouringRenderer.h"
 #include "Frustum.h"
+#include <fstream>
+#include <string>
+#include <filesystem>
 
 
-// Modified renderOctree function with frustum culling
+// Function to save triangles to a binary file
+bool saveTriangleCache(const std::string& filename, const std::vector<MCTriangle>& triangles) {
+	std::ofstream file(filename, std::ios::binary);
+	if (!file.is_open()) {
+		std::cerr << "Failed to open file for writing: " << filename << std::endl;
+		return false;
+	}
+
+	// Write number of triangles
+	size_t numTriangles = triangles.size();
+	file.write(reinterpret_cast<const char*>(&numTriangles), sizeof(numTriangles));
+
+	// Write all triangles to the file
+	file.write(reinterpret_cast<const char*>(triangles.data()),
+		numTriangles * sizeof(MCTriangle));
+
+	file.close();
+	std::cout << "Saved " << numTriangles << " triangles to " << filename << std::endl;
+	return true;
+}
+
+// Function to load triangles from a binary file
+bool loadTriangleCache(const std::string& filename, std::vector<MCTriangle>& triangles) {
+	std::ifstream file(filename, std::ios::binary);
+	if (!file.is_open()) {
+		std::cerr << "Failed to open file for reading: " << filename << std::endl;
+		return false;
+	}
+
+	// Read number of triangles
+	size_t numTriangles = 0;
+	file.read(reinterpret_cast<char*>(&numTriangles), sizeof(numTriangles));
+
+	// Resize vector and read all triangles
+	triangles.resize(numTriangles);
+	file.read(reinterpret_cast<char*>(triangles.data()),
+		numTriangles * sizeof(MCTriangle));
+
+	file.close();
+	std::cout << "Loaded " << numTriangles << " triangles from " << filename << std::endl;
+	return true;
+}
+
+// Function to generate a unique cache filename based on camera position
+std::string generateCacheFilename(const Camera& camera, float aspect) {
+	std::string cacheDir = "triangle_cache";
+
+	// Create cache directory if it doesn't exist
+	if (!std::filesystem::exists(cacheDir)) {
+		std::filesystem::create_directory(cacheDir);
+	}
+
+	// Generate a hash based on camera parameters
+	glm::vec3 pos = camera.getPos();
+	float theta = camera.getTheta();
+	float phi = camera.getPhi();
+
+	// Simple hash function
+	size_t hash = std::hash<float>{}(pos.x) ^
+		(std::hash<float>{}(pos.y) << 1) ^
+		(std::hash<float>{}(pos.z) << 2) ^
+		(std::hash<float>{}(theta) << 3) ^
+		(std::hash<float>{}(phi) << 4) ^
+		(std::hash<float>{}(aspect) << 5);
+
+	return cacheDir + "/dc_triangles_" + std::to_string(hash) + ".bin";
+}
+
+// Now modify the renderOctree function to add the force regenerate parameter
 std::vector<MCTriangle> renderOctree(
 	const OctreeNode* root,
 	const VoxelGrid& grid,
@@ -29,10 +100,26 @@ std::vector<MCTriangle> renderOctree(
 	const Camera& camera,
 	float aspect,
 	float extraMargin = 50.0f,
-	const std::vector<MCTriangle>* previousTriangles = nullptr)  // Added parameter for incremental updates
+	const std::vector<MCTriangle>* previousTriangles = nullptr,
+	bool forceRegenerate = false)  // Added parameter to force regeneration
 {
 	std::vector<MCTriangle> result;
 	if (!root) return result;
+
+	// For Dual Contouring, check if we can use cached triangles
+	auto* dcRenderer = dynamic_cast<AdaptiveDualContouringRenderer*>(&renderer);
+	if (dcRenderer && !forceRegenerate) {
+		// Generate filename based on camera position
+		std::string cacheFilename = generateCacheFilename(camera, aspect);
+
+		// Try to load cached triangles
+		if (std::filesystem::exists(cacheFilename)) {
+			if (loadTriangleCache(cacheFilename, result)) {
+				std::cout << "Using cached triangles from: " << cacheFilename << std::endl;
+				return result;
+			}
+		}
+	}
 
 	// Create view and projection matrices
 	glm::mat4 V = camera.getView();
@@ -52,7 +139,6 @@ std::vector<MCTriangle> renderOctree(
 	}
 
 	// For AdaptiveDualContouringRenderer, make sure it's properly initialized
-	auto* dcRenderer = dynamic_cast<AdaptiveDualContouringRenderer*>(&renderer);
 	if (dcRenderer) {
 		// Ensure thread pool is initialized
 		// This is safe to call even if already initialized
@@ -113,9 +199,14 @@ std::vector<MCTriangle> renderOctree(
 	auto duration = std::chrono::duration_cast<std::chrono::milliseconds>(end - start).count();
 	std::cout << "Octree traversal completed in " << duration << " ms, triangles: " << result.size() << std::endl;
 
+	// Save the triangles for Dual Contouring
+	if (dcRenderer && result.size() > 0) {
+		std::string cacheFilename = generateCacheFilename(camera, aspect);
+		saveTriangleCache(cacheFilename, result);
+	}
+
 	return result;
 }
-
 static bool intersectBuildingVoxel(
 	const Camera& cam,
 	float screenX, float screenY,
@@ -522,6 +613,14 @@ struct Assignment4 : public CallbackInterface {
 				}
 				std::cout << "Mipmapped Skipping " << (mipmappedSkippingEnabled ? "Enabled" : "Disabled") << std::endl;
 			}
+			else if (key == GLFW_KEY_G) {
+				forceRegenerateDC = !forceRegenerateDC;
+				std::cout << "Force regenerate DC triangles: " << (forceRegenerateDC ? "ON" : "OFF") << std::endl;
+				if (forceRegenerateDC) {
+					cameraChanged = true;
+					updateFrustumRequested = true;
+				}
+			}
 		}
 	}
 
@@ -852,8 +951,8 @@ struct Assignment4 : public CallbackInterface {
 	int renderModeToggle;
 
 	// Store the current window size for re-render calls
-	int lastWindowWidth = 800;
-	int lastWindowHeight = 800;
+	int lastWindowWidth = 1300;
+	int lastWindowHeight = 1300;
 
 	// Some geometry for CPU-based modes:
 	CPU_Geometry cpuGeom;
@@ -868,7 +967,10 @@ struct Assignment4 : public CallbackInterface {
 	bool cameraChanged;
 	bool updateFrustumRequested;
 	bool octreeSkipEnabled = false;  
-	bool mipmappedSkippingEnabled = true; 
+	bool mipmappedSkippingEnabled = true;
+
+	bool forceRegenerateDC = false;
+
 };
 
 int main() {
@@ -888,7 +990,7 @@ int main() {
 #endif
 
 	// Create window
-	Window window(800, 800, "Octree + DC + Volume Raycast + Compute BVH");
+	Window window(1300, 1300, "Octree + DC + Volume Raycast + Compute BVH");
 	if (!window.getWindow()) {
 		std::cerr << "Failed to create GLFW window. Check if your GPU supports OpenGL 4.3\n";
 		glfwTerminate();
@@ -922,7 +1024,7 @@ int main() {
 
 	bool useGDB = true;
 	int dim = 256;
-	float voxelSize = 10.0f;
+	float voxelSize = 2.0f;
 	std::string cacheFilename = "sceneCache.bin";
 
 	VoxelGrid grid;
@@ -1162,10 +1264,7 @@ int main() {
 
 		}
 		else if (app->currentMode == RenderMode::DualContouring) {
-			// Make sure we always trigger the renderer even if cache exists
-			// The original code only triggered rendering when cache was empty or camera changed
-			// This change ensures we always use parallel rendering
-			if (app->updateFrustumRequested) {
+			if (app->updateFrustumRequested || app->forceRegenerateDC || triCache.empty()) {
 				app->cameraChanged = false; // Reset the flag
 				app->updateFrustumRequested = false;
 
@@ -1175,7 +1274,8 @@ int main() {
 				// Force rendering with parallel processing
 				auto start = std::chrono::high_resolution_clock::now();
 
-				triCache = renderOctree(root, grid, dcRenderer, app->camera, app->aspect);
+				// Pass the forceRegenerateDC flag to renderOctree
+				triCache = renderOctree(root, grid, dcRenderer, app->camera, app->aspect, 50.0f, nullptr, app->forceRegenerateDC);
 
 				auto end = std::chrono::high_resolution_clock::now();
 				auto duration = std::chrono::duration_cast<std::chrono::milliseconds>(end - start).count();
@@ -1195,6 +1295,11 @@ int main() {
 				gpuGeom.setVerts(cpuGeom.verts);
 				gpuGeom.setNormals(cpuGeom.normals);
 				gpuGeom.setCols(cpuGeom.cols);
+
+				// Reset the flag after rendering
+				if (app->forceRegenerateDC) {
+					app->forceRegenerateDC = false;
+				}
 			}
 			shader.use();
 			app->viewPipeline(shader);

@@ -142,4 +142,5 @@ private:
 
 	std::vector<MCTriangle> createFaceTriangles(
 		const VoxelGrid& grid, const OctreeNode* node, int x0, int y0, int z0, int size);
+
 };

@@ -1690,3 +1690,4 @@ std::vector<MCTriangle> AdaptiveDualContouringRenderer::renderParallel(
 
 	return triangles;
 }
+
