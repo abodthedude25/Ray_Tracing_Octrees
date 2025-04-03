@@ -1,6 +1,3 @@
-// VolumeRaycastRenderer.cpp
-// Integrates point-radiation (compute shader) + thresholded, gradient-based Lambert shading
-// with performance optimizations for large volumes.
 
 #include <glad/glad.h>
 #include <GLFW/glfw3.h>
@@ -10,11 +7,9 @@
 #include <vector>
 #include <iostream>
 #include <algorithm>
-#include <cmath> // for std::min, etc.
+#include <cmath> 
 #include <fstream>
 #include <sstream>
-
-// #include <chrono> // If needed for timing
 
 #include "VolumeRaycastRenderer.h"
 

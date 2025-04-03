@@ -2,7 +2,6 @@
 #include <glm/gtc/matrix_access.hpp>
 
 
-// Constructor that builds the frustum from view and projection matrices
 Frustum::Frustum(const glm::mat4& viewProj) {
 	// Extract planes from the combined view-projection matrix
 	// Left plane

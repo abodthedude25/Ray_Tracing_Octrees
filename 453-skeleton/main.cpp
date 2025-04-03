@@ -1,4 +1,3 @@
-// main.cpp
 #include <iostream>
 #include <vector>
 #include <cmath>
@@ -422,7 +421,6 @@ static void recenterFilledVoxels(VoxelGrid& grid) {
 		<< centerX << ", " << centerY << ", " << centerZ << ")\n";
 }
 
-// ========== Functions to Gather Octree Wireframe Lines ==========
 static void getCubeCorners(const VoxelGrid& grid, int x0, int y0, int z0,
 	int size, std::array<glm::vec3, 8>& corners) {
 	float vx = grid.voxelSize;

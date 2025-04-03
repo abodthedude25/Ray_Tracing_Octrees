@@ -1,4 +1,3 @@
-// MarchingCubes.h
 #pragma once
 
 #include <vector>

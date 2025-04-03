@@ -1,4 +1,3 @@
-// MarchingCubes.cpp
 #include "MarchingCubes.h"
 #include <cmath>
 #include <array>

@@ -91,7 +91,6 @@ bool intersectOctreeIterative(vec3 rayOrigin, vec3 rayDir,
 		if (tNear >= closestT)
 			continue;
 
-		// NEW: If this node is uniform (all voxels are the same), treat it as a leaf.
 		if (node.isUniform == 1) {
 			if (node.isSolid == 1) {  // Uniform and solid: update hit directly.
 				float tHit = max(0.0, tNear);

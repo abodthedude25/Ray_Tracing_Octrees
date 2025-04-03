@@ -1245,8 +1245,6 @@ HermitePoint AdaptiveDualContouringRenderer::calculateIntersection(
 	// Interpolate the position
 	glm::vec3 position = p1 + t * (p2 - p1);
 
-	// For better normal calculation, let's try a more accurate method
-	// We'll calculate gradients along each axis using central differences if possible
 	glm::vec3 normal(0.0f);
 
 	// Determine primary axis of the edge
@@ -1255,8 +1253,6 @@ HermitePoint AdaptiveDualContouringRenderer::calculateIntersection(
 	int dz = z2 - z1;
 
 	if (std::abs(dx) + std::abs(dy) + std::abs(dz) != 1) {
-		// This is not a grid-aligned edge - shouldn't happen in this implementation
-		// But if it does, calculate normal based on the edge direction
 		normal = glm::normalize(glm::vec3(dx, dy, dz));
 		// Make normal point from filled to empty
 		if (isFilled1) normal = -normal;

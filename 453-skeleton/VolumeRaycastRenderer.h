@@ -1,4 +1,3 @@
-// VolumeRaycastRenderer.h
 #pragma once
 
 #include <glad/glad.h>
