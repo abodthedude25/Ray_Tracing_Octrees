@@ -24,9 +24,7 @@ struct MCTriangle {
 	glm::vec3 normal[3]; // optional normals
 };
 
-// --------------------------------------------------------------------
 // A container for voxel data in a single 3D grid
-// --------------------------------------------------------------------
 struct VoxelGrid {
 	int dimX = 0;
 	int dimY = 0;
@@ -43,9 +41,7 @@ struct VoxelGrid {
 	}
 };
 
-// --------------------------------------------------------------------
 // Our Octree Node
-// --------------------------------------------------------------------
 struct OctreeNode {
 	int x, y, z;
 	int size;
@@ -67,9 +63,7 @@ struct OctreeNode {
 };
 
 
-// --------------------------------------------------------------------
 // Building the Octree from a VoxelGrid
-// --------------------------------------------------------------------
 OctreeNode* createOctreeFromVoxelGrid(const VoxelGrid& grid);
 
 // Clean up
@@ -78,9 +72,7 @@ void freeOctree(OctreeNode* node);
 // Helper to safely retrieve a voxel from the grid
 VoxelState getVoxelSafe(const VoxelGrid& grid, int x, int y, int z);
 
-// --------------------------------------------------------------------
 // Hierarchical Traversal Helpers
-// --------------------------------------------------------------------
 OctreeNode* getParentCube(OctreeNode* node);
 
 // Return the sub-cube index (which of the 8 children) for a coordinate

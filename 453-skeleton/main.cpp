@@ -524,7 +524,6 @@ struct Assignment4 : public CallbackInterface {
 		lastViewMatrix = camera.getView(); // Initialize last view matrix
 	}
 
-	// ----------- KEY CALLBACK -------------
 	void keyCallback(int key, int scancode, int action, int mods) override {
 		if (action == GLFW_PRESS) {
 			if (key == GLFW_KEY_W) {

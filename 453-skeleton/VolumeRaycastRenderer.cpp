@@ -29,9 +29,7 @@
 
 static int frameCounter = 0;
 
-//----------------------------------------------------------------------------
 // Utility to check for GL errors
-//----------------------------------------------------------------------------
 static void checkGLError(const char* msg = "") {
     GLenum err;
     while ((err = glGetError()) != GL_NO_ERROR) {
@@ -161,7 +159,6 @@ static float octreeRaySkip(
 	return bestT;
 }
 
-//==================== CONSTRUCTOR / DESTRUCTOR ====================
 VolumeRaycastRenderer::VolumeRaycastRenderer()
     : m_volumeTex(0)
     , m_workingVolumeTex(0)
@@ -281,7 +278,6 @@ void VolumeRaycastRenderer::createVolumeTexture(const VoxelGrid& grid) {
 	);
 }
 
-//==================== createRadiationTexture ====================
 void VolumeRaycastRenderer::createRadiationTexture() {
     glGenTextures(1, &m_radiationTex);
     glBindTexture(GL_TEXTURE_3D, m_radiationTex);
@@ -303,7 +299,6 @@ void VolumeRaycastRenderer::createRadiationTexture() {
     checkGLError("createRadiationTexture");
 }
 
-//==================== clearRadiationVolume ====================
 void VolumeRaycastRenderer::clearRadiationVolume() {
     if (!m_radiationTex) return;
     float clr[4] = { 0.f, 0.f, 0.f, 0.f };
@@ -311,12 +306,10 @@ void VolumeRaycastRenderer::clearRadiationVolume() {
     checkGLError("clearRadiationVolume");
 }
 
-//==================== updateSplatPoints ====================
 void VolumeRaycastRenderer::updateSplatPoints(const std::vector<RadiationPoint>& pts) {
     m_splatPoints = pts;
 }
 
-//==================== Compute Shader (Point Radiation) =====================
 static const char* pointRadComputeSrc = R"COMPUTE(
 #version 430 core
 struct RadiationPoint {
@@ -506,7 +499,6 @@ void VolumeRaycastRenderer::createComputeShader() {
     checkGLError("createComputeShader");
 }
 
-//==================== dispatchRadiationCompute ====================
 void VolumeRaycastRenderer::dispatchRadiationCompute() {
 	if (!m_computeProg || m_splatPoints.empty()) return;
 
@@ -601,7 +593,6 @@ void VolumeRaycastRenderer::dispatchRadiationCompute() {
 	m_splatPoints.clear();
 }
 
-//==================== Precompute Shader =====================
 static const char* precomputeShaderSrc = R"COMPUTE(
 #version 430 core
 layout(local_size_x = 8, local_size_y = 8, local_size_z = 8) in;
@@ -853,7 +844,6 @@ void VolumeRaycastRenderer::dispatchPrecompute() {
 	checkGLError("dispatchPrecompute");
 }
 
-//==================== Raycast Program =====================
 static const char* raycastVS = R"VS(
 #version 430 core
 layout(location=0) in vec2 aPos;
@@ -926,7 +916,6 @@ void VolumeRaycastRenderer::createRaycastProgram() {
     checkGLError("createRaycastProgram");
 }
 
-//==================== createFullscreenQuad ====================
 void VolumeRaycastRenderer::createFullscreenQuad() {
     float fsQuad[8] = {
        -1.f, -1.f,
@@ -952,7 +941,6 @@ void VolumeRaycastRenderer::createFullscreenQuad() {
     checkGLError("createFullscreenQuad");
 }
 
-//==================== bindRaycastUniforms ====================
 void VolumeRaycastRenderer::bindRaycastUniforms(float aspect) {
     glUseProgram(m_raycastProg);
 
@@ -1039,7 +1027,7 @@ void VolumeRaycastRenderer::bindRaycastUniforms(float aspect) {
     checkGLError("bindRaycastUniforms");
 }
 
-// Method 1: Enhanced frustum culling implementation
+// Enhanced frustum culling implementation
 void VolumeRaycastRenderer::optimizedFrustumCulling(float aspect) {
 	if (!m_octreeRoot || !m_cameraPtr) return;
 
@@ -1066,7 +1054,7 @@ void VolumeRaycastRenderer::optimizedFrustumCulling(float aspect) {
 	m_needsInitialFrustumCulling = false;
 }
 
-// Method 2: Efficient frustum test
+// Efficient frustum test
 bool VolumeRaycastRenderer::isNodeInFrustum(const OctreeNode* node, const Frustum& frustum,
 	int x0, int y0, int z0, int size, float extraMargin) {
 	if (!node) return false;
@@ -1084,7 +1072,7 @@ bool VolumeRaycastRenderer::isNodeInFrustum(const OctreeNode* node, const Frustu
 	return frustum.testAABB(minPoint, maxPoint, 0.0f) != -1;
 }
 
-// Method 3: Optimized node marking that only tracks visible nodes
+// Optimized node marking that only tracks visible nodes
 void VolumeRaycastRenderer::markVisibleNodesOnly(const OctreeNode* node, const Frustum& frustum,
 	int x0, int y0, int z0, int size, float extraMargin) {
 	if (!node) return;
@@ -1113,7 +1101,7 @@ void VolumeRaycastRenderer::markVisibleNodesOnly(const OctreeNode* node, const F
 	}
 }
 
-// Method 4: Create MIP-mapped volume texture for hierarchical skipping
+// Create MIP-mapped volume texture for hierarchical skipping
 void VolumeRaycastRenderer::createMipMappedVolumeTexture(const VoxelGrid& grid) {
 	// Generate texture for the volume data
 	glGenTextures(1, &m_volumeTex);
@@ -1305,7 +1293,7 @@ void VolumeRaycastRenderer::buildSkipDistanceTexture() {
 		<< skipTexDimX << "x" << skipTexDimY << "x" << skipTexDimZ << std::endl;
 }
 
-// Method 6: Modify your existing init method to use these new functions
+//  Modify your existing init method to use these new functions
 void VolumeRaycastRenderer::init(const VoxelGrid& grid) {
 	m_inited = true;
 	m_gridPtr = &grid;
@@ -1555,7 +1543,6 @@ void VolumeRaycastRenderer::updateWorkingVolumeWithVisibility() {
 }
 
 
-//==================== drawRaycast ====================
 void VolumeRaycastRenderer::drawRaycast(float aspect) {
 	if (!m_raycastProg) return;
 

@@ -6,7 +6,6 @@
 #include "glm/gtc/type_ptr.hpp"
 
 // -------------------- MARCHING CUBES LOOKUP TABLES --------------------
-
 static const int edgeTable[256] = {
 	0x0,
 	0x109,

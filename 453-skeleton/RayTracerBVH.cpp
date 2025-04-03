@@ -48,8 +48,6 @@ struct Ray {
 	vec3 direction;
 };
 
-// ---------- Utility Functions ----------
-
 bool intersectAABB(vec3 rayOrigin, vec3 rayDir, vec3 bmin, vec3 bmax, out float tNear, out float tFar)
 {
 	vec3 invDir = 1.0 / rayDir;
@@ -61,8 +59,6 @@ bool intersectAABB(vec3 rayOrigin, vec3 rayDir, vec3 bmin, vec3 bmax, out float 
 	tFar = min(min(tMax.x, tMax.y), tMax.z);
 	return (tNear <= tFar && tFar > 0.0);
 }
-
-// ---------- Optimized Octree Traversal with Early Exit ----------
 
 bool intersectOctreeIterative(vec3 rayOrigin, vec3 rayDir,
 							  out vec3 hitPoint, out vec3 hitNormal)
@@ -184,7 +180,6 @@ void main()
 }
 )";*/
 
-// ============ GPU Shader Source (inline) ============
 static const char* g_computeShaderSrc = R"(
 #version 430 core
 
@@ -229,8 +224,6 @@ struct Ray {
     vec3 direction;
 };
 
-// ---------- Utility Functions ----------
-
 bool intersectAABB(vec3 rayOrigin, vec3 rayDir, vec3 bmin, vec3 bmax, out float tNear, out float tFar)
 {
     vec3 invDir = 1.0 / rayDir;
@@ -243,8 +236,7 @@ bool intersectAABB(vec3 rayOrigin, vec3 rayDir, vec3 bmin, vec3 bmax, out float 
     return (tNear <= tFar && tFar > 0.0);
 }
 
-// ---------- Optimized Octree Traversal with Workload Limiting ----------
-
+// Optimized Octree Traversal with Workload Limiting 
 bool intersectOctreeIterative(vec3 rayOrigin, vec3 rayDir,
                               out vec3 hitPoint, out vec3 hitNormal)
 {
@@ -399,8 +391,6 @@ void main() {
 }
 )";
 
-// ============ RayTracerBVH Implementation ============
-
 RayTracerBVH::RayTracerBVH()
 	: m_octreeRoot(nullptr),
 	m_computeInited(false),
@@ -521,7 +511,6 @@ void RayTracerBVH::ensureComputeInitialized()
 	if (m_computeInited) return;
 	m_computeInited = true;
 
-	// =============== Compute Shader Program ===============
 	{
 		GLuint cs = glCreateShader(GL_COMPUTE_SHADER);
 		glShaderSource(cs, 1, &g_computeShaderSrc, nullptr);
@@ -554,7 +543,6 @@ void RayTracerBVH::ensureComputeInitialized()
 		glDeleteShader(cs);
 	}
 
-	// =============== Fullscreen Quad Program ===============
 	{
 		// Vertex shader
 		GLuint vs = glCreateShader(GL_VERTEX_SHADER);
@@ -603,7 +591,6 @@ void RayTracerBVH::ensureComputeInitialized()
 		glDeleteShader(fs);
 	}
 
-	// =============== Create fullscreen quad geometry ===============
 	{
 		glGenVertexArrays(1, &m_fullscreenVAO);
 		glBindVertexArray(m_fullscreenVAO);

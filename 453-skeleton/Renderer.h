@@ -6,9 +6,7 @@
 #include <glm/glm.hpp>
 #include "Camera.h" 
 
-// ----------------------------
 // Generic Renderer interface
-// ----------------------------
 class Renderer {
 public:
 	virtual std::vector<MCTriangle> render(const OctreeNode* node,
@@ -17,9 +15,7 @@ public:
 	virtual ~Renderer() = default;
 };
 
-// ----------------------------
-// Marching Cubes (unchanged)
-// ----------------------------
+// Marching Cubes 
 class MarchingCubesRenderer : public Renderer {
 public:
 	std::vector<MCTriangle> render(const OctreeNode* node,
@@ -27,11 +23,9 @@ public:
 		int x0, int y0, int z0, int size) override;
 };
 
-// ----------------------------
 // Ray Tracer
 // This renderer traverses the octree and generates a cube for each solid leaf,
 // but only emits faces on the boundary (where adjacent voxels are empty).
-// ============================================================
 class VoxelCubeRenderer : public Renderer {
 public:
 	virtual std::vector<MCTriangle> render(const OctreeNode* node,

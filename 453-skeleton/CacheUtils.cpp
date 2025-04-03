@@ -58,18 +58,7 @@ bool loadVoxelGrid(const std::string& filename, VoxelGrid& grid)
 	return true;
 }
 
-// -----------------------------------------------------------------------------
-// NEW FUNCTION: loadVoxelGridPartial
-//
-// This function loads only a portion (subvolume) of the full voxel grid from file.
-// Here we assume that the grid is segmented along the Z–axis. You provide a starting
-// layer index (startLayer) and the number of layers (numLayers) you wish to load.
-// The function reads the grid parameters (dimX, dimY, full dimZ, etc.), then skips
-// ahead in the voxel data to read only the requested portion. It also updates grid.dimZ
-// and grid.minZ accordingly.
-//
-// An interactive UI (for example, a slider) can set startLayer and numLayers (or a fraction)
-// so that only a fraction of the scene is loaded at a time.
+
 bool loadVoxelGridPartial(const std::string& filename, VoxelGrid& grid, int startLayer, int numLayers)
 {
 	std::ifstream in(filename, std::ios::binary);

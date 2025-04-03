@@ -16,7 +16,6 @@ static glm::vec3 centroid(const Triangle* tri) {
 	return (tri->v0 + tri->v1 + tri->v2) / 3.0f;
 }
 
-// ------------------ BVH Construction ------------------
 BVH::BVH(const std::vector<Triangle>& triangles) {
 	// Create a vector of pointers to the triangles.
 	std::vector<const Triangle*> tris;
@@ -71,7 +70,6 @@ BVHNode* BVH::build(std::vector<const Triangle*>& tris, int depth) {
 	return node;
 }
 
-// ------------------ Ray-AABB Intersection ------------------
 // We use the slab method. 'invDir' is the component–wise inverse of the ray direction.
 // 'dirIsNeg' is a vector of three integers (0 or 1) indicating if each component of the ray's
 // direction is negative.
@@ -88,7 +86,6 @@ static bool intersectAABB(const AABB& box, const glm::vec3& origin, const glm::v
 	return true;
 }
 
-// ------------------ BVH Query ------------------
 void BVH::queryNode(BVHNode* node, const glm::vec3& origin, const glm::vec3& invDir,
 	const std::vector<int>& dirIsNeg, float tmin, float tmax,
 	std::vector<const Triangle*>& outCandidates) const {
@@ -115,7 +112,6 @@ void BVH::query(const glm::vec3& origin, const glm::vec3& direction,
 	queryNode(root, origin, invDir, dirIsNeg, 0.0f, std::numeric_limits<float>::max(), outCandidates);
 }
 
-// ------------------ BVH Node Freeing ------------------
 void BVH::freeNode(BVHNode* node) {
 	if (!node)
 		return;

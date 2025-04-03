@@ -10,9 +10,7 @@
 #include <cstdint>
 std::unordered_map<long long, OctreeNode*> g_octreeMap;
 
-// --------------------------------------------------------
 // MARCHING CUBES
-// --------------------------------------------------------
 std::vector<MCTriangle> MarchingCubesRenderer::render(const OctreeNode* node,
 	const VoxelGrid& grid,
 	int x0, int y0, int z0, int size)
@@ -38,9 +36,7 @@ std::vector<MCTriangle> MarchingCubesRenderer::render(const OctreeNode* node,
 }
 
 
-// --------------------------------------------------------
-// NEW: VOXEL CUBE RENDERER (Block-based Voxel Geometry)
-// --------------------------------------------------------
+//VOXEL CUBE RENDERER (Block-based Voxel Geometry)
 std::vector<MCTriangle> VoxelCubeRenderer::render(const OctreeNode* node,
 	const VoxelGrid& grid,
 	int x0, int y0, int z0, int size)

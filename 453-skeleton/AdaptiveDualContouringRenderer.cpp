@@ -4,8 +4,6 @@
 #include <limits>
 #include <algorithm>
 #include <cmath>
-
-// Include OpenGL headers - adjust paths based on your project
 #include <glad/glad.h>
 #include <GLFW/glfw3.h>
 #include <glm/glm.hpp>
@@ -20,10 +18,8 @@
 // Forward declaration of global octree map
 extern std::unordered_map<long long, OctreeNode*> g_octreeMap;
 
-// If you have a global map of OctreeNodes:
 extern std::unordered_map<long long, OctreeNode*> g_octreeMap;
 
-// ---------------------------------------------------------------------------
 // A small helper to read a file into a std::string (for the compute shader).
 static inline std::string loadShaderFromFile(const std::string& filePath) {
 	std::ifstream file(filePath);
@@ -36,7 +32,6 @@ static inline std::string loadShaderFromFile(const std::string& filePath) {
 	return buffer.str();
 }
 
-// ---------------------------------------------------------------------------
 // Simple CPU isSolid to check if a voxel is filled.
 static inline bool cpuIsSolid(const VoxelGrid& grid, int x, int y, int z) {
 	if (x < 0 || y < 0 || z < 0 ||
@@ -200,7 +195,6 @@ void AdaptiveDualContouringRenderer::clearCaches() {
 	dualVertexCache.reserve(m_cacheSize);
 }
 
-// ---------------------------------------------------------------------------
 // GPU: Compile the single-pass compute shader that only does QEF per voxel
 bool AdaptiveDualContouringRenderer::compileComputeShader() {
 	std::string compSrc = loadShaderFromFile("single_pass_dc.glsl");
@@ -239,7 +233,6 @@ bool AdaptiveDualContouringRenderer::compileComputeShader() {
 	return true;
 }
 
-// ---------------------------------------------------------------------------
 // GPU: Initialize + create buffers
 bool AdaptiveDualContouringRenderer::initComputeShader() {
 	if (m_computeShaderInitialized) {
@@ -279,7 +272,6 @@ void AdaptiveDualContouringRenderer::destroyComputeShader() {
 	}
 }
 
-// ---------------------------------------------------------------------------
 // SINGLE-PASS GPU approach: For each voxel, gather edges + solve QEF => store vertex
 // Return the entire vertex array to the caller so we can do adjacency on CPU
 std::vector<glm::vec4>
@@ -376,7 +368,6 @@ AdaptiveDualContouringRenderer::executeComputeShaderSinglePass(const VoxelGrid& 
 	return allVerts;
 }
 
-// ---------------------------------------------------------------------------
 // CPU adjacency: For each voxel, if sign difference with (x+1,y,z), (x,y+1,z), etc. 
 // form two triangles from the 4 voxel vertices
 std::vector<MCTriangle>
@@ -490,7 +481,6 @@ AdaptiveDualContouringRenderer::buildTrianglesCPU(const VoxelGrid& grid,
 	return triOut;
 }
 
-// ---------------------------------------------------------------------------
 // The main "render" function: tries GPU single-pass, then builds adjacency on CPU
 std::vector<MCTriangle> AdaptiveDualContouringRenderer::render(
 	const OctreeNode* node,
@@ -539,9 +529,7 @@ std::vector<MCTriangle> AdaptiveDualContouringRenderer::createTriangles(
 {
 	std::vector<MCTriangle> triangles;
 
-	// -----------------------------------------------------------------------
-	// 1) Quick exit checks
-	// -----------------------------------------------------------------------
+	// Quick exit checks
 	if (!node || !node->isLeaf) {
 		// Not a leaf => no direct geometry
 		return triangles;
@@ -552,9 +540,7 @@ std::vector<MCTriangle> AdaptiveDualContouringRenderer::createTriangles(
 		return triangles;
 	}
 
-	// -----------------------------------------------------------------------
-	// 2) Prepare cell info, compute or retrieve dual vertex
-	// -----------------------------------------------------------------------
+	// Prepare cell info, compute or retrieve dual vertex
 	float cellSizeWorld = size * grid.voxelSize;
 	glm::vec3 cellCenter = gridToWorld(grid, x0, y0, z0)
 		+ glm::vec3(size * 0.5f * grid.voxelSize);
@@ -591,10 +577,7 @@ std::vector<MCTriangle> AdaptiveDualContouringRenderer::createTriangles(
 		}
 	}
 
-	// -----------------------------------------------------------------------
-	// 3) Build Triangles from Edge‐Based Sign Changes
-	// (Existing logic to create triangles from the cell's edges)
-	// -----------------------------------------------------------------------
+	// Build Triangles from Edge‐Based Sign Changes
 	static const int edgeDirections[3][3] = {
 		{1, 0, 0},  // +X
 		{0, 1, 0},  // +Y
@@ -799,10 +782,8 @@ std::vector<MCTriangle> AdaptiveDualContouringRenderer::createTriangles(
 		}
 	}
 
-	// -----------------------------------------------------------------------
-	// 4) Fallback for boundary cells: if no triangles were created and this cell
-	//    touches the grid boundary, try to create face triangles.
-	// -----------------------------------------------------------------------
+	// Fallback for boundary cells: if no triangles were created and this cell
+	// touches the grid boundary, try to create face triangles.
 	if (triangles.empty()) {
 		// Only add fallback if this cell touches a grid boundary
 		if (x0 == 0 || y0 == 0 || z0 == 0 ||
