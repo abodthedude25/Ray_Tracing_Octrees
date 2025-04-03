@@ -1339,7 +1339,6 @@ void VolumeRaycastRenderer::init(const VoxelGrid& grid) {
 	dispatchPrecompute();
 }
 
-// A much simpler frustum culling implementation
 void VolumeRaycastRenderer::updateFrustumCulling(float aspect) {
 	if (!m_useFrustumCulling || !m_cameraPtr) return;
 
@@ -1347,13 +1346,14 @@ void VolumeRaycastRenderer::updateFrustumCulling(float aspect) {
 	m_previousCamPos = m_cameraPtr->getPos();
 	m_previousViewDir = -glm::normalize(glm::mat3(m_cameraPtr->getView())[2]);
 
-	// Create view frustum
+	// Create view frustum with a slightly NARROWER FOV for stricter culling
+	// Change from 45.f to 42.f
 	glm::mat4 V = m_cameraPtr->getView();
-	glm::mat4 P = glm::perspective(glm::radians(45.f), aspect, 0.01f, 5000.f);
+	glm::mat4 P = glm::perspective(glm::radians(42.f), aspect, 0.01f, 5000.f);
 	Frustum frustum(P * V);
 
 	// Create a simpler, grid-based culling approach
-	int cellSize = 16; // Larger cells for less overhead
+	int cellSize = 8; // Smaller cells for more precise culling (changed from 16)
 	std::vector<bool> visibilityGrid((m_dimX / cellSize + 1) * (m_dimY / cellSize + 1) * (m_dimZ / cellSize + 1), false);
 
 	// Mark visible grid cells
@@ -1370,18 +1370,20 @@ void VolumeRaycastRenderer::updateFrustumCulling(float aspect) {
 				);
 				glm::vec3 maxPoint = minPoint + glm::vec3(cellSize * voxelSize);
 
-				// Check if cell is visible
+				// Check if cell is visible - use a slightly reduced margin
 				int idx = (x / cellSize) + (y / cellSize) * (m_dimX / cellSize + 1) +
 					(z / cellSize) * (m_dimX / cellSize + 1) * (m_dimY / cellSize + 1);
 
-				if (frustum.testAABB(minPoint, maxPoint, m_frustumMargin) != -1) {
+				// Reduce the margin by 20% for tighter culling
+				float reducedMargin = m_frustumMargin * 0.8f;
+				if (frustum.testAABB(minPoint, maxPoint, reducedMargin) != -1) {
 					visibilityGrid[idx] = true;
 				}
 			}
 		}
 	}
 
-	// Update volume texture based on grid visibility (simple approach)
+	// Update volume texture based on grid visibility - clear boundary more aggressively
 	glBindTexture(GL_TEXTURE_3D, m_workingVolumeTex);
 	std::vector<float> modifiedVolume(m_dimX * m_dimY * m_dimZ, 0.0f);
 
@@ -1396,6 +1398,51 @@ void VolumeRaycastRenderer::updateFrustumCulling(float aspect) {
 				if (visibilityGrid[gridIdx]) {
 					bool isFilled = m_gridPtr->data[voxelIdx] == VoxelState::FILLED;
 					modifiedVolume[voxelIdx] = isFilled ? 1.0f : 0.0f;
+				}
+			}
+		}
+	}
+
+	// Add a definitive boundary at frustum edges
+	// This adds a clear "zero" border around the frustum to prevent mipmapping beyond
+	int borderSize = 2;
+	for (int z = 0; z < m_dimZ; z++) {
+		for (int y = 0; y < m_dimY; y++) {
+			for (int x = 0; x < m_dimX; x++) {
+				int voxelIdx = x + y * m_dimX + z * (m_dimX * m_dimY);
+				int gridIdx = (x / cellSize) + (y / cellSize) * (m_dimX / cellSize + 1) +
+					(z / cellSize) * (m_dimX / cellSize + 1) * (m_dimY / cellSize + 1);
+
+				// If this voxel has a visible neighbor but is itself not visible,
+				// set it to zero to create a clear boundary
+				if (!visibilityGrid[gridIdx]) {
+					bool hasVisibleNeighbor = false;
+					for (int dz = -1; dz <= 1 && !hasVisibleNeighbor; dz++) {
+						for (int dy = -1; dy <= 1 && !hasVisibleNeighbor; dy++) {
+							for (int dx = -1; dx <= 1 && !hasVisibleNeighbor; dx++) {
+								int nx = x / cellSize + dx;
+								int ny = y / cellSize + dy;
+								int nz = z / cellSize + dz;
+
+								if (nx >= 0 && nx < (m_dimX / cellSize + 1) &&
+									ny >= 0 && ny < (m_dimY / cellSize + 1) &&
+									nz >= 0 && nz < (m_dimZ / cellSize + 1)) {
+
+									int neighborIdx = nx + ny * (m_dimX / cellSize + 1) +
+										nz * (m_dimX / cellSize + 1) * (m_dimY / cellSize + 1);
+
+									if (visibilityGrid[neighborIdx]) {
+										hasVisibleNeighbor = true;
+									}
+								}
+							}
+						}
+					}
+
+					// If this is at the boundary of visibility, force it to zero
+					if (hasVisibleNeighbor) {
+						modifiedVolume[voxelIdx] = 0.0f;
+					}
 				}
 			}
 		}

@@ -506,8 +506,8 @@ struct Assignment4 : public CallbackInterface {
 	Assignment4()
 		: wireframeMode(false),
 		showOctreeWire(false),
-		currentMode(RenderMode::DualContouring),
-		oldMode(RenderMode::DualContouring),
+		currentMode(RenderMode::VolumeRaycast),
+		oldMode(RenderMode::VolumeRaycast),
 		camera(glm::radians(90.0f), glm::radians(0.f), 500.f),
 		aspect(1.f),
 		rightMouseDown(false),
@@ -1024,7 +1024,7 @@ int main() {
 
 	bool useGDB = true;
 	int dim = 256;
-	float voxelSize = 2.0f;
+	float voxelSize = 10.0f;
 	std::string cacheFilename = "sceneCache.bin";
 
 	VoxelGrid grid;

@@ -354,7 +354,17 @@ vec3 calculateShading(vec3 pos, vec3 normal, vec3 rayDir, float edgeFactor) {
 float smoothDensitySample(vec3 uvw) {
     // Get base sample
     float den = texture(volumeTex, uvw).r;
-    
+
+	if (useFrustumCulling) {
+        // Check if this point is in the culled working volume
+        float visibilityCheck = texture(workingVolumeTex, uvw).r;
+        
+        // If this point was culled (visibility near zero), force density to zero
+        if (visibilityCheck < 0.001) {
+            return 0.0;
+        }
+    }
+
     // Only smooth near edges (optimization)
     if (abs(den - edgeThreshold) < edgeWidth) {
         vec3 texelSize = 1.0 / vec3(textureSize(volumeTex, 0));
@@ -366,11 +376,26 @@ float smoothDensitySample(vec3 uvw) {
             vec3 offset = vec3(0.0);
             offset[i] = texelSize[i] * 0.8;
             
-            float s1 = texture(volumeTex, uvw + offset).r;
+           float s1 = texture(volumeTex, uvw + offset).r;
             float s2 = texture(volumeTex, uvw - offset).r;
             
-            sum += s1 + s2;
-            weight += 2.0;
+            if (useFrustumCulling) {
+                float v1 = texture(workingVolumeTex, uvw + offset).r;
+                float v2 = texture(workingVolumeTex, uvw - offset).r;
+                
+                // Only include samples that are visible in working volume
+                if (v1 > 0.001) {
+                    sum += s1;
+                    weight += 1.0;
+                }
+                if (v2 > 0.001) {
+                    sum += s2;
+                    weight += 1.0;
+                }
+            } else {
+                sum += s1 + s2;
+                weight += 2.0;
+            }
         }
         
         return sum / weight;
@@ -406,6 +431,7 @@ float getOptimizedSkipDistance(vec3 rayOrigin, vec3 rayDir, vec3 currentPos) {
     if (any(lessThan(normalizedPos, vec3(0.0))) || any(greaterThan(normalizedPos, vec3(1.0)))) {
         return 0.0;
     }
+
 
     // Skip distance to return
     float skipDistance = 0.0;
@@ -614,7 +640,33 @@ vec4 traceRay(vec2 coord) {
         posWorld += noiseOffset * mix(0.5, 2.0, distanceFactor); // Reduced offset magnitude
         
         vec3 uvw = (posWorld - boxMin) / (boxMax - boxMin);
+        // Enhanced boundary check for mipmapped mode
+		if (useFrustumCulling && useMipMappedSkipping) {
+			// Get visibility from working volume with no mipmapping to avoid bleeding
+			float visibilityFactor = textureLod(workingVolumeTex, uvw, 0.0).r;
+    
+			// Create a hard boundary at the frustum edge
+			if (visibilityFactor < 0.001) {
+				// Take a larger step past this invisible region
+				T += baseStep * 4.0;
+				emptyFrustumSkips++;
+				continue;
+			}
+    
+			// Add a small boundary region with reduced opacity
+			if (visibilityFactor < 0.1) {
+				// We're near the boundary, create a gradient falloff
+				float falloff = smoothstep(0.0, 0.1, visibilityFactor);
         
+				// Apply smooth boundary transition
+				if (falloff < 0.2) {
+					T += baseStep * (1.0 + (1.0 - falloff) * 3.0);
+					emptyFrustumSkips++;
+					continue;
+				}
+			}
+		}
+
         // Enhanced boundary handling - use clamped coordinates for edge samples
         bool isOutside = any(lessThan(uvw, vec3(0.0))) || any(greaterThan(uvw, vec3(1.0)));
         vec3 uvwClamped = clamp(uvw, vec3(0.001), vec3(0.999));
