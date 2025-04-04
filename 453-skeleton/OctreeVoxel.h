@@ -46,12 +46,11 @@ struct OctreeNode {
 	int x, y, z;
 	int size;
 	bool isLeaf;
-	bool isSolid; // already present, e.g., whether filled.
-	bool isUniform; // NEW MEMBER: true if all voxels in this cell are the same
+	bool isSolid; 
+	bool isUniform;
 	OctreeNode* parent;
 	OctreeNode* children[8];
 
-	// Constructor (update as needed)
 	OctreeNode(int _x, int _y, int _z, int _size)
 		: x(_x), y(_y), z(_z), size(_size), isLeaf(false),
 		isSolid(false), isUniform(false), parent(nullptr)

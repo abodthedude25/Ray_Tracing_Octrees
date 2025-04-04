@@ -504,8 +504,8 @@ struct Assignment4 : public CallbackInterface {
 	Assignment4()
 		: wireframeMode(false),
 		showOctreeWire(false),
-		currentMode(RenderMode::VolumeRaycast),
-		oldMode(RenderMode::VolumeRaycast),
+		currentMode(RenderMode::DualContouring),
+		oldMode(RenderMode::DualContouring),
 		camera(glm::radians(90.0f), glm::radians(0.f), 500.f),
 		aspect(1.f),
 		rightMouseDown(false),

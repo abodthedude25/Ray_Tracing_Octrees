@@ -124,6 +124,10 @@ glm::vec3 QEFSolver::solve(const glm::vec3& cellCenter, float cellSize) {
 		if (invertible) {
 			glm::vec3 solution = invA * atb;
 
+			// Apply relaxation for better convergence
+			const float relaxation = 0.7f; // Relaxation factor
+			solution = masspoint + relaxation * (solution - masspoint);
+
 			// Validation
 			if (!std::isnan(solution.x) && !std::isnan(solution.y) && !std::isnan(solution.z)) {
 				// Check if solution is reasonably close to the cell
@@ -798,8 +802,6 @@ std::vector<MCTriangle> AdaptiveDualContouringRenderer::createTriangles(
 	return triangles;
 }
 
-
-// Helper function to explicitly handle face triangulation when needed
 std::vector<MCTriangle> AdaptiveDualContouringRenderer::createFaceTriangles(
 	const VoxelGrid& grid, const OctreeNode* node, int x0, int y0, int z0, int size) {
 
@@ -911,7 +913,9 @@ std::vector<MCTriangle> AdaptiveDualContouringRenderer::createFaceTriangles(
 			hasNeighborVertex = true;
 		}
 
-		// Create face corners
+		// Create enhanced face representation with more triangles
+		// This creates a smoother surface with better curvature
+
 		float halfSize = size * grid.voxelSize * 0.5f;
 		glm::vec3 faceNormal(faceDirections[face][0], faceDirections[face][1], faceDirections[face][2]);
 
@@ -937,121 +941,152 @@ std::vector<MCTriangle> AdaptiveDualContouringRenderer::createFaceTriangles(
 			tangent2 = glm::vec3(0, 1, 0);
 		}
 
-		// Create the four corners of the face
-		glm::vec3 corners[4];
-		corners[0] = faceCenter - tangent1 * halfSize - tangent2 * halfSize;
-		corners[1] = faceCenter + tangent1 * halfSize - tangent2 * halfSize;
-		corners[2] = faceCenter + tangent1 * halfSize + tangent2 * halfSize;
-		corners[3] = faceCenter - tangent1 * halfSize + tangent2 * halfSize;
-
-		// Create two triangles from this cell to the face
-		MCTriangle tri1, tri2;
-
-		// First triangle
-		tri1.v[0] = cellVertex;
-		tri1.v[1] = corners[0];
-		tri1.v[2] = corners[1];
+		// Define subdivision level - more divisions create smoother surfaces
+		// but increase triangle count
+		const int divisions = 2; // 2x2 grid (resulting in 8 triangles)
 
 		// Calculate normal (pointing from solid to empty)
 		glm::vec3 normal = faceNormal;
-		if (currentSolid) {
-			normal = normal;  // Already correct
-		}
-		else {
+		if (!currentSolid) {
 			normal = -normal; // Flip to point outward
 		}
 
-		tri1.normal[0] = normal;
-		tri1.normal[1] = normal;
-		tri1.normal[2] = normal;
+		// Create a grid of points on the face
+		std::vector<glm::vec3> gridPoints;
+		gridPoints.reserve((divisions + 1) * (divisions + 1));
 
-		triangles.push_back(tri1);
+		for (int i = 0; i <= divisions; i++) {
+			float u = i / float(divisions);
+			for (int j = 0; j <= divisions; j++) {
+				float v = j / float(divisions);
 
-		// Second triangle
-		tri2.v[0] = cellVertex;
-		tri2.v[1] = corners[1];
-		tri2.v[2] = corners[2];
+				// Map u,v to [-1,1] range for tangent vectors
+				float mappedU = 2.0f * u - 1.0f;
+				float mappedV = 2.0f * v - 1.0f;
 
-		tri2.normal[0] = normal;
-		tri2.normal[1] = normal;
-		tri2.normal[2] = normal;
+				// Calculate point on face
+				glm::vec3 point = faceCenter +
+					tangent1 * (mappedU * halfSize) +
+					tangent2 * (mappedV * halfSize);
 
-		triangles.push_back(tri2);
+				// Add subtle curvature based on distance from center
+				// This creates a slightly rounded appearance
+				float distFromCenter = glm::length(glm::vec2(mappedU, mappedV));
+				float bulge = 0.05f * halfSize * (1.0f - distFromCenter * distFromCenter);
+				point += faceNormal * bulge;
 
-		// Third triangle
-		MCTriangle tri3;
-		tri3.v[0] = cellVertex;
-		tri3.v[1] = corners[2];
-		tri3.v[2] = corners[3];
+				gridPoints.push_back(point);
+			}
+		}
 
-		tri3.normal[0] = normal;
-		tri3.normal[1] = normal;
-		tri3.normal[2] = normal;
+		// Create triangles connecting to the cell vertex
+		for (int i = 0; i < divisions; i++) {
+			for (int j = 0; j < divisions; j++) {
+				// Calculate indices into the grid points array
+				int idx00 = i * (divisions + 1) + j;
+				int idx10 = (i + 1) * (divisions + 1) + j;
+				int idx01 = i * (divisions + 1) + (j + 1);
+				int idx11 = (i + 1) * (divisions + 1) + (j + 1);
 
-		triangles.push_back(tri3);
+				// Create two triangles for this grid cell (connecting to cell vertex)
+				MCTriangle tri1, tri2;
 
-		// Fourth triangle
-		MCTriangle tri4;
-		tri4.v[0] = cellVertex;
-		tri4.v[1] = corners[3];
-		tri4.v[2] = corners[0];
+				tri1.v[0] = cellVertex;
+				tri1.v[1] = gridPoints[idx00];
+				tri1.v[2] = gridPoints[idx10];
+				tri1.normal[0] = normal;
+				tri1.normal[1] = normal;
+				tri1.normal[2] = normal;
 
-		tri4.normal[0] = normal;
-		tri4.normal[1] = normal;
-		tri4.normal[2] = normal;
+				tri2.v[0] = cellVertex;
+				tri2.v[1] = gridPoints[idx10];
+				tri2.v[2] = gridPoints[idx11];
+				tri2.normal[0] = normal;
+				tri2.normal[1] = normal;
+				tri2.normal[2] = normal;
 
-		triangles.push_back(tri4);
+				// Add both triangles
+				triangles.push_back(tri1);
+				triangles.push_back(tri2);
 
-		// Also create triangles from neighbor to the face (with opposite normals)
+				// Create two more triangles to complete the quad
+				MCTriangle tri3, tri4;
+
+				tri3.v[0] = cellVertex;
+				tri3.v[1] = gridPoints[idx11];
+				tri3.v[2] = gridPoints[idx01];
+				tri3.normal[0] = normal;
+				tri3.normal[1] = normal;
+				tri3.normal[2] = normal;
+
+				tri4.v[0] = cellVertex;
+				tri4.v[1] = gridPoints[idx01];
+				tri4.v[2] = gridPoints[idx00];
+				tri4.normal[0] = normal;
+				tri4.normal[1] = normal;
+				tri4.normal[2] = normal;
+
+				// Add the additional triangles
+				triangles.push_back(tri3);
+				triangles.push_back(tri4);
+			}
+		}
+
+		// If neighbor vertex is available, create similar triangles connecting to it
 		if (hasNeighborVertex) {
-			MCTriangle ntri1, ntri2, ntri3, ntri4;
+			// Create mirrored set of triangles connecting to neighbor
+			for (int i = 0; i < divisions; i++) {
+				for (int j = 0; j < divisions; j++) {
+					// Calculate indices into the grid points array
+					int idx00 = i * (divisions + 1) + j;
+					int idx10 = (i + 1) * (divisions + 1) + j;
+					int idx01 = i * (divisions + 1) + (j + 1);
+					int idx11 = (i + 1) * (divisions + 1) + (j + 1);
 
-			ntri1.v[0] = neighborVertex;
-			ntri1.v[1] = corners[1];
-			ntri1.v[2] = corners[0];
+					// Create triangles with opposite winding and normal
+					MCTriangle tri1, tri2, tri3, tri4;
 
-			ntri1.normal[0] = -normal;
-			ntri1.normal[1] = -normal;
-			ntri1.normal[2] = -normal;
+					tri1.v[0] = neighborVertex;
+					tri1.v[1] = gridPoints[idx10];
+					tri1.v[2] = gridPoints[idx00];
+					tri1.normal[0] = -normal;
+					tri1.normal[1] = -normal;
+					tri1.normal[2] = -normal;
 
-			triangles.push_back(ntri1);
+					tri2.v[0] = neighborVertex;
+					tri2.v[1] = gridPoints[idx11];
+					tri2.v[2] = gridPoints[idx10];
+					tri2.normal[0] = -normal;
+					tri2.normal[1] = -normal;
+					tri2.normal[2] = -normal;
 
-			ntri2.v[0] = neighborVertex;
-			ntri2.v[1] = corners[2];
-			ntri2.v[2] = corners[1];
+					tri3.v[0] = neighborVertex;
+					tri3.v[1] = gridPoints[idx01];
+					tri3.v[2] = gridPoints[idx11];
+					tri3.normal[0] = -normal;
+					tri3.normal[1] = -normal;
+					tri3.normal[2] = -normal;
 
-			ntri2.normal[0] = -normal;
-			ntri2.normal[1] = -normal;
-			ntri2.normal[2] = -normal;
+					tri4.v[0] = neighborVertex;
+					tri4.v[1] = gridPoints[idx00];
+					tri4.v[2] = gridPoints[idx01];
+					tri4.normal[0] = -normal;
+					tri4.normal[1] = -normal;
+					tri4.normal[2] = -normal;
 
-			triangles.push_back(ntri2);
-
-			ntri3.v[0] = neighborVertex;
-			ntri3.v[1] = corners[3];
-			ntri3.v[2] = corners[2];
-
-			ntri3.normal[0] = -normal;
-			ntri3.normal[1] = -normal;
-			ntri3.normal[2] = -normal;
-
-			triangles.push_back(ntri3);
-
-			ntri4.v[0] = neighborVertex;
-			ntri4.v[1] = corners[0];
-			ntri4.v[2] = corners[3];
-
-			ntri4.normal[0] = -normal;
-			ntri4.normal[1] = -normal;
-			ntri4.normal[2] = -normal;
-
-			triangles.push_back(ntri4);
+					// Add all triangles
+					triangles.push_back(tri1);
+					triangles.push_back(tri2);
+					triangles.push_back(tri3);
+					triangles.push_back(tri4);
+				}
+			}
 		}
 	}
 
 	return triangles;
 }
 
-// Simplified version of gatherHermiteData that focuses on key surface points
 std::vector<HermitePoint> AdaptiveDualContouringRenderer::gatherHermiteData(
 	const VoxelGrid& grid, int x0, int y0, int z0, int size) {
 

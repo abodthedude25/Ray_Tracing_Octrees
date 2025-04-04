@@ -366,13 +366,11 @@ void main() {
     );
     
     // Initialize shared memory for this workgroup
-    for (int z = 0; z < TILE_SIZE; z++) {
-        if (gl_LocalInvocationID.z == 0) { // Only the first layer does initialization
-            int y = int(gl_LocalInvocationID.y);
-            int x = int(gl_LocalInvocationID.x);
-            radiationTile[x][y][z] = 0.0;
-        }
-    }
+    if (gl_LocalInvocationID.z == 0) {
+		for (int z = 0; z < TILE_SIZE; z++) {
+			radiationTile[int(gl_LocalInvocationID.x)][int(gl_LocalInvocationID.y)][z] = 0.0;
+		}
+	}
     barrier();
     
     // Only process point 0 for simplicity and performance
@@ -508,13 +506,12 @@ void VolumeRaycastRenderer::dispatchRadiationCompute() {
 	GLuint ssbo = 0;
 	glGenBuffers(1, &ssbo);
 	glBindBuffer(GL_SHADER_STORAGE_BUFFER, ssbo);
-	glBufferData(GL_SHADER_STORAGE_BUFFER, sizeof(RadiationPoint) * m_splatPoints.size(),
-		m_splatPoints.data(), GL_STATIC_DRAW);
-	glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 0, ssbo);
 
+	// Process radiation points in small batches for better performance
+	const int BATCH_SIZE = 4; // Process just a few points at once
+
+	// Set up general uniforms that don't change per batch
 	glUseProgram(m_computeProg);
-
-	// Set uniforms
 	glUniform3fv(glGetUniformLocation(m_computeProg, "boxMin"), 1, glm::value_ptr(m_boxMin));
 	glUniform3fv(glGetUniformLocation(m_computeProg, "boxMax"), 1, glm::value_ptr(m_boxMax));
 	glUniform1i(glGetUniformLocation(m_computeProg, "dimX"), m_dimX);
@@ -526,49 +523,91 @@ void VolumeRaycastRenderer::dispatchRadiationCompute() {
 	glBindImageTexture(1, m_radiationTex, 0, GL_TRUE, 0, GL_READ_WRITE, GL_R32F);
 	glBindImageTexture(2, m_volumeTex, 0, GL_TRUE, 0, GL_READ_ONLY, GL_R32F);
 
-	// Process one point at a time in small batches
-	for (size_t i = 0; i < std::min(size_t(1), m_splatPoints.size()); i++) {
-		const RadiationPoint& point = m_splatPoints[i];
+	// Track the total number of tiles processed
+	int totalTilesProcessed = 0;
 
-		// Calculate voxel position of the radiation point
-		glm::vec3 normPos = (point.worldPos - m_boxMin) / (m_boxMax - m_boxMin);
-		glm::ivec3 voxelPos = glm::ivec3(normPos * glm::vec3(m_dimX, m_dimY, m_dimZ));
+	// Process in batches to smooth performance and avoid long GPU stalls
+	for (size_t startIdx = 0; startIdx < m_splatPoints.size(); startIdx += BATCH_SIZE) {
+		size_t endIdx = std::min(startIdx + BATCH_SIZE, m_splatPoints.size());
+		size_t batchSize = endIdx - startIdx;
 
-		// Calculate effective radius in voxels (smaller for performance)
-		int radiusVoxels = std::min(int(point.radius * 1.6), 12);
+		std::cout << "  Processing batch " << (startIdx / BATCH_SIZE + 1)
+			<< " with " << batchSize << " points\n";
 
-		// Calculate the tile range to cover this radius
-		int tileRadius = (radiusVoxels + 7) / 8 + 1; // Round up to whole tiles
+		// Update SSBO with just this batch of points
+		std::vector<RadiationPoint> batch(m_splatPoints.begin() + startIdx,
+			m_splatPoints.begin() + endIdx);
 
-		// Calculate tile start and end with bounds checking
-		int minTileX = std::max(0, voxelPos.x / 8 - tileRadius);
-		int maxTileX = std::min(m_dimX / 8, voxelPos.x / 8 + tileRadius);
-		int minTileY = std::max(0, voxelPos.y / 8 - tileRadius);
-		int maxTileY = std::min(m_dimY / 8, voxelPos.y / 8 + tileRadius);
-		int minTileZ = std::max(0, voxelPos.z / 8 - tileRadius);
-		int maxTileZ = std::min(m_dimZ / 8, voxelPos.z / 8 + tileRadius);
+		// Update buffer with just this batch (more efficient than full data)
+		glBufferData(GL_SHADER_STORAGE_BUFFER, sizeof(RadiationPoint) * batch.size(),
+			batch.data(), GL_STATIC_DRAW);
+		glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 0, ssbo);
 
-		// Calculate number of tiles to process
-		int numTilesX = maxTileX - minTileX + 1;
-		int numTilesY = maxTileY - minTileY + 1;
-		int numTilesZ = maxTileZ - minTileZ + 1;
-		int totalTiles = numTilesX * numTilesY * numTilesZ;
+		// For each point in this batch, process only the affected tiles
+		for (size_t batchIdx = 0; batchIdx < batch.size(); batchIdx++) {
+			const RadiationPoint& point = batch[batchIdx];
 
-		// Use much smaller batches for smoother performance
-		const int BATCH_SIZE = 4; // Process just a few tiles at once
+			// Calculate voxel position of the radiation point
+			glm::vec3 normPos = (point.worldPos - m_boxMin) / (m_boxMax - m_boxMin);
+			glm::ivec3 voxelPos = glm::ivec3(normPos * glm::vec3(m_dimX, m_dimY, m_dimZ));
 
-		std::cout << "  Processing point in " << totalTiles << " tiles with "
-			<< (totalTiles + BATCH_SIZE - 1) / BATCH_SIZE << " batches\n";
+			// Calculate effective radius in voxels
+			int radiusVoxels = std::min(int(point.radius * 1.6), 12);
 
-		for (int z = minTileZ; z <= maxTileZ; z += BATCH_SIZE) {
-			// Immediately synchronize after each small batch
-			glFinish();
+			// Calculate the tile range to cover this radius
+			int tileRadius = (radiusVoxels + 7) / 8 + 1; // Round up to whole tiles
 
-			int batchSizeZ = std::min(maxTileZ - z + 1, BATCH_SIZE);
-			glDispatchCompute(numTilesX, numTilesY, batchSizeZ);
+			// Calculate tile start and end with bounds checking
+			int minTileX = std::max(0, voxelPos.x / 8 - tileRadius);
+			int maxTileX = std::min(m_dimX / 8, voxelPos.x / 8 + tileRadius);
+			int minTileY = std::max(0, voxelPos.y / 8 - tileRadius);
+			int maxTileY = std::min(m_dimY / 8, voxelPos.y / 8 + tileRadius);
+			int minTileZ = std::max(0, voxelPos.z / 8 - tileRadius);
+			int maxTileZ = std::min(m_dimZ / 8, voxelPos.z / 8 + tileRadius);
 
-			// Add memory barrier between batches
-			glMemoryBarrier(GL_SHADER_IMAGE_ACCESS_BARRIER_BIT);
+			// Calculate number of tiles to process
+			int numTilesX = maxTileX - minTileX + 1;
+			int numTilesY = maxTileY - minTileY + 1;
+			int numTilesZ = maxTileZ - minTileZ + 1;
+			int tilesToProcess = numTilesX * numTilesY * numTilesZ;
+
+			totalTilesProcessed += tilesToProcess;
+
+			// If there are a lot of tiles for this point, process them in smaller sub-batches
+			const int TILES_PER_DISPATCH = 32; // Process up to 32 tiles at once
+
+			// Set point-specific uniform if needed
+			// For example, if your shader can handle point index:
+			glUniform1i(glGetUniformLocation(m_computeProg, "currentPointIndex"), batchIdx);
+
+			// Process Z slices in smaller chunks
+			for (int z = minTileZ; z <= maxTileZ; z += TILES_PER_DISPATCH / (numTilesX * numTilesY)) {
+				int zEnd = std::min(maxTileZ + 1, z + TILES_PER_DISPATCH / (numTilesX * numTilesY));
+				int zCount = zEnd - z;
+
+				// Set the workgroup offset for this dispatch
+				glUniform3i(glGetUniformLocation(m_computeProg, "tileOffset"),
+					minTileX, minTileY, z);
+
+				// Dispatch compute for this subset of tiles
+				glDispatchCompute(numTilesX, numTilesY, zCount);
+
+				// Add memory barrier between batches
+				glMemoryBarrier(GL_SHADER_IMAGE_ACCESS_BARRIER_BIT);
+
+				// Optional: For smoother rendering during long operations,
+				// periodically flush the command buffer to allow the GPU
+				// to start processing while we continue queueing more work
+				if (tilesToProcess > 100) {
+					glFlush(); // Don't wait, just send commands to GPU
+				}
+			}
+
+			// For very large operations, add a synchronization point 
+			// to avoid excessive command buffer buildup
+			if (tilesToProcess > 500) {
+				glFinish(); // Wait for the GPU to complete
+			}
 		}
 	}
 
@@ -580,6 +619,9 @@ void VolumeRaycastRenderer::dispatchRadiationCompute() {
 	glDeleteBuffers(1, &ssbo);
 
 	checkGLError("dispatchRadiationCompute");
+
+	std::cout << "Radiation compute complete. Processed " << totalTilesProcessed
+		<< " total tiles for " << m_splatPoints.size() << " points\n";
 
 	// Force re-run precompute for updated radiation
 	m_precomputeNeeded = true;
