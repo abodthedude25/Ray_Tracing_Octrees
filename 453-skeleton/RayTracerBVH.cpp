@@ -182,16 +182,35 @@ void main()
 static const char* g_computeShaderSrc = R"(
 #version 430 core
 
-// For local workgroup sizes
+#ifdef GL_ARB_shader_atomic_float
+#extension GL_ARB_shader_atomic_float : enable
+#endif
+
 layout(local_size_x = 8, local_size_y = 8) in;
 
-// Output image: final rendered image
+// OUTPUT IMAGE
 layout(rgba32f, binding = 0) uniform image2D outputImage;
 
-// Define maximum traversal steps per ray
-#define MAX_TRAVERSAL_STEPS 512
+// VOLUME MEASUREMENT BUFFER
+layout(std430, binding = 2) buffer VolumeBuffer {
+    int accumulatedVolume;
+};
 
-// GPU octree node structure – note the added 'isUniform' field.
+// UNIFORMS
+uniform int   numNodes;
+uniform vec3  gridMin;
+uniform float voxelSize;
+uniform mat4  invVP;
+uniform mat4  viewMat;
+uniform vec3  cameraPos;
+uniform float aspect;
+uniform float fov;
+uniform int   imageWidth;
+uniform int   imageHeight;
+uniform bool  enableVolumeMeasurement;
+
+const float VOLUME_SCALE = 1e8;
+
 struct OctreeNodeGPUStruct {
     int x;
     int y;
@@ -199,7 +218,7 @@ struct OctreeNodeGPUStruct {
     int size;
     int isLeaf;
     int isSolid;
-    int isUniform;  // 1 if uniform (all voxels are the same), else 0.
+    int isUniform;
     int child[8];
 };
 
@@ -207,23 +226,18 @@ layout(std430, binding = 1) buffer OctreeNodes {
     OctreeNodeGPUStruct nodes[];
 };
 
-uniform int numNodes;
-uniform vec3 gridMin;
-uniform float voxelSize;
-uniform mat4 invVP;
-uniform mat4 viewMat;
-uniform vec3 cameraPos;
-uniform float aspect;
-uniform float fov;  // in degrees
-uniform int imageWidth;
-uniform int imageHeight;
-
 struct Ray {
     vec3 origin;
     vec3 direction;
 };
 
-bool intersectAABB(vec3 rayOrigin, vec3 rayDir, vec3 bmin, vec3 bmax, out float tNear, out float tFar)
+struct VolumeInterval {
+    float tStart;
+    float tEnd;
+};
+
+bool intersectAABB(vec3 rayOrigin, vec3 rayDir, vec3 bmin, vec3 bmax,
+                    out float tNear, out float tFar)
 {
     vec3 invDir = 1.0 / rayDir;
     vec3 t1 = (bmin - rayOrigin) * invDir;
@@ -235,33 +249,34 @@ bool intersectAABB(vec3 rayOrigin, vec3 rayDir, vec3 bmin, vec3 bmax, out float 
     return (tNear <= tFar && tFar > 0.0);
 }
 
-// Optimized Octree Traversal with Workload Limiting 
-bool intersectOctreeIterative(vec3 rayOrigin, vec3 rayDir,
-                              out vec3 hitPoint, out vec3 hitNormal)
+// Modified to collect all volume intervals, not just the closest hit
+void intersectOctreeForVolume(vec3 rayOrigin, vec3 rayDir, 
+                            out float closestT, 
+                            out vec3 outNormal,
+                            out VolumeInterval intervals[16],
+                            out int intervalCount)
 {
-    float closestT = 1e30;
     bool hitFound = false;
-    vec3 bestNormal = vec3(0.0);
-
-    // Stack for node indices
+    vec3 bestNormal = vec3(0);
+    float bestT = 1e30;
+    
+    // Start with zero intervals
+    intervalCount = 0;
+    
+    // Stack for BFS
     int stack[128];
     int sp = 0;
-    stack[sp++] = 0;  // Push root node (assumed index 0)
-    
-    // Track traversal steps to limit workload
-    int traversalSteps = 0;
+    stack[sp++] = 0; // root node index = 0
 
-    while (sp > 0 && traversalSteps < MAX_TRAVERSAL_STEPS) {
+    while (sp > 0) {
         sp--;
         int nodeIdx = stack[sp];
         if (nodeIdx < 0) continue;
-        
-        // Increment step counter
-        traversalSteps++;
 
+        // Read the node
         OctreeNodeGPUStruct node = nodes[nodeIdx];
 
-        // Compute world-space AABB for the node.
+        // Build the node's AABB
         vec3 nodeMin = gridMin + vec3(node.x, node.y, node.z) * voxelSize;
         vec3 nodeMax = nodeMin + vec3(node.size) * voxelSize;
 
@@ -269,78 +284,127 @@ bool intersectOctreeIterative(vec3 rayOrigin, vec3 rayDir,
         if (!intersectAABB(rayOrigin, rayDir, nodeMin, nodeMax, tNear, tFar))
             continue;
 
-        // Early exit if tNear is not better than current hit.
-        if (tNear >= closestT)
-            continue;
+        // If we're looking for the closest hit for shading
+        if (tNear >= bestT) continue;
+
+        // For solid leaf or uniform solid, we have a volume contribution
+        bool isSolid = false;
         
-        // If this node is uniform (all voxels are the same), treat it as a leaf.
+        // Uniform node => treat as leaf
         if (node.isUniform == 1) {
-            if (node.isSolid == 1) {  // Uniform and solid: update hit directly.
-                float tHit = max(0.0, tNear);
-                if (tHit < closestT && tHit <= tFar) {
-                    closestT = tHit;
-                    hitFound = true;
-                    vec3 center = 0.5 * (nodeMin + nodeMax);
-                    vec3 p = rayOrigin + rayDir * tHit;
-                    bestNormal = normalize(p - center);
-                    
-                    // Early exit once we found a hit - reduces warp divergence
-                    break;
-                }
-            }
-            // If uniform and empty, nothing to do.
-            continue;
-        }
-        
-        // If this is a leaf (non–uniform leaves are possible, though unlikely)
-        if (node.isLeaf == 1) {
             if (node.isSolid == 1) {
+                // This node is fully solid - for shading
                 float tHit = max(0.0, tNear);
-                if (tHit < closestT && tHit <= tFar) {
-                    closestT = tHit;
+                if (tHit < bestT && tHit <= tFar) {
+                    bestT = tHit;
                     hitFound = true;
                     vec3 center = 0.5 * (nodeMin + nodeMax);
                     vec3 p = rayOrigin + rayDir * tHit;
                     bestNormal = normalize(p - center);
-                    
-                    // Early exit once we found a hit - reduces warp divergence
-                    break;
                 }
+                
+                // And for volume calculation
+                isSolid = true;
             }
-            continue;
+        }
+        else if (node.isLeaf == 1) {
+            // Leaf node
+            if (node.isSolid == 1) {
+                // Solid leaf - for shading
+                float tHit = max(0.0, tNear);
+                if (tHit < bestT && tHit <= tFar) {
+                    bestT = tHit;
+                    hitFound = true;
+                    vec3 center = 0.5 * (nodeMin + nodeMax);
+                    vec3 p = rayOrigin + rayDir * tHit;
+                    bestNormal = normalize(p - center);
+                }
+                
+                // And for volume calculation
+                isSolid = true;
+            }
         }
         else {
-            // For non-uniform internal nodes, push all children.
-            for (int i = 0; i < 8; i++) {
-                int childIdx = node.child[i];
-                if (childIdx >= 0)
+            // For non-leaf non-uniform, push children
+            for (int c = 0; c < 8; c++) {
+                int childIdx = node.child[c];
+                if (childIdx >= 0) {
                     stack[sp++] = childIdx;
+                }
+            }
+        }
+        
+        // Add volume interval if solid
+        if (isSolid && enableVolumeMeasurement) {
+            // Make sure we're within ray limits
+            tNear = max(0.0, tNear);
+            
+            // Don't add zero-length intervals
+            if (tFar > tNear && intervalCount < 16) {
+                intervals[intervalCount].tStart = tNear;
+                intervals[intervalCount].tEnd = tFar;
+                intervalCount++;
             }
         }
     }
 
     if (hitFound) {
-        hitPoint = rayOrigin + rayDir * closestT;
-        hitNormal = bestNormal;
+        closestT = bestT;
+        outNormal = bestNormal;
+    } else {
+        closestT = -1.0;
     }
-    return hitFound;
 }
 
+// Merge overlapping intervals for accurate volume calculation
+void mergeIntervals(inout VolumeInterval intervals[16], inout int intervalCount) {
+    if (intervalCount <= 1) return;
+    
+    // Sort intervals by start time (simple bubble sort)
+    for (int i = 0; i < intervalCount - 1; i++) {
+        for (int j = 0; j < intervalCount - i - 1; j++) {
+            if (intervals[j].tStart > intervals[j+1].tStart) {
+                VolumeInterval temp = intervals[j];
+                intervals[j] = intervals[j+1];
+                intervals[j+1] = temp;
+            }
+        }
+    }
+    
+    // Merge overlapping intervals
+    int indexToKeep = 0;
+    for (int i = 1; i < intervalCount; i++) {
+        // If current interval overlaps with previous
+        if (intervals[indexToKeep].tEnd >= intervals[i].tStart) {
+            // Update end of previous interval if current end is greater
+            intervals[indexToKeep].tEnd = max(intervals[indexToKeep].tEnd, intervals[i].tEnd);
+        } else {
+            // No overlap, keep this interval
+            indexToKeep++;
+            intervals[indexToKeep] = intervals[i];
+        }
+    }
+    
+    // Update interval count
+    intervalCount = indexToKeep + 1;
+}
 
-// Simple Lambert shading function.
-vec3 shade(vec3 hitPoint, vec3 normal)
+vec3 shade(vec3 hitPoint, vec3 N)
 {
-    vec3 lightDir = normalize(vec3(-1.0, -1.0, -1.0));
-    float ndotl = max(0.0, dot(normal, -lightDir));
-    return vec3(1.0, 0.8, 0.6) * ndotl + vec3(0.1, 0.1, 0.1);
+    vec3 lightDir = normalize(vec3(-1, -1, -1));
+    float ndotl = max(0.0, dot(N, -lightDir));
+    vec3 baseColor = vec3(1.0, 0.8, 0.6) * ndotl + vec3(0.1, 0.1, 0.1);
+    return baseColor;
 }
 
-Ray generateRay(int px, int py, int w, int h, vec3 camPos, mat4 view, float fovDeg, float aspect)
+Ray generateRay(int px, int py, int w, int h,
+                vec3 camPos, mat4 view, float fovDeg, float aspect)
 {
     float fovRad = radians(fovDeg);
     float nx = (float(px) + 0.5) / float(w) * 2.0 - 1.0;
     float ny = 1.0 - (float(py) + 0.5) / float(h) * 2.0;
     nx *= aspect;
+
     float tanHalfFov = tan(fovRad * 0.5);
     nx *= tanHalfFov;
     ny *= tanHalfFov;
@@ -348,6 +412,7 @@ Ray generateRay(int px, int py, int w, int h, vec3 camPos, mat4 view, float fovD
     mat4 invView = inverse(view);
     vec4 rayDirView = normalize(vec4(nx, ny, -1.0, 0.0));
     vec4 rayDirWorld = invView * rayDirView;
+
     Ray r;
     r.origin = camPos;
     r.direction = normalize(vec3(rayDirWorld));
@@ -357,14 +422,78 @@ Ray generateRay(int px, int py, int w, int h, vec3 camPos, mat4 view, float fovD
 void main()
 {
     ivec2 gid = ivec2(gl_GlobalInvocationID.xy);
-    if (gid.x >= imageWidth || gid.y >= imageHeight)
+    if (gid.x >= imageWidth || gid.y >= imageHeight) {
         return;
+    }
 
-    Ray ray = generateRay(gid.x, gid.y, imageWidth, imageHeight, cameraPos, viewMat, fov, aspect);
-    vec3 hitPoint, hitNormal;
-    bool hit = intersectOctreeIterative(ray.origin, ray.direction, hitPoint, hitNormal);
-    vec3 color = hit ? shade(hitPoint, hitNormal) : vec3(0.0);
+    // Generate ray for this pixel
+    Ray ray = generateRay(gid.x, gid.y,
+                          imageWidth, imageHeight,
+                          cameraPos, viewMat, fov, aspect);
+
+    // For volume measurement, collect all intervals
+    VolumeInterval intervals[16];
+    int intervalCount = 0;
+    
+    // Intersect the octree for rendering and volume
+    float tClosest;
+    vec3 normal;
+    intersectOctreeForVolume(ray.origin, ray.direction, tClosest, normal, intervals, intervalCount);
+    
+    // Render the scene
+    vec3 color = vec3(0.0);
+    if (tClosest > 0.0) {
+        vec3 hitPoint = ray.origin + ray.direction * tClosest;
+        color = shade(hitPoint, normal);
+    }
+    
+    // Store the output color
     imageStore(outputImage, gid, vec4(color, 1.0));
+    
+    // Compute volume if enabled
+    if (enableVolumeMeasurement && intervalCount > 0) {
+        // Merge intervals to handle overlaps
+        mergeIntervals(intervals, intervalCount);
+        
+        // Compute variable cone size for each interval
+        float totalVolume = 0.0;
+        
+        // Get base pixel size at distance 1.0
+        float fovRad = radians(fov);
+        float pixelSize = 2.0 * tan(fovRad * 0.5) / float(imageHeight);
+        
+        // For each interval, calculate volume with proper perspective scaling
+        for (int i = 0; i < intervalCount; i++) {
+            float tStart = intervals[i].tStart;
+            float tEnd = intervals[i].tEnd;
+            float intervalLength = tEnd - tStart;
+            
+            // Skip tiny intervals (numerical precision issues)
+            if (intervalLength < 0.0001) continue;
+            
+            // Calculate middle distance for this interval
+            float midDist = (tStart + tEnd) * 0.5;
+            
+            // For perspective correction, scale pixel area by square of distance
+            float areaAtMidDist = pixelSize * pixelSize * midDist * midDist;
+            
+            // Volume = area × length
+            float intervalVolume = areaAtMidDist * intervalLength;
+            
+            // Accumulate volume
+            totalVolume += intervalVolume;
+        }
+        
+        // Scale by a factor to account for entire image
+        float scalingFactor = 1.0 / float(imageWidth * imageHeight);
+        totalVolume *= scalingFactor;
+        
+        // Convert to integer for atomic addition
+        int scaledVolume = int(totalVolume * VOLUME_SCALE + 0.5);
+        
+        // Add to the accumulated volume
+        atomicAdd(accumulatedVolume, scaledVolume);
+    }
 }
 )";
 
@@ -400,7 +529,10 @@ RayTracerBVH::RayTracerBVH()
 	m_fsqProg(0),
 	m_nodeSSBO(0),
 	m_numNodes(0),
-	m_frustumCullingEnabled(true)
+	m_frustumCullingEnabled(true),
+	m_enableVolumeMeasurement(true),
+	m_measuredVolume(0.0f),
+	m_volumeSSBO(0)
 {
 }
 
@@ -705,139 +837,143 @@ void RayTracerBVH::renderSceneCompute(const Camera& camera,
 
 void RayTracerBVH::renderSceneComputeWithCulling(
 	const Camera& camera,
-	int width, int height,
+	int width,
+	int height,
 	float aspect,
 	float fovDeg,
 	bool updateFrustum)
 {
+	// 1) Bail out if compute pipeline is not ready
 	if (!m_computeInited || m_computeProg == 0 || m_fsqProg == 0) {
 		std::cerr << "[RayTracerBVH] Compute pipeline not initialized or failed.\n";
 		return;
 	}
 
-	// If we have no data, skip
+	// 2) If no nodes, skip
 	if (m_numNodes <= 0) {
-		printf("No nodes to render.\n");
+		std::cout << "[RayTracerBVH] No octree nodes to render.\n";
 		return;
 	}
 
-	// Update the frustum culling if requested
+	// 3) Optionally perform frustum culling
 	if (updateFrustum) {
 		std::cout << "Applying frustum update with camera at position: ("
 			<< camera.getPos().x << ", "
 			<< camera.getPos().y << ", "
-			<< camera.getPos().z << ")" << std::endl;
+			<< camera.getPos().z << ")\n";
 
-		// Create the frustum from the camera's view-projection matrix
+		// Create the frustum from the camera's view-projection
 		glm::mat4 view = camera.getView();
 		glm::mat4 proj = glm::perspective(glm::radians(fovDeg), aspect, 0.01f, 5000.f);
 		Frustum frustum(proj * view);
 
-		// Clear the visible nodes list
+		// Clear the visible‐nodes list
 		m_visibleNodes.clear();
 
-		// First pass: Determine which nodes are visible
+		// 3.1) Mark which nodes pass frustum test
 		std::vector<bool> isVisible(m_flatNodes.size(), false);
 		int visibleCount = 0;
 
 		for (size_t i = 0; i < m_flatNodes.size(); i++) {
 			const auto& node = m_flatNodes[i];
 
-			// Calculate node bounds in world space
-			glm::vec3 minPoint(
-				m_grid.minX + node.x * m_grid.voxelSize,
+			// Build world‐space bounding box
+			glm::vec3 nodeMin(m_grid.minX + node.x * m_grid.voxelSize,
 				m_grid.minY + node.y * m_grid.voxelSize,
-				m_grid.minZ + node.z * m_grid.voxelSize
-			);
-			glm::vec3 maxPoint = minPoint + glm::vec3(node.size * m_grid.voxelSize);
+				m_grid.minZ + node.z * m_grid.voxelSize);
+			glm::vec3 nodeMax = nodeMin + glm::vec3(node.size * m_grid.voxelSize);
 
-			// Test against frustum with margin
-			int frustumTest = frustum.testAABB(minPoint, maxPoint, 150.0f);
-
-			// If not completely outside, include it
+			int frustumTest = frustum.testAABB(nodeMin, nodeMax, 150.0f);
 			if (frustumTest != -1) {
 				isVisible[i] = true;
 				visibleCount++;
 			}
 		}
 
-		// Create mapping from old indices to new indices
-		std::vector<int> oldToNewIndex(m_flatNodes.size(), -1);
+		// 3.2) Remap old indices -> new indices
+		std::vector<int> oldToNew(m_flatNodes.size(), -1);
 		int newIndex = 0;
-
 		for (size_t i = 0; i < m_flatNodes.size(); i++) {
 			if (isVisible[i]) {
-				oldToNewIndex[i] = newIndex++;
+				oldToNew[i] = newIndex++;
 			}
 		}
 
-		// Second pass: Build visible nodes list with remapped child indices
+		// 3.3) Build m_visibleNodes
 		m_visibleNodes.resize(visibleCount);
 		newIndex = 0;
-
 		for (size_t i = 0; i < m_flatNodes.size(); i++) {
-			if (isVisible[i]) {
-				// Copy the node
-				m_visibleNodes[newIndex] = m_flatNodes[i];
+			if (!isVisible[i]) continue;
+			m_visibleNodes[newIndex] = m_flatNodes[i];
 
-				// Remap child indices
-				if (!m_flatNodes[i].isLeaf) {
-					for (int c = 0; c < 8; c++) {
-						int oldChildIndex = m_flatNodes[i].child[c];
-
-						// If child is visible, update its index
-						if (oldChildIndex >= 0 && oldChildIndex < static_cast<int>(m_flatNodes.size()) &&
-							isVisible[oldChildIndex]) {
-							m_visibleNodes[newIndex].child[c] = oldToNewIndex[oldChildIndex];
-						}
-						else {
-							// Child not visible, mark as invalid
-							m_visibleNodes[newIndex].child[c] = -1;
-						}
+			// Re-map children
+			if (!m_flatNodes[i].isLeaf) {
+				for (int c = 0; c < 8; c++) {
+					int childIdx = m_flatNodes[i].child[c];
+					if (childIdx >= 0 && isVisible[childIdx]) {
+						m_visibleNodes[newIndex].child[c] = oldToNew[childIdx];
+					}
+					else {
+						m_visibleNodes[newIndex].child[c] = -1;
 					}
 				}
-
-				newIndex++;
 			}
+			newIndex++;
 		}
 
-		// Debug output
-		std::cout << "Frustum culling: " << m_numNodes << " -> " << visibleCount
-			<< " nodes (" << (visibleCount * 100 / m_numNodes) << "%)\n";
+		std::cout << "[RayTracerBVH] Frustum culling: " << m_numNodes << " -> "
+			<< visibleCount << " nodes\n";
 
-		// Update the GPU buffer with visible nodes
+		// 3.4) Update GPU buffer with just the visible nodes
 		glBindBuffer(GL_SHADER_STORAGE_BUFFER, m_nodeSSBO);
 		glBufferData(GL_SHADER_STORAGE_BUFFER,
 			m_visibleNodes.size() * sizeof(GPUNodes),
-			m_visibleNodes.data(), GL_DYNAMIC_DRAW);
+			m_visibleNodes.data(),
+			GL_DYNAMIC_DRAW);
+		glBindBuffer(GL_SHADER_STORAGE_BUFFER, 0);
 	}
 
-	// Resize or create output image
+	// 4) Prepare output image
 	if (!m_outputTex) {
 		glGenTextures(1, &m_outputTex);
 	}
 	glActiveTexture(GL_TEXTURE0);
 	glBindTexture(GL_TEXTURE_2D, m_outputTex);
 
-	// Allocate or re-allocate as RGBA32F
+	// Re‐allocate as RGBA32F
 	glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA32F, width, height,
 		0, GL_RGBA, GL_FLOAT, nullptr);
 	glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
 	glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
 
-	// Bind SSBO
+	// Bind node SSBO at binding=1
 	glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 1, m_nodeSSBO);
 
-	// Use compute shader
+	if (m_enableVolumeMeasurement && m_volumeSSBO) {
+		// 1) Zero out the SSBO each frame
+		glBindBuffer(GL_SHADER_STORAGE_BUFFER, m_volumeSSBO);
+
+		// Write int zero (since 'accumulatedVolume' is an int in the shader)
+		int zero = 0;
+		glBufferSubData(GL_SHADER_STORAGE_BUFFER, 0, sizeof(int), &zero);
+
+		// Optionally re‐bind at binding=2 if not still bound
+		glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 2, m_volumeSSBO);
+
+		glBindBuffer(GL_SHADER_STORAGE_BUFFER, 0);
+	}
+
+	// 6) Use the compute shader
 	glUseProgram(m_computeProg);
 
 	// Bind image for output
 	glBindImageTexture(0, m_outputTex, 0, GL_FALSE, 0, GL_WRITE_ONLY, GL_RGBA32F);
 
-	// Set uniforms
+	// 7) Set uniforms
+	//    — NB: set "enableVolumeMeasurement" uniform if your shader uses it
 	GLint locNumNodes = glGetUniformLocation(m_computeProg, "numNodes");
 	GLint locGridMin = glGetUniformLocation(m_computeProg, "gridMin");
-	GLint locVoxelSize = glGetUniformLocation(m_computeProg, "voxelSize");
+	GLint locVoxel = glGetUniformLocation(m_computeProg, "voxelSize");
 	GLint locInvVP = glGetUniformLocation(m_computeProg, "invVP");
 	GLint locViewMat = glGetUniformLocation(m_computeProg, "viewMat");
 	GLint locCamPos = glGetUniformLocation(m_computeProg, "cameraPos");
@@ -845,40 +981,63 @@ void RayTracerBVH::renderSceneComputeWithCulling(
 	GLint locFov = glGetUniformLocation(m_computeProg, "fov");
 	GLint locWidth = glGetUniformLocation(m_computeProg, "imageWidth");
 	GLint locHeight = glGetUniformLocation(m_computeProg, "imageHeight");
+	GLint locEnable = glGetUniformLocation(m_computeProg, "enableVolumeMeasurement");
 
-	// Pass the number of visible nodes
-	int nodeCount = updateFrustum ? m_visibleNodes.size() : m_numNodes;
-
+	int nodeCount = updateFrustum ? int(m_visibleNodes.size()) : m_numNodes;
 	glUniform1i(locNumNodes, nodeCount);
 	glUniform3f(locGridMin, m_grid.minX, m_grid.minY, m_grid.minZ);
-	glUniform1f(locVoxelSize, m_grid.voxelSize);
+	glUniform1f(locVoxel, m_grid.voxelSize);
 
-	// Calculate view and projection matrices
-	glm::mat4 view = camera.getView();
-	glm::mat4 invVP = glm::inverse(glm::perspective(glm::radians(fovDeg), aspect, 0.01f, 5000.f) * view);
+	glm::mat4 viewMatrix = camera.getView();
+	glm::mat4 vp = glm::perspective(glm::radians(fovDeg), aspect, 0.01f, 5000.f) * viewMatrix;
+	glm::mat4 invVP = glm::inverse(vp);
 
 	glUniformMatrix4fv(locInvVP, 1, GL_FALSE, &invVP[0][0]);
-	glUniformMatrix4fv(locViewMat, 1, GL_FALSE, &view[0][0]);
+	glUniformMatrix4fv(locViewMat, 1, GL_FALSE, &viewMatrix[0][0]);
 
-	glm::vec3 camPos = camera.getPos();
-	glUniform3f(locCamPos, camPos.x, camPos.y, camPos.z);
+	glm::vec3 cpos = camera.getPos();
+	glUniform3f(locCamPos, cpos.x, cpos.y, cpos.z);
+
 	glUniform1f(locAspect, aspect);
 	glUniform1f(locFov, fovDeg);
 	glUniform1i(locWidth, width);
 	glUniform1i(locHeight, height);
 
-	// Dispatch
-	int gx = (width + 7) / 8;   // match local_size_x=8
-	int gy = (height + 7) / 8;   // match local_size_y=8
+	if (locEnable >= 0) {
+		glUniform1i(locEnable, m_enableVolumeMeasurement ? 1 : 0);
+	}
+
+	// 8) Dispatch compute
+	int gx = (width + 7) / 8;
+	int gy = (height + 7) / 8;
 	glDispatchCompute(gx, gy, 1);
 
-	// Wait for compute
-	glMemoryBarrier(GL_SHADER_IMAGE_ACCESS_BARRIER_BIT);
+	// 9) Wait for completion
+	glMemoryBarrier(GL_SHADER_IMAGE_ACCESS_BARRIER_BIT | GL_BUFFER_UPDATE_BARRIER_BIT);
 
-	// Now draw a fullscreen quad to show the result
+	// 10) If measuring, read the volume result back from the SSBO
+	if (m_enableVolumeMeasurement && m_volumeSSBO) {
+		glBindBuffer(GL_SHADER_STORAGE_BUFFER, m_volumeSSBO);
+
+		// Map as an int*
+		int* ptr = (int*)glMapBuffer(GL_SHADER_STORAGE_BUFFER, GL_READ_ONLY);
+		if (ptr) {
+			int accumInt = *ptr; // total scaled volume
+			glUnmapBuffer(GL_SHADER_STORAGE_BUFFER);
+
+			// Convert back:
+			const float scale = 1e8f; // same scale as in the shader
+			float totalVolume = float(accumInt) / scale;
+
+			m_measuredVolume = totalVolume;
+			std::cout << "[RayTracerBVH] Measured volume: " << totalVolume << " units\n";
+		}
+		glBindBuffer(GL_SHADER_STORAGE_BUFFER, 0);
+	}
+
+	// 11) Draw a fullscreen quad to display the result
 	glUseProgram(m_fsqProg);
 
-	// Our texture is bound to GL_TEXTURE0, so set the sampler uniform
 	GLint locTex = glGetUniformLocation(m_fsqProg, "tex");
 	glUniform1i(locTex, 0); // texture unit 0
 
@@ -886,10 +1045,11 @@ void RayTracerBVH::renderSceneComputeWithCulling(
 	glDrawArrays(GL_TRIANGLE_STRIP, 0, 4);
 	glBindVertexArray(0);
 
-	// Unbind
+	// 12) Cleanup
 	glBindImageTexture(0, 0, 0, GL_FALSE, 0, GL_WRITE_ONLY, GL_RGBA32F);
 	glUseProgram(0);
 }
+
 
 void RayTracerBVH::updateNodesWithFrustumCulling(const Frustum& frustum, float extraMargin) {
 	m_visibleNodes.clear();
@@ -916,3 +1076,57 @@ void RayTracerBVH::updateNodesWithFrustumCulling(const Frustum& frustum, float e
 		}
 	}
 }
+
+
+// On the CPU, do the same:
+void RayTracerBVH::enableVolumeMeasurement(bool enable)
+{
+	m_enableVolumeMeasurement = enable;
+
+	if (enable) {
+		// If we haven't created the SSBO yet, do so
+		if (!m_volumeSSBO) {
+			glGenBuffers(1, &m_volumeSSBO);
+		}
+
+		// Bind it
+		glBindBuffer(GL_SHADER_STORAGE_BUFFER, m_volumeSSBO);
+
+		// We only need space for one integer
+		int zero = 0;
+		// Allocate and initialize to zero
+		glBufferData(GL_SHADER_STORAGE_BUFFER,
+			sizeof(int),
+			&zero,
+			GL_DYNAMIC_DRAW);
+
+		// Bind it at binding index=2 (must match your compute shader)
+		glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 2, m_volumeSSBO);
+
+		// Unbind
+		glBindBuffer(GL_SHADER_STORAGE_BUFFER, 0);
+
+		// Also reset our CPU‐side value
+		m_measuredVolume = 0.0f;
+	}
+	else {
+		// If disabling measurement, optionally free the buffer
+		if (m_volumeSSBO) {
+			glDeleteBuffers(1, &m_volumeSSBO);
+			m_volumeSSBO = 0;
+		}
+	}
+}
+
+void RayTracerBVH::resetVolumeMeasurement() {
+	m_measuredVolume = 0.0f;
+
+	if (m_volumeSSBO) {
+		// Clear the SSBO to zero as an integer
+		glBindBuffer(GL_SHADER_STORAGE_BUFFER, m_volumeSSBO);
+		int zero = 0;
+		glBufferSubData(GL_SHADER_STORAGE_BUFFER, 0, sizeof(int), &zero);
+		glBindBuffer(GL_SHADER_STORAGE_BUFFER, 0);
+	}
+}
+

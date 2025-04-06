@@ -49,6 +49,11 @@ public:
 	void renderSceneComputeWithCulling(const Camera& camera, int width, int height,
 		float aspect, float fovDeg, bool updateFrustum);
 
+	void enableVolumeMeasurement(bool enable);
+	bool isVolumeMeasurementEnabled() const { return m_enableVolumeMeasurement; }
+
+	float getMeasuredVolume() const { return m_measuredVolume; } // or double if you prefer
+	void resetVolumeMeasurement();
 
 private:
 	// Scene data
@@ -77,4 +82,7 @@ private:
 	// Storage for visible nodes
 	std::vector<GPUNodes> m_visibleNodes;
 
+	bool   m_enableVolumeMeasurement;
+	float  m_measuredVolume;  // Stores the total measured volume from the GPU
+	GLuint m_volumeSSBO;      // The GPU buffer used for accumulation
 };
