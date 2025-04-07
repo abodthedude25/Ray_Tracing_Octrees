@@ -49,6 +49,9 @@ public:
 	// For octree-based ray skipping
 	bool m_enableOctreeSkip;
 	bool m_useMipMappedSkipping;  // Flag for enabling MIP mapped skipping
+	// Radiation splatting points
+	std::vector<RadiationPoint> m_splatPoints;
+	size_t m_lastProcessedRadiationPoint = 0;
 
 private:
 	// Create/initialize various textures and shaders
@@ -131,12 +134,12 @@ private:
 	float m_timeValue;
 	float m_frustumMargin;
 
-	// Radiation splatting points
-	std::vector<RadiationPoint> m_splatPoints;
-
 	// Frustum culling data
 	std::unordered_map<const OctreeNode*, bool> m_nodeVisibility;
 
 	glm::vec3 m_previousCamPos = glm::vec3(0.0f);
 	glm::vec3 m_previousViewDir = glm::vec3(0.0f, 0.0f, -1.0f);
+
+	void createWorkingVolumeTexture(const VoxelGrid& grid);
+
 };

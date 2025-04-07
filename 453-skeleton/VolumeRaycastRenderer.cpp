@@ -262,7 +262,7 @@ void VolumeRaycastRenderer::createVolumeTexture(const VoxelGrid& grid) {
 	}
 
 	// Upload data
-	glTexImage3D(GL_TEXTURE_3D, 0, GL_R8, m_dimX, m_dimY, m_dimZ, 0, GL_RED, GL_FLOAT, volumeData.data());
+	glTexImage3D(GL_TEXTURE_3D, 0, GL_R32F, m_dimX, m_dimY, m_dimZ, 0, GL_RED, GL_FLOAT, volumeData.data());
 
 	// Set bounds
 	m_boxMin = glm::vec3(grid.minX, grid.minY, grid.minZ);
@@ -301,9 +301,6 @@ void VolumeRaycastRenderer::clearRadiationVolume() {
     checkGLError("clearRadiationVolume");
 }
 
-void VolumeRaycastRenderer::updateSplatPoints(const std::vector<RadiationPoint>& pts) {
-    m_splatPoints = pts;
-}
 
 static const char* pointRadComputeSrc = R"COMPUTE(
 #version 430 core
@@ -317,7 +314,8 @@ layout(std430, binding=0) buffer SplatBuffer {
 };
 
 layout(r32f, binding=1) uniform image3D radiationVol;
-layout(r32f, binding=2) uniform image3D volumeTex; // optional
+layout(r32f, binding=2) uniform readonly image3D volumeTex;
+layout(r32f, binding=3) uniform image3D workingVolumeTex;
 
 uniform vec3 boxMin;
 uniform vec3 boxMax;
@@ -326,17 +324,13 @@ uniform int dimY;
 uniform int dimZ;
 uniform uint seed;
 
-// Pre-computed jitter offsets for better cache coherency
-const vec3 jitterOffsets[16] = vec3[16](
-    vec3(-0.4, -0.4, -0.4), vec3(0.4, -0.4, -0.4),
-    vec3(-0.4, 0.4, -0.4), vec3(0.4, 0.4, -0.4),
-    vec3(-0.4, -0.4, 0.4), vec3(0.4, -0.4, 0.4),
-    vec3(-0.4, 0.4, 0.4), vec3(0.4, 0.4, 0.4),
-    vec3(-0.2, -0.2, -0.2), vec3(0.2, -0.2, -0.2),
-    vec3(-0.2, 0.2, -0.2), vec3(0.2, 0.2, -0.2),
-    vec3(-0.2, -0.2, 0.2), vec3(0.2, -0.2, 0.2),
-    vec3(-0.2, 0.2, 0.2), vec3(0.2, 0.2, 0.2)
-);
+// A simple random generator
+float randFloat(inout uint n) {
+    n = 1664525u * n + 1013904223u;
+    uint bits = (n >> 9u) | 0x3F800000u;
+    float f = uintBitsToFloat(bits) - 1.0;
+    return f;
+}
 
 // Sharper cubic B-spline
 float bspline1D(float x) {
@@ -350,146 +344,143 @@ float bspline1D(float x) {
     return 0.0;
 }
 
-// Tile size for shared memory aggregation
-#define TILE_SIZE 8
-
-// Shared memory buffer for accumulating radiation within a tile
-shared float radiationTile[TILE_SIZE][TILE_SIZE][TILE_SIZE];
-
-layout(local_size_x = 8, local_size_y = 8, local_size_z = 1) in;
+layout(local_size_x = 16, local_size_y = 16, local_size_z = 1) in;
 void main() {
-    // Get global work group info
-    ivec3 tileStart = ivec3(
-        gl_WorkGroupID.x * TILE_SIZE,
-        gl_WorkGroupID.y * TILE_SIZE,
-        gl_WorkGroupID.z * TILE_SIZE
-    );
-    
-    // Initialize shared memory for this workgroup
-    if (gl_LocalInvocationID.z == 0) {
-		for (int z = 0; z < TILE_SIZE; z++) {
-			radiationTile[int(gl_LocalInvocationID.x)][int(gl_LocalInvocationID.y)][z] = 0.0;
-		}
-	}
-    barrier();
-    
-    // Only process point 0 for simplicity and performance
-    if (splats.length() == 0) return;
-    RadiationPoint rp = splats[0];
-    
-    // Calculate point position in voxel coordinates
+    uint gid = gl_GlobalInvocationID.x
+             + gl_GlobalInvocationID.y * gl_NumWorkGroups.x * gl_WorkGroupSize.x;
+
+    if(gid >= splats.length()) return;
+
+    RadiationPoint rp = splats[gid];
+    if(rp.radius <= 0.0) return;
+
     vec3 size = boxMax - boxMin;
     vec3 voxelCoordF = (rp.worldPos - boxMin) / size * vec3(dimX, dimY, dimZ);
-    ivec3 centerVoxel = ivec3(floor(voxelCoordF));
+    ivec3 center = ivec3(floor(voxelCoordF));
+
+    float maxSupport = 1.6 * rp.radius;
+    int iRad = int(ceil(maxSupport));
+    uint rng = seed + gid;
+
+    for(int dz = -iRad; dz <= iRad; dz++){
+        for(int dy = -iRad; dy <= iRad; dy++){
+            for(int dx = -iRad; dx <= iRad; dx++){
+                ivec3 samplePos = center + ivec3(dx, dy, dz);
+
+                if(samplePos.x < 0 || samplePos.x >= dimX ||
+                   samplePos.y < 0 || samplePos.y >= dimY ||
+                   samplePos.z < 0 || samplePos.z >= dimZ) {
+                   continue;
+                }
+
+                vec3 d = vec3(samplePos) - voxelCoordF;
+                vec3 nd = d / rp.radius;
+
+                // Evaluate bspline with random jitter
+                float w = bspline1D(length(nd));
+
+                float rx = (randFloat(rng)-0.5)*0.05;
+                float ry = (randFloat(rng)-0.5)*0.05;
+                float rz = (randFloat(rng)-0.5)*0.05;
+                float w2 = bspline1D(length(nd + vec3(rx, ry, rz)));
+
+                float finalW = 0.5*(w + w2);
+
+                if(finalW > 1e-5) {
+                     // Update radiation value with accumulation that emphasizes boundaries
+					float oldVal = imageLoad(radiationVol, samplePos).r;
     
-    // Calculate distance from the radiation point to this tile
-    vec3 tileCenter = vec3(tileStart) + vec3(TILE_SIZE/2);
-    float tileDist = distance(tileCenter, voxelCoordF);
+					// Calculate core vs boundary regions
+					float coreRadius = rp.radius * 0.7; // Core is 70% of total radius
+					float boundaryStart = coreRadius;
+					float boundaryEnd = rp.radius * 1.2; // Extended boundary region
     
-    // Early exit if this tile is too far from the radiation point
-    float maxEffect = rp.radius * 1.6; // Maximum distance of effect
-    if (tileDist > maxEffect + float(TILE_SIZE)) {
-        return; // Skip this tile completely
-    }
+					float dist = length(vec3(samplePos) - voxelCoordF);
+					float boundaryFactor = 1.0;
     
-    // Process voxels in this workgroup's section of the tile
-    for (int z = 0; z < TILE_SIZE; z++) {
-        // Calculate global voxel coordinates
-        ivec3 voxelPos = tileStart + ivec3(gl_LocalInvocationID.xy, z);
+					// Special treatment for boundary region
+					if (dist > boundaryStart && dist < boundaryEnd) {
+						// Enhance radiation at boundaries - create a "ridge" of radiation
+						float normalizedDist = (dist - boundaryStart) / (boundaryEnd - boundaryStart);
+						float boundaryPeak = sin(normalizedDist * 3.14159); // Peak in the middle of boundary
+						boundaryFactor = max(1.0, 1.5 * boundaryPeak); // Amplify radiation at boundary
+					}
+    
+					// Apply final radiation with boundary enhancement
+					float newVal = oldVal + finalW * boundaryFactor;
+					imageStore(radiationVol, samplePos, vec4(newVal, 0, 0, 0));
+    
+					// Get the original density
+					float originalDensity = imageLoad(volumeTex, samplePos).r;
+    
+					// Carving logic
+					if (dist < coreRadius && newVal > 0.4) {
+						// Core of radiation sphere - completely carved
+						imageStore(workingVolumeTex, samplePos, vec4(0.0, 0.0, 0.0, 0.0));
+					} 
+					else if (originalDensity > 0.1) {
+						// Boundary region - partially carved with radiation effect
+						float boundaryIntensity = 0.0;
         
-        // Skip if outside volume bounds
-        if (any(greaterThanEqual(voxelPos, ivec3(dimX, dimY, dimZ))) || 
-            any(lessThan(voxelPos, ivec3(0)))) {
-            continue;
-        }
-        
-        // Calculate distance from voxel to radiation point
-        vec3 voxelToPoint = vec3(voxelPos) - voxelCoordF;
-        vec3 nd = voxelToPoint / rp.radius;
-        float dist = length(nd);
-        
-        // Skip if too far
-        if (dist > 1.6) {
-            continue;
-        }
-        
-        // Calculate weight using b-spline
-        float w = bspline1D(nd.x) * bspline1D(nd.y) * bspline1D(nd.z);
-        
-        // Use jitter for better visual quality
-        uint jitterIdx = (voxelPos.x + voxelPos.y * 4 + voxelPos.z * 16) % 16;
-        vec3 jitter = jitterOffsets[jitterIdx] * 0.05;
-        
-        float w2 = bspline1D(nd.x + jitter.x) * bspline1D(nd.y + jitter.y) * bspline1D(nd.z + jitter.z);
-        float finalW = 0.5 * (w + w2);
-        
-        // Accumulate in shared memory if significant
-        if (finalW > 1e-4) {
-            // Map global voxel position to local tile position
-            ivec3 localPos = voxelPos - tileStart;
-            if (all(lessThan(localPos, ivec3(TILE_SIZE))) && all(greaterThanEqual(localPos, ivec3(0)))) {
-                // Since we don't have atomicAdd for floats in GLSL 430, we'll use manual addition
-                // This is safe since we ensure each thread writes to a different location
-                radiationTile[localPos.x][localPos.y][localPos.z] += finalW;
+						if (dist < boundaryEnd) {
+							// Calculate falloff for boundary
+							if (dist < coreRadius) {
+								// Inside core but not enough radiation yet
+								boundaryIntensity = min(1.0, newVal * 2.0);
+							} else {
+								// In boundary region
+								float normalizedDist = (dist - boundaryStart) / (boundaryEnd - boundaryStart);
+								boundaryIntensity = (1.0 - normalizedDist) * min(1.0, newVal * 3.0);
+							}
+            
+							// Ensure boundary voxels maintain some density while showing radiation
+							float modifiedDensity = originalDensity * (1.0 - boundaryIntensity * 0.8);
+							imageStore(workingVolumeTex, samplePos, vec4(modifiedDensity, 0.0, 0.0, 0.0));
+            
+							// Ensure radiation value is high enough to trigger visualization
+							// This is crucial - boost radiation values at boundary
+							if (boundaryIntensity > 0.1 && newVal < 0.2) {
+								imageStore(radiationVol, samplePos, vec4(max(newVal, 0.2), 0, 0, 0));
+							}
+						}
+					}
+				}
             }
-        }
-    }
-    
-    // Synchronize to ensure all threads have finished accumulating
-    barrier();
-    
-    // Now write back to global memory
-    for (int z = 0; z < TILE_SIZE; z++) {
-        // Only proceed if this thread handles valid coordinates
-        ivec3 voxelPos = tileStart + ivec3(gl_LocalInvocationID.xy, z);
-        if (any(greaterThanEqual(voxelPos, ivec3(dimX, dimY, dimZ))) || 
-            any(lessThan(voxelPos, ivec3(0)))) {
-            continue;
-        }
-        
-        // Map global voxel position to local tile position
-        ivec3 localPos = voxelPos - tileStart;
-        
-        // Only write non-zero values to reduce memory traffic
-        if (localPos.x < TILE_SIZE && localPos.y < TILE_SIZE && localPos.z < TILE_SIZE &&
-            radiationTile[localPos.x][localPos.y][localPos.z] > 0.0) {
-            float oldVal = imageLoad(radiationVol, voxelPos).r;
-            float newVal = oldVal + radiationTile[localPos.x][localPos.y][localPos.z];
-            imageStore(radiationVol, voxelPos, vec4(newVal, 0, 0, 0));
         }
     }
 }
 )COMPUTE";
 
+// Updated createComputeShader function to use the fixed shader
 void VolumeRaycastRenderer::createComputeShader() {
-    GLuint cs = glCreateShader(GL_COMPUTE_SHADER);
-    glShaderSource(cs, 1, &pointRadComputeSrc, nullptr);
-    glCompileShader(cs);
+	GLuint cs = glCreateShader(GL_COMPUTE_SHADER);
+	glShaderSource(cs, 1, &pointRadComputeSrc, nullptr);
+	glCompileShader(cs);
 
-    GLint success;
-    glGetShaderiv(cs, GL_COMPILE_STATUS, &success);
-    if (!success) {
-        char log[1024];
-        glGetShaderInfoLog(cs, 1024, nullptr, log);
-        std::cerr << "ComputeShader compile error:\n" << log << std::endl;
-        glDeleteShader(cs);
-        return;
-    }
+	GLint success;
+	glGetShaderiv(cs, GL_COMPILE_STATUS, &success);
+	if (!success) {
+		char log[1024];
+		glGetShaderInfoLog(cs, 1024, nullptr, log);
+		std::cerr << "ComputeShader compile error:\n" << log << std::endl;
+		glDeleteShader(cs);
+		return;
+	}
 
-    m_computeProg = glCreateProgram();
-    glAttachShader(m_computeProg, cs);
-    glLinkProgram(m_computeProg);
-    glDeleteShader(cs);
+	m_computeProg = glCreateProgram();
+	glAttachShader(m_computeProg, cs);
+	glLinkProgram(m_computeProg);
+	glDeleteShader(cs);
 
-    glGetProgramiv(m_computeProg, GL_LINK_STATUS, &success);
-    if (!success) {
-        char log[1024];
-        glGetProgramInfoLog(m_computeProg, 1024, nullptr, log);
-        std::cerr << "ComputeShader link error:\n" << log << std::endl;
-        glDeleteProgram(m_computeProg);
-        m_computeProg = 0;
-    }
-    checkGLError("createComputeShader");
+	glGetProgramiv(m_computeProg, GL_LINK_STATUS, &success);
+	if (!success) {
+		char log[1024];
+		glGetProgramInfoLog(m_computeProg, 1024, nullptr, log);
+		std::cerr << "ComputeShader link error:\n" << log << std::endl;
+		glDeleteProgram(m_computeProg);
+		m_computeProg = 0;
+	}
+	checkGLError("createComputeShader");
 }
 
 void VolumeRaycastRenderer::dispatchRadiationCompute() {
@@ -497,21 +488,30 @@ void VolumeRaycastRenderer::dispatchRadiationCompute() {
 
 	std::cout << "Dispatching radiation compute with " << m_splatPoints.size() << " points\n";
 
-	// Validate and limit radiation points for performance
+	// Validate radiation points
 	for (auto& pt : m_splatPoints) {
-		pt.radius = std::min(pt.radius, 6.0f); // Limit radius for performance
+		pt.radius = std::min(pt.radius, 15.0f);  // Limit radius for performance
+		glm::vec3 normalizedPos = (pt.worldPos - m_boxMin) / (m_boxMax - m_boxMin);
+		// If outside volume + margin, log warning
+		if (normalizedPos.x < -0.1f || normalizedPos.x > 1.1f ||
+			normalizedPos.y < -0.1f || normalizedPos.y > 1.1f ||
+			normalizedPos.z < -0.1f || normalizedPos.z > 1.1f) {
+			std::cout << "Warning: Radiation point outside volume: "
+				<< pt.worldPos.x << ", " << pt.worldPos.y << ", " << pt.worldPos.z << std::endl;
+		}
 	}
 
 	// Create SSBO for the radiation points
 	GLuint ssbo = 0;
 	glGenBuffers(1, &ssbo);
 	glBindBuffer(GL_SHADER_STORAGE_BUFFER, ssbo);
+	glBufferData(GL_SHADER_STORAGE_BUFFER, sizeof(RadiationPoint) * m_splatPoints.size(),
+		m_splatPoints.data(), GL_STATIC_DRAW);
+	glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 0, ssbo);
 
-	// Process radiation points in small batches for better performance
-	const int BATCH_SIZE = 4; // Process just a few points at once
-
-	// Set up general uniforms that don't change per batch
 	glUseProgram(m_computeProg);
+
+	// Set uniforms
 	glUniform3fv(glGetUniformLocation(m_computeProg, "boxMin"), 1, glm::value_ptr(m_boxMin));
 	glUniform3fv(glGetUniformLocation(m_computeProg, "boxMax"), 1, glm::value_ptr(m_boxMax));
 	glUniform1i(glGetUniformLocation(m_computeProg, "dimX"), m_dimX);
@@ -519,100 +519,45 @@ void VolumeRaycastRenderer::dispatchRadiationCompute() {
 	glUniform1i(glGetUniformLocation(m_computeProg, "dimZ"), m_dimZ);
 	glUniform1ui(glGetUniformLocation(m_computeProg, "seed"), 12345u);
 
-	// Bind images
+	// Bind images - make sure we're using the original volume texture and working texture properly
 	glBindImageTexture(1, m_radiationTex, 0, GL_TRUE, 0, GL_READ_WRITE, GL_R32F);
 	glBindImageTexture(2, m_volumeTex, 0, GL_TRUE, 0, GL_READ_ONLY, GL_R32F);
 
-	// Track the total number of tiles processed
-	int totalTilesProcessed = 0;
+	// Ensure working volume texture is also bound for writing
+	if (m_workingVolumeTex) {
+		glBindImageTexture(3, m_workingVolumeTex, 0, GL_TRUE, 0, GL_READ_WRITE, GL_R32F);
+	}
 
-	// Process in batches to smooth performance and avoid long GPU stalls
-	for (size_t startIdx = 0; startIdx < m_splatPoints.size(); startIdx += BATCH_SIZE) {
-		size_t endIdx = std::min(startIdx + BATCH_SIZE, m_splatPoints.size());
-		size_t batchSize = endIdx - startIdx;
+	// Critical fix: Calculate batch sizes and process in small batches for smoother performance
+	const GLuint localSizeX = 16;
+	const GLuint localSizeY = 16;
+	GLuint wgSize = localSizeX * localSizeY;
+	GLuint totalPoints = static_cast<GLuint>(m_splatPoints.size());
+	GLuint numGroups = (totalPoints + wgSize - 1) / wgSize;
 
-		std::cout << "  Processing batch " << (startIdx / BATCH_SIZE + 1)
-			<< " with " << batchSize << " points\n";
+	// Process in smaller batches for smoother performance
+	const GLuint batchSize = 4;  // Process just a few points at once
+	for (GLuint batch = 0; batch < numGroups; batch += batchSize) {
+		GLuint currentBatchSize = std::min(batchSize, numGroups - batch);
 
-		// Update SSBO with just this batch of points
-		std::vector<RadiationPoint> batch(m_splatPoints.begin() + startIdx,
-			m_splatPoints.begin() + endIdx);
+		std::cout << "Processing batch " << batch / batchSize + 1
+			<< " of " << (numGroups + batchSize - 1) / batchSize << "\n";
 
-		// Update buffer with just this batch (more efficient than full data)
-		glBufferData(GL_SHADER_STORAGE_BUFFER, sizeof(RadiationPoint) * batch.size(),
-			batch.data(), GL_STATIC_DRAW);
-		glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 0, ssbo);
+		glDispatchCompute(currentBatchSize, 1, 1);
 
-		// For each point in this batch, process only the affected tiles
-		for (size_t batchIdx = 0; batchIdx < batch.size(); batchIdx++) {
-			const RadiationPoint& point = batch[batchIdx];
-
-			// Calculate voxel position of the radiation point
-			glm::vec3 normPos = (point.worldPos - m_boxMin) / (m_boxMax - m_boxMin);
-			glm::ivec3 voxelPos = glm::ivec3(normPos * glm::vec3(m_dimX, m_dimY, m_dimZ));
-
-			// Calculate effective radius in voxels
-			int radiusVoxels = std::min(int(point.radius * 1.6), 12);
-
-			// Calculate the tile range to cover this radius
-			int tileRadius = (radiusVoxels + 7) / 8 + 1; // Round up to whole tiles
-
-			// Calculate tile start and end with bounds checking
-			int minTileX = std::max(0, voxelPos.x / 8 - tileRadius);
-			int maxTileX = std::min(m_dimX / 8, voxelPos.x / 8 + tileRadius);
-			int minTileY = std::max(0, voxelPos.y / 8 - tileRadius);
-			int maxTileY = std::min(m_dimY / 8, voxelPos.y / 8 + tileRadius);
-			int minTileZ = std::max(0, voxelPos.z / 8 - tileRadius);
-			int maxTileZ = std::min(m_dimZ / 8, voxelPos.z / 8 + tileRadius);
-
-			// Calculate number of tiles to process
-			int numTilesX = maxTileX - minTileX + 1;
-			int numTilesY = maxTileY - minTileY + 1;
-			int numTilesZ = maxTileZ - minTileZ + 1;
-			int tilesToProcess = numTilesX * numTilesY * numTilesZ;
-
-			totalTilesProcessed += tilesToProcess;
-
-			// If there are a lot of tiles for this point, process them in smaller sub-batches
-			const int TILES_PER_DISPATCH = 32; // Process up to 32 tiles at once
-
-			// Set point-specific uniform if needed
-			// For example, if your shader can handle point index:
-			glUniform1i(glGetUniformLocation(m_computeProg, "currentPointIndex"), batchIdx);
-
-			// Process Z slices in smaller chunks
-			for (int z = minTileZ; z <= maxTileZ; z += TILES_PER_DISPATCH / (numTilesX * numTilesY)) {
-				int zEnd = std::min(maxTileZ + 1, z + TILES_PER_DISPATCH / (numTilesX * numTilesY));
-				int zCount = zEnd - z;
-
-				// Set the workgroup offset for this dispatch
-				glUniform3i(glGetUniformLocation(m_computeProg, "tileOffset"),
-					minTileX, minTileY, z);
-
-				// Dispatch compute for this subset of tiles
-				glDispatchCompute(numTilesX, numTilesY, zCount);
-
-				// Add memory barrier between batches
-				glMemoryBarrier(GL_SHADER_IMAGE_ACCESS_BARRIER_BIT);
-
-				// Optional: For smoother rendering during long operations,
-				// periodically flush the command buffer to allow the GPU
-				// to start processing while we continue queueing more work
-				if (tilesToProcess > 100) {
-					glFlush(); // Don't wait, just send commands to GPU
-				}
-			}
-
-			// For very large operations, add a synchronization point 
-			// to avoid excessive command buffer buildup
-			if (tilesToProcess > 500) {
-				glFinish(); // Wait for the GPU to complete
-			}
-		}
+		// Add memory barrier between batches
+		glMemoryBarrier(GL_SHADER_IMAGE_ACCESS_BARRIER_BIT);
 	}
 
 	// Final barrier
 	glMemoryBarrier(GL_SHADER_IMAGE_ACCESS_BARRIER_BIT | GL_TEXTURE_FETCH_BARRIER_BIT);
+
+	// Also update the working volume texture from the main volume texture
+	if (m_volumeTex && m_workingVolumeTex) {
+		glCopyImageSubData(m_volumeTex, GL_TEXTURE_3D, 0, 0, 0, 0,
+			m_workingVolumeTex, GL_TEXTURE_3D, 0, 0, 0, 0,
+			m_dimX, m_dimY, m_dimZ);
+	}
 
 	// Clean up
 	glBindBuffer(GL_SHADER_STORAGE_BUFFER, 0);
@@ -620,14 +565,53 @@ void VolumeRaycastRenderer::dispatchRadiationCompute() {
 
 	checkGLError("dispatchRadiationCompute");
 
-	std::cout << "Radiation compute complete. Processed " << totalTilesProcessed
-		<< " total tiles for " << m_splatPoints.size() << " points\n";
-
 	// Force re-run precompute for updated radiation
 	m_precomputeNeeded = true;
+}
 
-	// Clear the splat points to prevent accumulation
-	m_splatPoints.clear();
+
+void VolumeRaycastRenderer::createWorkingVolumeTexture(const VoxelGrid& grid) {
+	// Create a copy of the volume texture for working operations
+	glGenTextures(1, &m_workingVolumeTex);
+	glBindTexture(GL_TEXTURE_3D, m_workingVolumeTex);
+
+	// Use the same parameters as the main volume texture
+	glTexParameteri(GL_TEXTURE_3D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+	glTexParameteri(GL_TEXTURE_3D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+	glTexParameteri(GL_TEXTURE_3D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+	glTexParameteri(GL_TEXTURE_3D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+	glTexParameteri(GL_TEXTURE_3D, GL_TEXTURE_WRAP_R, GL_CLAMP_TO_EDGE);
+
+	// Allocate storage and copy data from volume texture
+	std::vector<float> volumeData(m_dimX * m_dimY * m_dimZ);
+	for (int z = 0; z < m_dimZ; z++) {
+		for (int y = 0; y < m_dimY; y++) {
+			for (int x = 0; x < m_dimX; x++) {
+				int idx = x + y * m_dimX + z * (m_dimX * m_dimY);
+				volumeData[idx] = (grid.data[idx] == VoxelState::FILLED) ? 1.0f : 0.0f;
+			}
+		}
+	}
+
+	// Upload data
+	glTexImage3D(GL_TEXTURE_3D, 0, GL_R32F, m_dimX, m_dimY, m_dimZ,
+		0, GL_RED, GL_FLOAT, volumeData.data());
+
+	glBindTexture(GL_TEXTURE_3D, 0);
+	checkGLError("createWorkingVolumeTexture");
+}
+
+void VolumeRaycastRenderer::updateSplatPoints(const std::vector<RadiationPoint>& pts) {
+	// Save the new radiation points
+	m_splatPoints.insert(m_splatPoints.end(), pts.begin(), pts.end());
+
+	// Ensure the working texture is available for radiation computation
+	if (m_workingVolumeTex == 0 && m_volumeTex != 0) {
+		// If working texture doesn't exist but volume texture does, create a copy
+		if (m_gridPtr) {
+			createWorkingVolumeTexture(*m_gridPtr);
+		}
+	}
 }
 
 static const char* precomputeShaderSrc = R"COMPUTE(
@@ -1060,7 +1044,6 @@ void VolumeRaycastRenderer::bindRaycastUniforms(float aspect) {
 	GLint uUseMipMappedSkipping = glGetUniformLocation(m_raycastProg, "useMipMappedSkipping");
 	glUniform1i(uUseMipMappedSkipping, m_useMipMappedSkipping ? 1 : 0);
 
-
     checkGLError("bindRaycastUniforms");
 }
 
@@ -1170,7 +1153,7 @@ void VolumeRaycastRenderer::createMipMappedVolumeTexture(const VoxelGrid& grid) 
 	}
 
 	// Upload volume data
-	glTexImage3D(GL_TEXTURE_3D, 0, GL_R8, m_dimX, m_dimY, m_dimZ, 0, GL_RED, GL_FLOAT, volumeData.data());
+	glTexImage3D(GL_TEXTURE_3D, 0, GL_R32F, m_dimX, m_dimY, m_dimZ, 0, GL_RED, GL_FLOAT, volumeData.data());
 
 	// Generate MIP maps
 	glGenerateMipmap(GL_TEXTURE_3D);
@@ -1194,7 +1177,7 @@ void VolumeRaycastRenderer::createMipMappedVolumeTexture(const VoxelGrid& grid) 
 	glTexParameteri(GL_TEXTURE_3D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
 	glTexParameteri(GL_TEXTURE_3D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
 	glTexParameteri(GL_TEXTURE_3D, GL_TEXTURE_WRAP_R, GL_CLAMP_TO_EDGE);
-	glTexImage3D(GL_TEXTURE_3D, 0, GL_R8, m_dimX, m_dimY, m_dimZ, 0, GL_RED, GL_FLOAT, volumeData.data());
+	glTexImage3D(GL_TEXTURE_3D, 0, GL_R32F, m_dimX, m_dimY, m_dimZ, 0, GL_RED, GL_FLOAT, volumeData.data());
 	glGenerateMipmap(GL_TEXTURE_3D);
 }
 
@@ -1343,6 +1326,12 @@ void VolumeRaycastRenderer::init(const VoxelGrid& grid) {
 	m_frustumMargin = 20.0f;
 	m_timeValue = 0.0f;
 
+	// 1) Create volume texture from voxel data
+	createVolumeTexture(grid);
+
+	// 1.5) Create working volume texture (critical fix)
+	createWorkingVolumeTexture(grid);
+
 	// Use MIP-mapped texture creation
 	createMipMappedVolumeTexture(grid);
 
@@ -1408,11 +1397,15 @@ void VolumeRaycastRenderer::updateFrustumCulling(float aspect) {
 		}
 	}
 
-	// Update volume texture based on grid visibility - clear boundary more aggressively
-	glBindTexture(GL_TEXTURE_3D, m_workingVolumeTex);
+	// Create a CPU buffer to hold the updated volume
 	std::vector<float> modifiedVolume(m_dimX * m_dimY * m_dimZ, 0.0f);
 
-	// Copy only visible regions
+	// First, read the current data from m_volumeTex (which has the radiation carving)
+	// This makes sure we preserve the carving when regenerating the working texture
+	glBindTexture(GL_TEXTURE_3D, m_volumeTex);
+	glGetTexImage(GL_TEXTURE_3D, 0, GL_RED, GL_FLOAT, modifiedVolume.data());
+
+	// Now apply frustum culling on top of that
 	for (int z = 0; z < m_dimZ; z++) {
 		for (int y = 0; y < m_dimY; y++) {
 			for (int x = 0; x < m_dimX; x++) {
@@ -1420,10 +1413,11 @@ void VolumeRaycastRenderer::updateFrustumCulling(float aspect) {
 				int gridIdx = (x / cellSize) + (y / cellSize) * (m_dimX / cellSize + 1) +
 					(z / cellSize) * (m_dimX / cellSize + 1) * (m_dimY / cellSize + 1);
 
-				if (visibilityGrid[gridIdx]) {
-					bool isFilled = m_gridPtr->data[voxelIdx] == VoxelState::FILLED;
-					modifiedVolume[voxelIdx] = isFilled ? 1.0f : 0.0f;
+				// If this cell is not visible, set to 0 regardless of its current state
+				if (!visibilityGrid[gridIdx]) {
+					modifiedVolume[voxelIdx] = 0.0f;
 				}
+				// If cell is visible, we keep its current value from m_volumeTex (carved or not)
 			}
 		}
 	}
@@ -1473,18 +1467,53 @@ void VolumeRaycastRenderer::updateFrustumCulling(float aspect) {
 		}
 	}
 
-	// Update texture with new visibility
+	// Update texture with new visibility, preserving the radiation carving effects
+	glBindTexture(GL_TEXTURE_3D, m_workingVolumeTex);
 	glTexSubImage3D(GL_TEXTURE_3D, 0, 0, 0, 0, m_dimX, m_dimY, m_dimZ,
 		GL_RED, GL_FLOAT, modifiedVolume.data());
 
+	// Reset texture parameters
+	glTexParameteri(GL_TEXTURE_3D, GL_TEXTURE_MIN_FILTER, GL_LINEAR_MIPMAP_LINEAR);
+	glTexParameteri(GL_TEXTURE_3D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+	glTexParameteri(GL_TEXTURE_3D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+	glTexParameteri(GL_TEXTURE_3D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+	glTexParameteri(GL_TEXTURE_3D, GL_TEXTURE_WRAP_R, GL_CLAMP_TO_EDGE);
+
+	// Regenerate mipmaps
+	glGenerateMipmap(GL_TEXTURE_3D);
+
+	// Apply anisotropic filtering if supported
+	GLfloat maxAniso = 0.0f;
+	glGetFloatv(GL_MAX_TEXTURE_MAX_ANISOTROPY_EXT, &maxAniso);
+	if (maxAniso > 0.0f) {
+		glTexParameterf(GL_TEXTURE_3D, GL_TEXTURE_MAX_ANISOTROPY_EXT, std::min(4.0f, maxAniso));
+	}
+
+	glBindTexture(GL_TEXTURE_3D, 0);
+
+	// Enhanced debugging output
+	size_t visibleVoxels = 0;
+	for (const auto& val : modifiedVolume) {
+		if (val > 0.0f) visibleVoxels++;
+	}
+
+	std::cout << "Working volume: " << visibleVoxels << " of " << m_dimX * m_dimY * m_dimZ
+		<< " voxels visible (" << (100.0f * visibleVoxels / (m_dimX * m_dimY * m_dimZ)) << "%)\n";
+
+	// Update counters and flags
 	m_updateFrustumRequested = false;
 }
-
 
 void VolumeRaycastRenderer::updateWorkingVolumeWithVisibility() {
 	if (!m_volumeTex || !m_workingVolumeTex || !m_gridPtr) return;
 
-	// Create a CPU buffer of zeros
+	// Read the current volume texture data which has the carved areas
+	std::vector<float> volumeData(m_dimX * m_dimY * m_dimZ, 0.0f);
+	glBindTexture(GL_TEXTURE_3D, m_volumeTex);
+	glGetTexImage(GL_TEXTURE_3D, 0, GL_RED, GL_FLOAT, volumeData.data());
+	glBindTexture(GL_TEXTURE_3D, 0);
+
+	// Create a CPU buffer for the working data
 	std::vector<float> workingData(m_dimX * m_dimY * m_dimZ, 0.0f);
 
 	// Track voxel counting details for debugging
@@ -1504,7 +1533,7 @@ void VolumeRaycastRenderer::updateWorkingVolumeWithVisibility() {
 		bool isVisible = pair.second;
 
 		if (isVisible && node) {
-			// IMPORTANT: Check if the node is leaf AND solid before filling voxels
+			// Check if the node is leaf AND solid before filling voxels
 			if (node->isLeaf && node->isSolid) {
 				// Bounds of this node in voxel coordinates
 				int startX = std::max(0, node->x);
@@ -1514,16 +1543,20 @@ void VolumeRaycastRenderer::updateWorkingVolumeWithVisibility() {
 				int endY = std::min(m_dimY, node->y + node->size);
 				int endZ = std::min(m_dimZ, node->z + node->size);
 
-				// For each voxel in this node, copy the original volume data
+				// For each voxel in this node
 				for (int z = startZ; z < endZ; z++) {
 					for (int y = startY; y < endY; y++) {
 						for (int x = startX; x < endX; x++) {
 							int idx = x + y * m_dimX + z * (m_dimX * m_dimY);
 							if (idx >= 0 && idx < workingData.size() &&
-								idx < m_gridPtr->data.size() &&
-								m_gridPtr->data[idx] == VoxelState::FILLED) {
-								workingData[idx] = 1.0f;  // Solid voxel (visible)
-								visibleFilledVoxels++;
+								idx < m_gridPtr->data.size()) {
+								// Use the value from volumeData which includes the carving
+								workingData[idx] = volumeData[idx];
+
+								// Count only actual filled voxels for statistics
+								if (volumeData[idx] > 0.0f) {
+									visibleFilledVoxels++;
+								}
 							}
 						}
 					}
@@ -1538,7 +1571,7 @@ void VolumeRaycastRenderer::updateWorkingVolumeWithVisibility() {
 		}
 	}
 
-	// IMPORTANT: Use glTexImage3D to completely replace the texture
+	// Use glTexImage3D to completely replace the texture
 	glBindTexture(GL_TEXTURE_3D, m_workingVolumeTex);
 	glTexImage3D(GL_TEXTURE_3D, 0, GL_R32F, m_dimX, m_dimY, m_dimZ,
 		0, GL_RED, GL_FLOAT, workingData.data());
@@ -1578,7 +1611,6 @@ void VolumeRaycastRenderer::updateWorkingVolumeWithVisibility() {
 	// Verify texture upload
 	std::cout << "Texture dimensions: " << m_dimX << "x" << m_dimY << "x" << m_dimZ << std::endl;
 }
-
 
 void VolumeRaycastRenderer::drawRaycast(float aspect) {
 	if (!m_raycastProg) return;

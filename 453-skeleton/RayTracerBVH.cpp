@@ -249,7 +249,7 @@ bool intersectAABB(vec3 rayOrigin, vec3 rayDir, vec3 bmin, vec3 bmax,
     return (tNear <= tFar && tFar > 0.0);
 }
 
-// Modified to collect all volume intervals, not just the closest hit
+// collect all volume intervals, not just the closest hit
 void intersectOctreeForVolume(vec3 rayOrigin, vec3 rayDir, 
                             out float closestT, 
                             out vec3 outNormal,
@@ -530,7 +530,7 @@ RayTracerBVH::RayTracerBVH()
 	m_nodeSSBO(0),
 	m_numNodes(0),
 	m_frustumCullingEnabled(true),
-	m_enableVolumeMeasurement(true),
+	m_enableVolumeMeasurement(false),
 	m_measuredVolume(0.0f),
 	m_volumeSSBO(0)
 {

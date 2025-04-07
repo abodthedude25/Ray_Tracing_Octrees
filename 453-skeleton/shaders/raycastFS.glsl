@@ -270,7 +270,6 @@ float calculateShadow(vec3 pos, vec3 lightDir) {
     return max(shadow, 0.2);
 }
 
-// Modified shading function with enhanced building separation
 vec3 calculateShading(vec3 pos, vec3 normal, vec3 rayDir, float edgeFactor) {
     // Get building color with boundary enhancement
     vec3 baseColor = getBuildingColor(pos, normal);
@@ -762,22 +761,32 @@ vec4 traceRay(vec2 coord) {
         // Apply subtle dithering to density value to break up banding
         den += (pixelNoise - 0.5) * 0.01; // Reduced dithering magnitude
         
-        // Adaptive step for radiation
-        if (radVal > 0.05) {
-            emptySpaceCounter += 1.0;
-            
-            // Use varying step size based on position and ray direction
-            float variableStep = baseStep * mix(1.0, 4.0, min(1.0, emptySpaceCounter / 15.0));
-            
-            // Add ray-angle dependent jitter to break horizontal patterns
-            variableStep *= 1.0 + 0.1 * sin(dot(rayDir, vec3(1.0, 3.0, 2.0)) * 10.0 + timeValue);
-            
-            T += variableStep * mix(1.0, 1.5, radVal);
-            wasEmpty = true;
-            detailRegionCounter = 0.0;
-            continue;
-        }
-        
+        // If the building density is near zero (carved-out) but radiation is high,
+		// then we are at the boundary of a removal. In that case, blend in a red tint.
+		if (den < 0.1 && radVal > 0.01) {
+			// REPLACE with this enhanced version:
+			vec3 boundaryColor = vec3(1.0, 0.2, 0.0); // Brighter red-orange
+			float glowStrength = min(1.0, radVal * 10.0); // Increased from 5.0 to 10.0 for stronger effect
+    
+			// Create pulsing effect
+			float pulseEffect = 0.8 + 0.2 * sin(timeValue * 4.0 + gl_FragCoord.x * 0.01 + gl_FragCoord.y * 0.01);
+			boundaryColor *= pulseEffect;
+    
+			// Apply a stronger glowing effect to the carved areas
+			accumColor = mix(accumColor, boundaryColor, glowStrength * 0.9); // Increased from 0.7 to 0.9
+			accumAlpha = max(accumAlpha, min(0.98, radVal * 1.5 + 0.5)); // Made more visible
+    
+			// Add a subtle bloom effect for the glow
+			if (radVal > 0.3) {
+				// For high radiation values, add additional glow
+				accumColor += boundaryColor * 0.2 * pulseEffect;
+			}
+    
+			// Take smaller steps around radiation areas for better detail
+			T += baseStep * 0.3; // Even smaller steps (from 0.5 to 0.3) for higher detail
+			continue;
+		}
+
         // If the voxel is empty, take a larger step
         if (den < 0.01) {
             emptySpaceCounter += 1.0;

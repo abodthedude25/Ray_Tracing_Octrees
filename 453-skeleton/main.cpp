@@ -206,6 +206,7 @@ std::vector<MCTriangle> renderOctree(
 
 	return result;
 }
+
 static bool intersectBuildingVoxel(
 	const Camera& cam,
 	float screenX, float screenY,
@@ -256,78 +257,134 @@ static bool intersectBuildingVoxel(
 	}
 
 	// 4) More precise ray marching to find first building voxel
-	float stepSize = grid.voxelSize * 0.5f; // Smaller step size for accuracy
+	// Use a much smaller step size for greater accuracy
+	float stepSize = grid.voxelSize * 0.2f; // Smaller step for better accuracy
 	float T = tNear; // Start at the box entry point
 
-	// Calculate voxel dimensions in world units
-	glm::vec3 voxelSize = (boxMax - boxMin) / glm::vec3(grid.dimX, grid.dimY, grid.dimZ);
+	// Store the position of the last empty voxel before hitting a filled one
+	glm::vec3 lastEmptyPos = rayOrigin + rayDir * tNear;
 
-	for (int i = 0; i < 8000; i++) { // Increased max iterations for precision
-		if (T > tFar) break;
+	// Find highest building point along ray
+	struct Hit {
+		float yPos;        // Y position in world space (height)
+		glm::vec3 pos;     // Position in world space
+		glm::vec3 lastEmpty; // Last empty position before this hit
+		float den;         // Density value at hit
+		int vx, vy, vz;    // Voxel indices
+	};
 
-		// Current position along ray
-		glm::vec3 posWorld = rayOrigin + rayDir * T;
+	// Store multiple hits along the ray to find the best one
+	std::vector<Hit> hits;
 
-		// Convert to normalized volume coordinates [0,1]
-		glm::vec3 uvw = (posWorld - boxMin) / (boxMax - boxMin);
+	// Add some wiggle to the ray direction to avoid missing thin features
+	const int numRays = 1; // Primary ray
+	const float wiggleAmount = 0.02f; // Small wiggle amount
 
-		// Check if within volume bounds
-		if (uvw.x < 0.0f || uvw.x >= 1.0f ||
-			uvw.y < 0.0f || uvw.y >= 1.0f ||
-			uvw.z < 0.0f || uvw.z >= 1.0f)
-		{
-			T += stepSize;
-			continue;
+	// Storage for random vectors
+	std::vector<glm::vec3> wiggleVecs;
+	wiggleVecs.push_back(glm::vec3(0.0f)); // First is no wiggle (primary ray)
+
+	// Create random unit vectors for ray wiggling
+	for (int i = 1; i < numRays; i++) {
+		float angle = (float)i / numRays * 6.28f;
+		wiggleVecs.push_back(glm::vec3(
+			std::cos(angle) * wiggleAmount,
+			std::sin(angle) * wiggleAmount,
+			wiggleAmount
+		));
+	}
+
+	// Ray march for each wiggled ray
+	for (int rayIdx = 0; rayIdx < numRays; rayIdx++) {
+		// Apply wiggle to ray direction
+		glm::vec3 wiggleDir = rayDir;
+		if (rayIdx > 0) {
+			wiggleDir = glm::normalize(rayDir + wiggleVecs[rayIdx]);
 		}
 
-		// Convert to voxel indices
-		int vx = int(uvw.x * grid.dimX);
-		int vy = int(uvw.y * grid.dimY);
-		int vz = int(uvw.z * grid.dimZ);
-
-		// Clamp to valid indices (should be redundant with previous check)
-		vx = std::max(0, std::min(vx, grid.dimX - 1));
-		vy = std::max(0, std::min(vy, grid.dimY - 1));
-		vz = std::max(0, std::min(vz, grid.dimZ - 1));
-
-		// Look up voxel state
-		int idx = vx + vy * grid.dimX + vz * (grid.dimX * grid.dimY);
-
-		if (idx >= 0 && idx < grid.data.size() && grid.data[idx] == VoxelState::FILLED) {
-			// Found a filled voxel - adjust position to be exactly at the voxel surface
-
-			// Calculate the position slightly before the hit point to place the radiation
-			// point just at the surface rather than inside the voxel
-			outPosWorld = posWorld - rayDir * (stepSize * 0.1f);
-
-			return true;
-		}
-
-		// Adaptive step size - smaller near potential surfaces
-		// Check neighbors to see if we're approaching a surface
+		float rayT = tNear;
+		glm::vec3 rayLastEmpty = rayOrigin + wiggleDir * tNear;
 		bool nearSurface = false;
-		for (int dz = -1; dz <= 1 && !nearSurface; dz++) {
-			for (int dy = -1; dy <= 1 && !nearSurface; dy++) {
-				for (int dx = -1; dx <= 1 && !nearSurface; dx++) {
-					int nx = vx + dx;
-					int ny = vy + dy;
-					int nz = vz + dz;
 
-					if (nx >= 0 && nx < grid.dimX &&
-						ny >= 0 && ny < grid.dimY &&
-						nz >= 0 && nz < grid.dimZ)
-					{
-						int nidx = nx + ny * grid.dimX + nz * (grid.dimX * grid.dimY);
-						if (nidx >= 0 && nidx < grid.data.size() && grid.data[nidx] == VoxelState::FILLED) {
-							nearSurface = true;
-						}
-					}
+		for (int i = 0; i < 10000; i++) { // Many iterations for precision
+			if (rayT > tFar) break;
+
+			// Current position along ray
+			glm::vec3 posWorld = rayOrigin + wiggleDir * rayT;
+
+			// Convert to normalized volume coordinates [0,1]
+			glm::vec3 uvw = (posWorld - boxMin) / (boxMax - boxMin);
+
+			// Check if within volume bounds
+			if (uvw.x < 0.0f || uvw.x >= 1.0f ||
+				uvw.y < 0.0f || uvw.y >= 1.0f ||
+				uvw.z < 0.0f || uvw.z >= 1.0f)
+			{
+				rayT += stepSize;
+				continue;
+			}
+
+			// Convert to voxel indices
+			int vx = int(uvw.x * grid.dimX);
+			int vy = int(uvw.y * grid.dimY);
+			int vz = int(uvw.z * grid.dimZ);
+
+			// Clamp to valid indices
+			vx = std::max(0, std::min(vx, grid.dimX - 1));
+			vy = std::max(0, std::min(vy, grid.dimY - 1));
+			vz = std::max(0, std::min(vz, grid.dimZ - 1));
+
+			// Look up voxel state
+			int idx = vx + vy * grid.dimX + vz * (grid.dimX * grid.dimY);
+
+			if (idx >= 0 && idx < grid.data.size() && grid.data[idx] == VoxelState::FILLED) {
+				// Found a filled voxel - store it
+				Hit hit;
+				hit.yPos = posWorld.y;
+				hit.pos = posWorld;
+				hit.lastEmpty = rayLastEmpty;
+				hit.den = 1.0f; // Filled voxel
+				hit.vx = vx;
+				hit.vy = vy;
+				hit.vz = vz;
+
+				hits.push_back(hit);
+
+				// Smaller steps near surfaces for better precision
+				stepSize = grid.voxelSize * 0.1f;
+				nearSurface = true;
+			}
+			else {
+				// This is an empty voxel, remember it
+				rayLastEmpty = posWorld;
+
+				// Use regular step size in empty space
+				if (!nearSurface) {
+					stepSize = grid.voxelSize * 0.25f;
 				}
 			}
-		}
 
-		// Adaptive step size - use smaller steps near surfaces
-		T += nearSurface ? stepSize * 0.25f : stepSize;
+			// Advance along the ray
+			rayT += stepSize;
+		}
+	}
+
+	// Find the best hit point (highest Y position or nearest to camera)
+	if (!hits.empty()) {
+		// Sort hits by Y position (highest first)
+		std::sort(hits.begin(), hits.end(), [](const Hit& a, const Hit& b) {
+			return a.yPos > b.yPos;
+			});
+
+		// Get the highest hit
+		const Hit& bestHit = hits[0];
+
+		// Position slightly outside the surface for better carving
+		outPosWorld = bestHit.lastEmpty + (bestHit.pos - bestHit.lastEmpty) * 0.2f;
+
+		std::cout << "Found highest filled voxel at Y=" << bestHit.yPos
+			<< " (voxel: " << bestHit.vx << "," << bestHit.vy << "," << bestHit.vz << ")\n";
+		return true;
 	}
 
 	return false; // No building voxel found along the ray
@@ -618,6 +675,13 @@ struct Assignment4 : public CallbackInterface {
 					updateFrustumRequested = true;
 				}
 			}
+			else if (key == GLFW_KEY_V && currentMode == RenderMode::BVHRayTrace) {
+				if (raytracerRendererPtr) {
+					bool newState = !raytracerRendererPtr->isVolumeMeasurementEnabled();
+					raytracerRendererPtr->enableVolumeMeasurement(newState);
+					std::cout << "Volume measurement " << (newState ? "enabled" : "disabled") << std::endl;
+				}
+			}
 		}
 	}
 
@@ -642,9 +706,7 @@ struct Assignment4 : public CallbackInterface {
 		}
 		if (button == GLFW_MOUSE_BUTTON_LEFT) {
 			leftMouseDown = (action == GLFW_PRESS);
-
 			if (action == GLFW_PRESS && currentMode == RenderMode::VolumeRaycast) {
-				// Let's do a carve or paint operation:
 				// 1) Raycast to find building voxel
 				if (raycastRendererPtr) {
 					// call our helper
@@ -662,28 +724,22 @@ struct Assignment4 : public CallbackInterface {
 					);
 					// print the value of intersectBuildingVoxel
 					std::cout << "intersectBuildingVoxel: " << foundVoxel << std::endl;
-
 					if (foundVoxel) {
 						std::cout << "Carve at (" << hitPos.x << ", "
 							<< hitPos.y << ", " << hitPos.z << ")\n";
-
 						try {
 							std::cout << "Step 1: Creating RadiationPoint" << std::endl;
 							RadiationPoint rp;
 							rp.worldPos = hitPos;
-							rp.radius = 0.5f; // Even smaller radius for testing
+							rp.radius = 2.5f; // Even smaller radius for testing
+							std::vector<RadiationPoint> radiationPoints;
+							radiationPoints.push_back(rp);
 
-							std::cout << "Step 2: Clearing radiation volume" << std::endl;
-							//raycastRendererPtr->clearRadiationVolume();
+							std::cout << "Step 2: Adding directly to radiation points" << std::endl;
+							// Add directly to the radiation points collection
+							raycastRendererPtr->updateSplatPoints(radiationPoints);
 
-							std::cout << "Step 3: Creating vector" << std::endl;
-							std::vector<RadiationPoint> singlePoint;
-							singlePoint.push_back(rp);
-
-							std::cout << "Step 4: Updating splat points" << std::endl;
-							raycastRendererPtr->updateSplatPoints(singlePoint);
-
-							std::cout << "Step 5: Dispatching compute" << std::endl;
+							std::cout << "Step 3: Dispatching compute" << std::endl;
 							raycastRendererPtr->dispatchRadiationCompute();
 
 							std::cout << "All steps completed successfully" << std::endl;
@@ -956,6 +1012,7 @@ struct Assignment4 : public CallbackInterface {
 	GPU_Geometry gpuGeom;
 
 	VolumeRaycastRenderer* raycastRendererPtr = nullptr;  // Pointer to the volume raycast
+	RayTracerBVH* raytracerRendererPtr = nullptr;
 
 	// Possibly store a "carve radius"
 	float carveRadius = 2.0f;
@@ -1021,7 +1078,7 @@ int main() {
 
 	bool useGDB = true;
 	int dim = 256;
-	float voxelSize = 10.0f;
+	float voxelSize = 6.0f;
 	std::string cacheFilename = "sceneCache.bin";
 
 	VoxelGrid grid;
@@ -1129,7 +1186,10 @@ int main() {
 
 	// Initialize the BVH Ray tracer (GPU)
 	bvhRayTracer.setOctree(root, grid);
-	bvhRayTracer.enableVolumeMeasurement(true);
+	bvhRayTracer.enableVolumeMeasurement(true); // Enable by default
+
+	// Set the pointer in the app so it can be accessed in the key callback
+	app->raytracerRendererPtr = &bvhRayTracer;
 
 	// Wireframe for octree
 	CPU_Geometry cpuWire;

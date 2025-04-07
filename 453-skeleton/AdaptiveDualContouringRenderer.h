@@ -93,7 +93,6 @@ public:
 	std::vector<MCTriangle> createTriangles(const VoxelGrid& grid, const OctreeNode* node,
 		int x0, int y0, int z0, int size);
 	bool cellContainsSurface(const VoxelGrid& grid, int x0, int y0, int z0, int size);
-	bool isCellImportant(const VoxelGrid& grid, int x0, int y0, int z0, int size, float cellSizeWorld);
 	glm::vec3 gridToWorld(const VoxelGrid& grid, int x, int y, int z);
 	std::vector<HermitePoint> gatherHermiteData(const VoxelGrid& grid, int x0, int y0, int z0, int size);
 	glm::vec3 generateDualVertex(const std::vector<HermitePoint>& hermiteData,
