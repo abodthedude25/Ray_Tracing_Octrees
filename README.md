@@ -1,125 +1,129 @@
+# Volumetric Building Renderer
 
-# README
+This repository contains an advanced volumetric rendering system that supports multiple rendering techniques for visualizing voxel-based building data.
 
-This repository demonstrates **voxelization** of either a **test sphere** volume **or** building footprints loaded from the **City of Calgary** `.gdb` folder, and then **renders** the resulting voxel data via an **octree** and two volumetric surface extraction methods:
-1. **Marching Cubes**
-2. **Dual Contouring** (Adaptive)
+## Features
 
+- **Multiple Rendering Modes**:
+  - **Marching Cubes**: Traditional surface extraction algorithm that approximates the isosurface between filled and empty voxels with triangles.
+  - **Dual Contouring**: Advanced algorithm that produces sharper features at corners and edges compared to Marching Cubes, while typically using fewer triangles.
+  - **Voxel Blocks**: Direct visualization of the voxel grid using cube faces, showing the raw building blocks with minimal processing.
+  - **BVH Ray Tracing**: GPU-accelerated ray tracing using a Bounding Volume Hierarchy for fast intersection tests and high-quality lighting.
+  - **Volume Raycasting**: Direct volume rendering with interactive carving capabilities, using ray marching through the 3D volume with adaptive sampling.
 
-NOTE: please make sure to put your .gbd folder of the city of calgary under gdb_folder/
+- **Efficient Data Structures**:
+  - **Octree-based spatial partitioning**: Hierarchical structure that adaptively subdivides space to reduce memory usage and accelerate rendering.
+  - **GPU-optimized acceleration structures**: SSBO-based storage of scene data for parallelized GPU computation.
+  - **Frustum culling**: Skip rendering parts of the scene that aren't visible to the camera.
+  - **Edge caching**: Optimized handling of edge intersections for faster surface extraction.
 
-## 1. **Overview**
+- **Interactive Features**:
+  - **Real-time camera navigation**: Smooth orbit-style camera controls for exploring the 3D model.
+  - **Volumetric carving**: In Volume Raycast mode, interactively remove parts of the building to see inside.
+  - **Adaptive level of detail**: Automatically adjusts detail level based on distance from the camera.
+  - **Temporal coherence**: Techniques to improve frame-to-frame stability and reduce flickering.
+  - **Empty space skipping**: Accelerated rendering by quickly passing through empty regions of the volume.
 
-1. **Load or Generate** a voxel volume:
-   - **Test Sphere**  
-     The code can generate a synthetic sphere by filling a 3D volume with `VoxelState::FILLED` inside a radius, and `VoxelState::EMPTY` outside.
-   - **.GDB Building**  
-     Alternatively, the code reads a `.gdb` geodatabase containing building polygons for the City of Calgary, finds the bounding box, voxelizes them into a 3D grid, and optionally re-centers around the origin.
+- **Visual Enhancements**:
+  - **Edge detection**: Enhanced rendering of building edges and boundaries for better visual clarity.
+  - **Lighting models**: Physically-based shading with shadows and ambient occlusion.
+  - **Radiation visualization**: Glowing visualization of carved regions in Volume Raycast mode.
+  - **Building-to-building boundaries**: Visual differentiation between adjacent buildings.
 
-2. **Build Octree**  
-   A function \(`createOctreeFromVoxelGrid()`\) constructs an octree from the voxel grid by recursively subdividing until regions are uniform or the node is at minimum size.
+## Building and Running
 
-3. **Render** in **Real-Time**  
-   Depending on user input:
-   - **Marching Cubes (MC)**: Recursively extracts triangles from each leaf node in the octree to approximate the surface. 
-   - **Dual Contouring (DC)**: An alternative volumetric surface approach that can reduce polygon count or produce sharper edges.
+### Windows (Visual Studio 2022)
 
-4. **Wireframe Debug**  
-   A toggle (`S`) allows you to see the **octree wireframe** bounding each leaf node. Another toggle (`W`) sets fill vs. wireframe polygon modes for the surface mesh.
+From the root directory of the project:
 
-5. **Profiling**  
-   The code prints **FPS** and other profiling details (e.g. triangle count) once per second in the console.
-
-## 2. **Repository Layout**
-
-- **CMakeLists.txt**  
-  Root build file using [CMake](https://cmake.org/).
-- **453-skeleton/**  
-  Folder containing:
-  - **main.cpp**  
-    Entry point where you choose either test sphere or `.gdb` building. 
-    Handles toggling between MC/DC.  
-  - **BuildingLoader.cpp/.h**  
-    Code that voxelizes building footprints from `.gdb`.  
-  - **OctreeVoxel.cpp/.h**  
-    Functions to build and manage the octree, plus local MC code.  
-  - **Renderer.cpp/.h**  
-    Classes for Marching Cubes or Dual Contouring. 
-- **shaders/**  
-  GLSL vertex + fragment shaders for rendering geometry.
-- **third-party/Window**, **Camera**, etc.  
-  Utility classes for an OpenGL-based window, camera controls, etc.
-
-## 3. **Usage**
-
-1. **Clone** or download this repo.  
-2. **Install** [Vcpkg](https://github.com/microsoft/vcpkg) if you don’t already have it. You’ll also need [GDAL](https://gdal.org/) for `.gdb` support, plus the usual OpenGL libraries.
-3. **Adjust** any paths in `BuildingLoader.cpp` if needed to find `STRUCT_ID` or other fields.
-
-### A) **Choose** between Sphere or GDB
-Inside `main.cpp`, there is a toggle like:
-```cpp
-bool useGDB = true; 
-std::string gdbPath = "./textures/Buildings_3D.gdb";
-```
-- If `useGDB = false;` -> We generate a **test sphere**.
-- If `useGDB = true;`  -> We load building footprints from the `.gdb` file at `gdbPath`.
-
-### B) **Voxelizing** the Building (if `useGDB = true`)
-- `BuildingLoader.cpp` finds bounding box from building polygons.
-- A voxel array is allocated (`dimX, dimY, dimZ`).
-- Each polygon is rasterized in **XY** plane for each Z layer (if desired).  
-- The code sets `grid.data[idx] = FILLED` if inside the polygon, else `EMPTY`.
-
-### C) **Re-Center** (optional)
-If you want the building around the origin, you can re-center by calling:
-```cpp
-recenterFilledVoxels(grid);
-```
-*before* building the octree.
-
-### D) **Build Octree**
-```cpp
-OctreeNode* root = createOctreeFromVoxelGrid(grid);
-```
-This subdivides until uniform or minimum size is reached.
-
-### E) **Render** in Real-Time
-- Press **R** to toggle **Marching Cubes** vs. **Dual Contouring**.
-- Press **W** to toggle fill vs. wireframe rendering of the **surface**.
-- Press **S** to toggle **octree wireframe** bounding each leaf node.
-
-## 4. **Building the Project**
-
-From the **root** of the repository:
-
-1. **CMake Configure**  
-   ```bash
-   cmake -B build -DCMAKE_TOOLCHAIN_FILE=C:/vcpkg/scripts/buildsystems/vcpkg.cmake
+1. Configure the project:
    ```
-   Adjust the path for your local vcpkg install.
+   cmake -B build -DCMAKE_TOOLCHAIN_FILE=C:/vcpkg/scripts/buildsystems/vcpkg.cmake -DVCPKG_TARGET_TRIPLET=x64-mingw-dynamic
+   ```
 
-2. **CMake Build**  
-   ```bash
+2. Build the project:
+   ```
    cmake --build build
    ```
-   This compiles all sources and places the executable in `build/Debug/` or `build/Release`.
 
-3. **Run**  
-   ```bash
-   ./build/Debug/453-skeleton-program.exe
+3. Run the executable:
    ```
-   or on Windows:
-   ```powershell
    .\build\Debug\453-skeleton-program.exe
    ```
-   This launches the **OpenGL** window with the chosen mode (sphere or GDB).
 
-## 5. **Keyboard Controls**
+### Linux
 
-- **R** : Toggle rendering method (Marching Cubes / Dual Contouring).  
-- **W** : Toggle fill vs. wireframe polygon mode for the extracted surface.  
-- **S** : Toggle octree bounding-wire display in red.  
-- Right-drag + mouse** : Rotate camera angles (\(\theta\) and \(\phi\)).  
-- Mouse wheel** : Zoom.  
+A build script is included in the repository to handle CMake configuration issues on Linux. Simply run:
 
+```bash
+chmod +x build.sh
+./build.sh
+```
+
+After building, run the executable:
+
+```bash
+cd build
+./my-skeleton-program
+```
+
+The build script handles setting the display for X11 forwarding, modifying the target name to avoid conflicts, and configuring CMake with the appropriate options for Linux.
+
+**Note for WSL users**: An X server like VcXsrv must be installed on Windows and configured properly to display the OpenGL window.
+
+## Controls
+
+### General Controls
+- **R** - Cycle through rendering modes (Marching Cubes → Voxel Blocks → Dual Contouring → Volume Raycast → BVH Ray Trace)
+- **W** - Toggle wireframe mode for geometry
+- **S** - Toggle octree wireframe visualization
+- **F** - Force update of frustum culling
+- **G** - Toggle forced regeneration of Dual Contouring triangles
+- **C** - Center camera on building (in BVH Ray Trace mode)
+
+### Navigation
+- **Right Mouse Button + Drag** - Rotate camera view
+- **Left Mouse Button + Drag** - Pan camera
+- **Mouse Wheel** - Zoom in/out
+
+### Volume Raycasting Mode
+- **Left Mouse Button** - Carve the volume at the clicked location
+- **O** - Toggle octree-based ray skipping for improved performance
+- **M** - Toggle MIP-mapped skipping
+
+### BVH Ray Tracing Mode
+- **V** - Toggle volume measurement
+
+### Visualization
+- **Up/Down Arrow Keys** - Adjust peeling plane position
+- **X** - Toggle render mode visualization
+
+## Data Loading
+
+The application can load building data from the City of Calgary GDB format or generate a test sphere volume. The data loading option is controlled in the code.
+
+The GDB loader extracts building footprints and converts them to a 3D voxel representation automatically. For test purposes, a multi-shell sphere can be generated as an alternative dataset.
+
+## Performance Notes
+
+- **Frustum culling** is enabled by default to improve performance by skipping invisible parts of the model
+- The application uses various acceleration techniques:
+  - **Adaptive sampling**: Adjusts ray step size based on scene complexity
+  - **Multiple acceleration structures**: Octree, BVH, and distance field optimizations
+  - **GPU computation**: GLSL compute shaders for parallel processing
+  - **Ray skipping**: Multiple techniques to avoid sampling empty space
+  - **Temporal caching**: Reuses results between frames when possible
+  - **View-dependent level of detail**: Simplifies distant geometry
+
+## Troubleshooting
+
+### WSL Graphics Issues
+When running in WSL:
+1. Install VcXsrv or another X server on Windows
+2. Launch it with "Disable access control" checked
+3. Set the DISPLAY environment variable in WSL
+4. Install necessary OpenGL libraries with `sudo apt install libgl1-mesa-glx libglu1-mesa mesa-utils`
+
+### Build Issues
+- If experiencing CMake configuration errors, check if GLFW is trying to use Wayland instead of X11
+- Explicitly specify `-DGLFW_BUILD_WAYLAND=OFF -DGLFW_BUILD_X11=ON` when configuring with CMake
