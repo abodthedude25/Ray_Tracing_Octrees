@@ -208,186 +208,105 @@ std::vector<MCTriangle> renderOctree(
 }
 
 static bool intersectBuildingVoxel(
-	const Camera& cam,
-	float screenX, float screenY,
-	int windowWidth, int windowHeight,
-	const glm::vec3& boxMin,
-	const glm::vec3& boxMax,
-	const VoxelGrid& grid,
-	glm::vec3& outPosWorld,
-	float aspect
+    const Camera& cam,
+    float screenX, float screenY,
+    int windowWidth, int windowHeight,
+    const glm::vec3& boxMin,
+    const glm::vec3& boxMax,
+    const VoxelGrid& grid,
+    glm::vec3& outPosWorld,
+    float aspect
 )
 {
-	// 1) Convert screen coords -> NDC
-	float ndcX = (screenX / float(windowWidth)) * 2.f - 1.f;
-	float ndcY = 1.f - (screenY / float(windowHeight)) * 2.f;
+    // 1) Convert screen coords -> NDC
+    float ndcX = (screenX / float(windowWidth)) * 2.f - 1.f;
+    float ndcY = 1.f - (screenY / float(windowHeight)) * 2.f;
 
-	// 2) Build ray from camera through click point
-	glm::mat4 V = cam.getView();
-	glm::mat4 P = cam.getProj(aspect);
-	glm::mat4 invV = glm::inverse(V);
-	glm::mat4 invP = glm::inverse(P);
+    // 2) Build ray from camera through click point
+    glm::mat4 V = cam.getView();
+    glm::mat4 P = glm::perspective(glm::radians(45.f), aspect, 0.01f, 5000.f);
+    glm::mat4 invV = glm::inverse(V);
+    glm::mat4 invP = glm::inverse(P);
 
-	glm::vec4 clipPos(ndcX, ndcY, 1.f, 1.f);
-	glm::vec4 viewPos = invP * clipPos;
-	viewPos /= viewPos.w;
-	glm::vec4 worldPos4 = invV * viewPos;
-	glm::vec3 rayDir = glm::normalize(glm::vec3(worldPos4) - cam.getPos());
-	glm::vec3 rayOrigin = cam.getPos();
+    glm::vec4 clipPos(ndcX, ndcY, 1.f, 1.f);
+    glm::vec4 viewPos = invP * clipPos;
+    viewPos /= viewPos.w;
+    glm::vec4 worldPos4 = invV * viewPos;
+    glm::vec3 rayDir = glm::normalize(glm::vec3(worldPos4) - cam.getPos());
+    glm::vec3 rayOrigin = cam.getPos();
 
-	// 3) Intersect with volume bounding box
-	auto intersectBox = [](const glm::vec3& ro, const glm::vec3& rd,
-		const glm::vec3& bmin, const glm::vec3& bmax) -> glm::vec2
-		{
-			glm::vec3 t1 = (bmin - ro) / rd;
-			glm::vec3 t2 = (bmax - ro) / rd;
-			glm::vec3 tmin = glm::min(t1, t2);
-			glm::vec3 tmax = glm::max(t1, t2);
-			float tN = std::max(std::max(tmin.x, tmin.y), tmin.z);
-			float tF = std::min(std::min(tmax.x, tmax.y), tmax.z);
-			return glm::vec2(tN, tF);
-		};
+    // 3) Intersect with volume bounding box
+    auto intersectBox = [](const glm::vec3& ro, const glm::vec3& rd,
+        const glm::vec3& bmin, const glm::vec3& bmax) -> glm::vec2
+        {
+            glm::vec3 t1 = (bmin - ro) / rd;
+            glm::vec3 t2 = (bmax - ro) / rd;
+            glm::vec3 tmin = glm::min(t1, t2);
+            glm::vec3 tmax = glm::max(t1, t2);
+            float tN = std::max(std::max(tmin.x, tmin.y), tmin.z);
+            float tF = std::min(std::min(tmax.x, tmax.y), tmax.z);
+            return glm::vec2(tN, tF);
+        };
 
-	glm::vec2 tHit = intersectBox(rayOrigin, rayDir, boxMin, boxMax);
-	float tNear = std::max(tHit.x, 0.f);
-	float tFar = tHit.y;
+    glm::vec2 tHit = intersectBox(rayOrigin, rayDir, boxMin, boxMax);
+    float tNear = std::max(tHit.x, 0.f);
+    float tFar = tHit.y;
 
-	if (tNear > tFar) {
-		return false; // No intersection with volume bounds
-	}
+    if (tNear > tFar) {
+        return false; // No intersection with volume bounds
+    }
 
-	// 4) More precise ray marching to find first building voxel
-	// Use a much smaller step size for greater accuracy
-	float stepSize = grid.voxelSize * 0.2f; // Smaller step for better accuracy
-	float T = tNear; // Start at the box entry point
+    // 4) Simple ray marching to find first building voxel
+    float stepSize = grid.voxelSize * 0.25f; // Smaller step for better accuracy
+    float T = tNear; // Start at the box entry point
 
-	// Store the position of the last empty voxel before hitting a filled one
-	glm::vec3 lastEmptyPos = rayOrigin + rayDir * tNear;
+    for (int i = 0; i < 5000; i++) { // More iterations to ensure we hit something
+        if (T > tFar) break;
 
-	// Find highest building point along ray
-	struct Hit {
-		float yPos;        // Y position in world space (height)
-		glm::vec3 pos;     // Position in world space
-		glm::vec3 lastEmpty; // Last empty position before this hit
-		float den;         // Density value at hit
-		int vx, vy, vz;    // Voxel indices
-	};
+        // Current position along ray
+        glm::vec3 posWorld = rayOrigin + rayDir * T;
 
-	// Store multiple hits along the ray to find the best one
-	std::vector<Hit> hits;
+        // Convert to normalized volume coordinates [0,1]
+        glm::vec3 uvw = (posWorld - boxMin) / (boxMax - boxMin);
 
-	// Add some wiggle to the ray direction to avoid missing thin features
-	const int numRays = 1; // Primary ray
-	const float wiggleAmount = 0.02f; // Small wiggle amount
+        // Check if within volume bounds
+        if (uvw.x < 0.0f || uvw.x >= 1.0f ||
+            uvw.y < 0.0f || uvw.y >= 1.0f ||
+            uvw.z < 0.0f || uvw.z >= 1.0f)
+        {
+            T += stepSize;
+            continue;
+        }
 
-	// Storage for random vectors
-	std::vector<glm::vec3> wiggleVecs;
-	wiggleVecs.push_back(glm::vec3(0.0f)); // First is no wiggle (primary ray)
+        // Convert to voxel indices
+        int vx = int(uvw.x * grid.dimX);
+        int vy = int(uvw.y * grid.dimY);
+        int vz = int(uvw.z * grid.dimZ);
 
-	// Create random unit vectors for ray wiggling
-	for (int i = 1; i < numRays; i++) {
-		float angle = (float)i / numRays * 6.28f;
-		wiggleVecs.push_back(glm::vec3(
-			std::cos(angle) * wiggleAmount,
-			std::sin(angle) * wiggleAmount,
-			wiggleAmount
-		));
-	}
+        // Clamp to valid indices
+        vx = std::max(0, std::min(vx, grid.dimX - 1));
+        vy = std::max(0, std::min(vy, grid.dimY - 1));
+        vz = std::max(0, std::min(vz, grid.dimZ - 1));
 
-	// Ray march for each wiggled ray
-	for (int rayIdx = 0; rayIdx < numRays; rayIdx++) {
-		// Apply wiggle to ray direction
-		glm::vec3 wiggleDir = rayDir;
-		if (rayIdx > 0) {
-			wiggleDir = glm::normalize(rayDir + wiggleVecs[rayIdx]);
-		}
+        // Look up voxel state
+        int idx = vx + vy * grid.dimX + vz * (grid.dimX * grid.dimY);
 
-		float rayT = tNear;
-		glm::vec3 rayLastEmpty = rayOrigin + wiggleDir * tNear;
-		bool nearSurface = false;
+        if (idx >= 0 && idx < grid.data.size() && grid.data[idx] == VoxelState::FILLED) {
+            // Found a filled voxel - use this exact position (no offset)
+            outPosWorld = posWorld;
+            
+            std::cout << "Found filled voxel at position: "
+                << posWorld.x << ", " << posWorld.y << ", " << posWorld.z 
+                << " (NDC: " << ndcX << ", " << ndcY << ")\n";
+            
+            return true;
+        }
 
-		for (int i = 0; i < 10000; i++) { // Many iterations for precision
-			if (rayT > tFar) break;
+        // Not found, continue marching
+        T += stepSize;
+    }
 
-			// Current position along ray
-			glm::vec3 posWorld = rayOrigin + wiggleDir * rayT;
-
-			// Convert to normalized volume coordinates [0,1]
-			glm::vec3 uvw = (posWorld - boxMin) / (boxMax - boxMin);
-
-			// Check if within volume bounds
-			if (uvw.x < 0.0f || uvw.x >= 1.0f ||
-				uvw.y < 0.0f || uvw.y >= 1.0f ||
-				uvw.z < 0.0f || uvw.z >= 1.0f)
-			{
-				rayT += stepSize;
-				continue;
-			}
-
-			// Convert to voxel indices
-			int vx = int(uvw.x * grid.dimX);
-			int vy = int(uvw.y * grid.dimY);
-			int vz = int(uvw.z * grid.dimZ);
-
-			// Clamp to valid indices
-			vx = std::max(0, std::min(vx, grid.dimX - 1));
-			vy = std::max(0, std::min(vy, grid.dimY - 1));
-			vz = std::max(0, std::min(vz, grid.dimZ - 1));
-
-			// Look up voxel state
-			int idx = vx + vy * grid.dimX + vz * (grid.dimX * grid.dimY);
-
-			if (idx >= 0 && idx < grid.data.size() && grid.data[idx] == VoxelState::FILLED) {
-				// Found a filled voxel - store it
-				Hit hit;
-				hit.yPos = posWorld.y;
-				hit.pos = posWorld;
-				hit.lastEmpty = rayLastEmpty;
-				hit.den = 1.0f; // Filled voxel
-				hit.vx = vx;
-				hit.vy = vy;
-				hit.vz = vz;
-
-				hits.push_back(hit);
-
-				// Smaller steps near surfaces for better precision
-				stepSize = grid.voxelSize * 0.1f;
-				nearSurface = true;
-			}
-			else {
-				// This is an empty voxel, remember it
-				rayLastEmpty = posWorld;
-
-				// Use regular step size in empty space
-				if (!nearSurface) {
-					stepSize = grid.voxelSize * 0.25f;
-				}
-			}
-
-			// Advance along the ray
-			rayT += stepSize;
-		}
-	}
-
-	// Find the best hit point (highest Y position or nearest to camera)
-	if (!hits.empty()) {
-		// Sort hits by Y position (highest first)
-		std::sort(hits.begin(), hits.end(), [](const Hit& a, const Hit& b) {
-			return a.yPos > b.yPos;
-			});
-
-		// Get the highest hit
-		const Hit& bestHit = hits[0];
-
-		// Position slightly outside the surface for better carving
-		outPosWorld = bestHit.lastEmpty + (bestHit.pos - bestHit.lastEmpty) * 0.2f;
-
-		std::cout << "Found highest filled voxel at Y=" << bestHit.yPos
-			<< " (voxel: " << bestHit.vx << "," << bestHit.vy << "," << bestHit.vz << ")\n";
-		return true;
-	}
-
-	return false; // No building voxel found along the ray
+    return false; // No building voxel found along the ray
 }
 
 // Enhanced generateTestVolume: Multi-shell Sphere
@@ -1167,7 +1086,8 @@ int main() {
 	// Initialize the thread pool
 	dcRenderer.initThreadPool();
 	dcRenderer.m_useComputeShader = false;  // Enable compute shader acceleration
-
+	dcRenderer.setThreadCount(1);
+	
 	VoxelCubeRenderer          blockRenderer;
 	static VolumeRaycastRenderer pointRadRenderer;
 	std::cout << "Before createComputeShader()" << std::endl;
