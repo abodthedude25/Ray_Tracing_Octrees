@@ -37,22 +37,26 @@ This repository contains an advanced volumetric rendering system that supports m
 From the root directory of the project:
 
 1. Configure the project:
-Now you can build the project with or without GDAL support:
+	Now you can build the project with or without GDAL support:
+	
+	With GDAL (if you have it installed):
+	```
+	cmake -B build -G "Visual Studio 17 2022" -A x64
+ 	```
+	
+	Without GDAL (for systems where GDAL is missing):
+	```
+	cmake -B build -G "Visual Studio 17 2022" -A x64 -DUSE_GDAL=OFF
+	```
+	
+	You'll also need to modify any code that uses GDAL to check for the USE_GDAL preprocessor 		definition
 
-With GDAL (if you have it installed):
-```cmake -B build -G "Visual Studio 17 2022" -A x64```
-
-Without GDAL (for systems where GDAL is missing):
-```cmake -B build -G "Visual Studio 17 2022" -A x64 -DUSE_GDAL=OFF```
-
-You'll also need to modify any code that uses GDAL to check for the USE_GDAL preprocessor definition
-
-2. Build the project:
+3. Build the project:
    ```
    cmake --build build
    ```
 
-3. Run the executable:
+4. Run the executable:
    ```
    .\build\Debug\453-skeleton-program.exe
    ```
