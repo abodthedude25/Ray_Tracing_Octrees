@@ -15,22 +15,21 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_EXTENSIONS ON)
 set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 set(OpenGL_GL_PREFERENCE GLVND)
-#set(VCPKG_POLICY_ALLOW_OBSOLETE_MSVCRT enabled)
-#set(VCPKG_TARGET_TRIPLET "x64-windows" CACHE STRING "")
 set(CMAKE_VERBOSE_MAKEFILE ON)
 
+# For Linux, disable Wayland support if causing issues
+if(UNIX AND NOT APPLE)
+    option(GLFW_BUILD_WAYLAND "Build with Wayland support" OFF)
+    set(GLFW_BUILD_WAYLAND OFF CACHE BOOL "Build with Wayland support" FORCE)
+    set(GLFW_BUILD_X11 ON CACHE BOOL "Build with X11 support" FORCE)
+endif()
 
 #-------------------------------------------------------------------------------
 # https://github.com/adishavit/argh/releases/tag/v1.3.1
 include_directories(SYSTEM thirdparty/argh-1.3.1/)
 
 #-------------------------------------------------------------------------------
-# http://glew.sourceforge.net/
-# include_directories(SYSTEM thirdparty/glew-2.1.0/include)
-
 # https://glad.dav1d.de/
-#add_subdirectory(thirdparty/glad-opengl-3.3-core) 
-# This is needed for Bonus 3 to access the optional shader stages (Possibly won't work on MacOS)
 add_subdirectory(thirdparty/glad-opengl-4.6-core)  
 set(LIBRARIES ${LIBRARIES} glad)
 
@@ -68,11 +67,21 @@ include_directories(SYSTEM thirdparty/imgui-1.78)
 find_package(OpenGL REQUIRED)
 set(LIBRARIES ${LIBRARIES} ${OPENGL_gl_LIBRARY})
 
-find_package(GDAL REQUIRED)
-message(STATUS "GDAL Include Directory: ${GDAL_INCLUDE_DIRS}")
-message(STATUS "GDAL Libraries: ${GDAL_LIBRARIES}")
-set(LIBRARIES ${LIBRARIES} GDAL::GDAL)
-
+# Make GDAL optional
+option(USE_GDAL "Use GDAL for GDB file support" ON)
+if(USE_GDAL)
+    find_package(GDAL QUIET)
+    if(GDAL_FOUND)
+        message(STATUS "GDAL Found: ${GDAL_VERSION}")
+        message(STATUS "GDAL Include Directory: ${GDAL_INCLUDE_DIRS}")
+        message(STATUS "GDAL Libraries: ${GDAL_LIBRARIES}")
+        set(LIBRARIES ${LIBRARIES} GDAL::GDAL)
+        add_definitions(-DUSE_GDAL)
+    else()
+        message(STATUS "GDAL not found. Building without GDAL support.")
+        add_definitions(-DNO_GDAL)
+    endif()
+endif()
 
 if ("${CMAKE_CXX_COMPILER_ID}" STREQUAL "Clang")
 	list(APPEND _453_CMAKE_CXX_FLAGS ${_453_CMAKE_CXX_FLAGS} "-Wall" "-pedantic")
@@ -85,33 +94,27 @@ elseif ("${CMAKE_CXX_COMPILER_ID}" STREQUAL "MSVC")
 	add_compile_options("/permissive-")
 	add_compile_options("/Zc:preprocessor")
 	# Remove the default warning level.
-	# https://stackoverflow.com/questions/58708772/cmake-project-in-visual-studio-gives-flag-override-warnings-command-line-warnin
 	string(REGEX REPLACE "/W[3|4]" "" CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS}")
-	 # The above preprocessor warns about certain things in windows headers.
-	 # Turn those off: https://docs.microsoft.com/en-us/cpp/error-messages/compiler-warnings/c5105?view=vs-2019
 	add_compile_options("/wd5105")
-
 	set(_453_CMAKE_CXX_FLAGS ${_453_CMAKE_CXX_FLAGS} /W3)
-
 endif()
 
 if(APPLE)
 	set(LIBRARIES ${LIBRARIES} pthread dl)
 elseif(UNIX)
 	set(LIBRARIES ${LIBRARIES} pthread GL dl)
+	# Add X11 libraries for Linux
+	find_package(X11 REQUIRED)
+	set(LIBRARIES ${LIBRARIES} ${X11_LIBRARIES})
 elseif(WIN32)
+	# Windows-specific libraries can be added here if needed
 endif()
 
-
 add_definitions(-DIMGUI_IMPL_OPENGL_LOADER_GLAD=ON)
-# include_directories(SYSTEM thirdparty/imgui thirdparty/imgui/examples)
-# include_directories(src)
-
 
 # Compile our main application
 file(GLOB SOURCES
     453-skeleton/*.cpp
-    #thirdparty/glew-2.1.0/src/glew.c
 	453-skeleton/OctreeVoxel.cpp
     453-skeleton/MarchingCubes.cpp
 	453-skeleton/Renderer.cpp
@@ -120,7 +123,6 @@ file(GLOB SOURCES
 set(INCLUDES ${INCLUDES} src)
 
 set(APP_NAME "my-skeleton-program")
-
 
 # Copy all the shaders and tell the build system to re-run CMAKE if one of them changes
 file(GLOB files 453-skeleton/shaders/*)
