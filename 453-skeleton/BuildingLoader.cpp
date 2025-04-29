@@ -6,6 +6,7 @@
 #include <unordered_map>
 #include <algorithm>
 #include <glm/glm.hpp>
+#include <unordered_set>
 
 struct CSVVertex {
 	int meshNumber;
@@ -158,13 +159,58 @@ VoxelGrid loadCSVDataIntoVoxelGrid(const std::string& vertsFilename, const std::
 
 	if (csvVerts.empty() || csvFaces.empty()) return grid;
 
-	// Create vertex lookup map
-	std::unordered_map<int, std::unordered_map<int, CSVVertex>> vertexMap;
-	for (const auto& v : csvVerts) {
-		vertexMap[v.meshNumber][v.vertexNumber] = v;
+	// Count faces per mesh to identify the largest meshes
+	std::unordered_map<int, int> meshFaceCount;
+	for (const auto& face : csvFaces) {
+		meshFaceCount[face.meshNumber]++;
 	}
 
-	// Calculate bounds
+	// Convert to vector for sorting
+	std::vector<std::pair<int, int>> meshCounts;
+	for (const auto& [meshId, count] : meshFaceCount) {
+		meshCounts.push_back({ meshId, count });
+	}
+
+	// Sort by face count in descending order
+	std::sort(meshCounts.begin(), meshCounts.end(),
+		[](const auto& a, const auto& b) { return a.second > b.second; });
+
+	// Select only the top 10% of meshes
+	size_t numMeshesToKeep = std::max(size_t(1), meshCounts.size() / 10);
+	std::unordered_set<int> selectedMeshes;
+
+	std::cout << "Total unique meshes: " << meshCounts.size() << std::endl;
+	std::cout << "Keeping top " << numMeshesToKeep << " meshes (10% of total)" << std::endl;
+
+	// Display information about top meshes
+	for (size_t i = 0; i < numMeshesToKeep && i < meshCounts.size(); ++i) {
+		selectedMeshes.insert(meshCounts[i].first);
+		std::cout << "Selected mesh #" << meshCounts[i].first
+			<< " with " << meshCounts[i].second << " faces" << std::endl;
+	}
+
+	// Filter faces to only include those from selected meshes
+	std::vector<CSVFace> filteredFaces;
+	filteredFaces.reserve(csvFaces.size() / 2);  // Reserve conservatively
+
+	for (const auto& face : csvFaces) {
+		if (selectedMeshes.count(face.meshNumber) > 0) {
+			filteredFaces.push_back(face);
+		}
+	}
+
+	std::cout << "Original face count: " << csvFaces.size() << std::endl;
+	std::cout << "Filtered face count: " << filteredFaces.size() << std::endl;
+
+	// Create vertex lookup map (only for selected meshes to save memory)
+	std::unordered_map<int, std::unordered_map<int, CSVVertex>> vertexMap;
+	for (const auto& v : csvVerts) {
+		if (selectedMeshes.count(v.meshNumber) > 0) {
+			vertexMap[v.meshNumber][v.vertexNumber] = v;
+		}
+	}
+
+	// Calculate bounds for selected meshes only
 	double minX = std::numeric_limits<double>::max();
 	double minY = std::numeric_limits<double>::max();
 	double minZ = std::numeric_limits<double>::max();
@@ -173,7 +219,8 @@ VoxelGrid loadCSVDataIntoVoxelGrid(const std::string& vertsFilename, const std::
 	double maxZ = -std::numeric_limits<double>::max();
 
 	for (const auto& v : csvVerts) {
-		if (std::isfinite(v.easting) && std::isfinite(v.northing) && std::isfinite(v.elevation)) {
+		if (selectedMeshes.count(v.meshNumber) > 0 &&
+			std::isfinite(v.easting) && std::isfinite(v.northing) && std::isfinite(v.elevation)) {
 			minX = std::min(minX, v.easting);
 			minY = std::min(minY, v.northing);
 			minZ = std::min(minZ, v.elevation);
@@ -228,9 +275,10 @@ VoxelGrid loadCSVDataIntoVoxelGrid(const std::string& vertsFilename, const std::
 
 	size_t filledVoxels = 0;
 
+	// Use the filtered faces instead of the original ones
 #pragma omp parallel for schedule(dynamic) reduction(+:filledVoxels)
-	for (size_t i = 0; i < csvFaces.size(); ++i) {
-		const auto& face = csvFaces[i];
+	for (size_t i = 0; i < filteredFaces.size(); ++i) {
+		const auto& face = filteredFaces[i];
 		auto meshIt = vertexMap.find(face.meshNumber);
 		if (meshIt == vertexMap.end()) continue;
 
@@ -286,5 +334,6 @@ VoxelGrid loadCSVDataIntoVoxelGrid(const std::string& vertsFilename, const std::
 		}
 	}
 
+	std::cout << "Total voxels filled: " << filledVoxels << std::endl;
 	return grid;
 }

@@ -52,8 +52,29 @@ public:
 	void enableVolumeMeasurement(bool enable);
 	bool isVolumeMeasurementEnabled() const { return m_enableVolumeMeasurement; }
 
-	float getMeasuredVolume() const { return m_measuredVolume; } // or double if you prefer
+	float getMeasuredVolume() const { return m_measuredVolume; }
 	void resetVolumeMeasurement();
+
+	// New methods for LOD control
+	void setHighQualityModeEnabled(bool enabled) { m_highQualityMode = enabled; }
+	bool isHighQualityModeEnabled() const { return m_highQualityMode; }
+
+	float getZoomFactor() const { return m_zoomFactor; }
+	float getCameraDistance() const { return m_lastCameraDistance; }
+
+	// Enum for render modes
+	enum RenderMode {
+		NORMAL = 0,
+		X_RAY = 1,
+		SEE_THROUGH = 2
+	};
+	RenderMode m_renderMode = NORMAL;
+
+	// Function to set the render mode
+	void setRenderMode(RenderMode mode) { m_renderMode = mode; }
+
+	// Get the current render mode
+	RenderMode getRenderMode() const { return m_renderMode; }
 
 private:
 	// Scene data
@@ -85,4 +106,9 @@ private:
 	bool   m_enableVolumeMeasurement;
 	float  m_measuredVolume;  // Stores the total measured volume from the GPU
 	GLuint m_volumeSSBO;      // The GPU buffer used for accumulation
+
+	// LOD-related variables
+	float  m_zoomFactor;      // Current zoom factor (higher = more zoomed in)
+	bool   m_highQualityMode; // Flag for high-quality rendering mode
+	float  m_lastCameraDistance; // Track camera distance for LOD switching
 };

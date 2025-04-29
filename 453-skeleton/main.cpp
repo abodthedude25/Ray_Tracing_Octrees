@@ -480,8 +480,8 @@ struct Assignment4 : public CallbackInterface {
 	Assignment4()
 		: wireframeMode(false),
 		showOctreeWire(false),
-		currentMode(RenderMode::VolumeRaycast),
-		oldMode(RenderMode::VolumeRaycast),
+		currentMode(RenderMode::BVHRayTrace),
+		oldMode(RenderMode::BVHRayTrace),
 		camera(glm::radians(90.0f), glm::radians(0.f), 500.f),
 		aspect(1.f),
 		rightMouseDown(false),
@@ -600,6 +600,22 @@ struct Assignment4 : public CallbackInterface {
 					raytracerRendererPtr->enableVolumeMeasurement(newState);
 					std::cout << "Volume measurement " << (newState ? "enabled" : "disabled") << std::endl;
 				}
+			}
+
+			if (key == GLFW_KEY_1 && currentMode == RenderMode::BVHRayTrace) {
+				// Normal rendering mode
+				raytracerRendererPtr->setRenderMode(RayTracerBVH::NORMAL);
+				std::cout << "Switched to normal rendering mode" << std::endl;
+			}
+			else if (key == GLFW_KEY_2 && currentMode == RenderMode::BVHRayTrace) {
+				// X-ray mode
+				raytracerRendererPtr->setRenderMode(RayTracerBVH::X_RAY);
+				std::cout << "Switched to X-ray rendering mode" << std::endl;
+			}
+			else if (key == GLFW_KEY_3 && currentMode == RenderMode::BVHRayTrace) {
+				// See-through mode
+				raytracerRendererPtr->setRenderMode(RayTracerBVH::SEE_THROUGH);
+				std::cout << "Switched to see-through rendering mode" << std::endl;
 			}
 		}
 	}
@@ -997,7 +1013,7 @@ int main() {
 
 	bool useGDB = true;
 	int dim = 256;
-	float voxelSize = 6.0f;
+	float voxelSize = 10.0f;
 	std::string cacheFilename = "sceneCache.bin";
 
 	VoxelGrid grid;
