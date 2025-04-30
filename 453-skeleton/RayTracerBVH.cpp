@@ -43,7 +43,11 @@ RayTracerBVH::RayTracerBVH()
 	m_frustumCullingEnabled(true),
 	m_enableVolumeMeasurement(false),
 	m_measuredVolume(0.0f),
-	m_volumeSSBO(0)
+	m_volumeSSBO(0),
+	m_enableLOD(true),
+	m_lodBaseDist(100.0f),
+	m_lodFactor(1.5f),
+	m_minVoxelSize(1.0f)
 {
 }
 
@@ -502,6 +506,7 @@ void RayTracerBVH::renderSceneComputeWithCulling(
 	glBindImageTexture(0, m_outputTex, 0, GL_FALSE, 0, GL_WRITE_ONLY, GL_RGBA32F);
 
 	// 7) Set uniforms
+	//    — NB: set "enableVolumeMeasurement" uniform if your shader uses it
 	GLint locNumNodes = glGetUniformLocation(m_computeProg, "numNodes");
 	GLint locGridMin = glGetUniformLocation(m_computeProg, "gridMin");
 	GLint locVoxel = glGetUniformLocation(m_computeProg, "voxelSize");
@@ -514,11 +519,27 @@ void RayTracerBVH::renderSceneComputeWithCulling(
 	GLint locHeight = glGetUniformLocation(m_computeProg, "imageHeight");
 	GLint locEnable = glGetUniformLocation(m_computeProg, "enableVolumeMeasurement");
 	GLint locRenderMode = glGetUniformLocation(m_computeProg, "renderMode");
-
-	// LOD uniforms
-	GLint locLodFactor = glGetUniformLocation(m_computeProg, "lodFactor");
+	GLint locEnableLOD = glGetUniformLocation(m_computeProg, "enableLOD");
+	GLint locLODBaseDist = glGetUniformLocation(m_computeProg, "lodBaseDist");
+	GLint locLODFactor = glGetUniformLocation(m_computeProg, "lodFactor");
 	GLint locMinVoxelSize = glGetUniformLocation(m_computeProg, "minVoxelSize");
-	GLint locMaxDistance = glGetUniformLocation(m_computeProg, "maxDistance");
+
+	if (locEnableLOD >= 0) {
+		glUniform1i(locEnableLOD, m_enableLOD ? 1 : 0);
+	}
+	if (locLODBaseDist >= 0) {
+		glUniform1f(locLODBaseDist, m_lodBaseDist);
+	}
+	if (locLODFactor >= 0) {
+		glUniform1f(locLODFactor, m_lodFactor);
+	}
+	if (locMinVoxelSize >= 0) {
+		glUniform1f(locMinVoxelSize, m_minVoxelSize);
+	}
+
+	if (locRenderMode >= 0) {
+		glUniform1i(locRenderMode, static_cast<int>(m_renderMode));
+	}
 
 	int nodeCount = updateFrustum ? int(m_visibleNodes.size()) : m_numNodes;
 	glUniform1i(locNumNodes, nodeCount);
@@ -542,21 +563,6 @@ void RayTracerBVH::renderSceneComputeWithCulling(
 
 	if (locEnable >= 0) {
 		glUniform1i(locEnable, m_enableVolumeMeasurement ? 1 : 0);
-	}
-
-	if (locRenderMode >= 0) {
-		glUniform1i(locRenderMode, static_cast<int>(m_renderMode));
-	}
-
-	// Set LOD uniforms
-	if (locLodFactor >= 0) {
-		glUniform1f(locLodFactor, m_lodFactor);
-	}
-	if (locMinVoxelSize >= 0) {
-		glUniform1f(locMinVoxelSize, m_minVoxelSize);
-	}
-	if (locMaxDistance >= 0) {
-		glUniform1f(locMaxDistance, m_maxLodDistance);
 	}
 
 	// 8) Dispatch compute

@@ -27,6 +27,29 @@ uniform int   imageWidth;
 uniform int   imageHeight;
 uniform bool  enableVolumeMeasurement;
 uniform int   renderMode = 0;  // 0: normal, 1: x-ray, 2: see-through
+uniform bool  enableLOD = true;          // Whether to enable LOD rendering
+uniform float lodBaseDist = 100.0;       // Base distance for LOD calculations
+uniform float lodFactor = 1.2;           // LOD scaling factor
+uniform float minVoxelSize = 1.0;        // Minimum voxel size (won't go smaller)
+
+// Add this function to calculate LOD level based on distance
+float calculateLODLevel(float distance) {
+    if (!enableLOD) return 1.0;
+    
+    // Calculate LOD level based on distance
+    // Start with level 1 (original size) at close distances
+    // and increase with distance
+    float lodLevel = max(1.0, distance / lodBaseDist);
+    
+    // Apply scaling factor to control how quickly LOD increases with distance
+    lodLevel = pow(lodLevel, lodFactor);
+    
+    // Round to nearest power of 2 for cleaner transitions
+    // This makes voxels combine in powers of 2 (2x, 4x, 8x, etc.)
+    lodLevel = pow(2.0, floor(log2(lodLevel) + 0.5));
+    
+    return lodLevel;
+}
 
 const float VOLUME_SCALE = 1e8;
 
@@ -271,9 +294,18 @@ void intersectOctreeMultiHit(vec3 rayOrigin, vec3 rayDir, float maxDistance, out
         // Skip if beyond our max distance
         if (tNear > maxDistance)
             continue;
+        
+        // Apply LOD based on distance
+        float distToNode = tNear;
+        float lodLevel = calculateLODLevel(distToNode);
+        
+        // Determine if we should stop traversal based on LOD level
+        bool isTerminalForLOD = node.isLeaf == 1 || 
+                               node.isUniform == 1 || 
+                               float(node.size * voxelSize) < (minVoxelSize * lodLevel);
 
-        // For solid leaf or uniform solid
-        if ((node.isLeaf == 1 || node.isUniform == 1) && node.isSolid == 1) {
+        // For solid leaf, uniform solid, or LOD-terminal nodes
+        if ((node.isLeaf == 1 || node.isUniform == 1 || isTerminalForLOD) && node.isSolid == 1) {
             float tHit = max(0.0, tNear);
             if (tHit <= tFar && tHit <= maxDistance) {
                 // Calculate hit point and normal
@@ -296,7 +328,7 @@ void intersectOctreeMultiHit(vec3 rayOrigin, vec3 rayDir, float maxDistance, out
                 }
             }
         }
-        else if (node.isLeaf == 0 && node.isUniform == 0) {
+        else if (node.isLeaf == 0 && node.isUniform == 0 && !isTerminalForLOD) {
             // For non-leaf non-uniform, push children
             for (int c = 0; c < 8; c++) {
                 int childIdx = node.child[c];
@@ -344,6 +376,7 @@ vec3 calculateFaceNormal(vec3 hitPoint, vec3 nodeMin, vec3 nodeMax) {
     return normal;
 }
 
+
 // Original single hit intersection function for normal mode and volume computation
 void intersectOctreeForVolume(vec3 rayOrigin, vec3 rayDir, 
                             out float closestT, 
@@ -381,8 +414,19 @@ void intersectOctreeForVolume(vec3 rayOrigin, vec3 rayDir,
 
         // If we're looking for the closest hit for shading
         if (tNear >= bestT) continue;
-
-        // For solid leaf or uniform solid, we have a volume contribution
+        
+        // Apply LOD based on distance
+        float distToNode = tNear;
+        float lodLevel = calculateLODLevel(distToNode);
+        
+        // Determine if we should stop traversal based on LOD level
+        // If node size is large enough for current LOD level or is a leaf,
+        // treat it as a terminal node
+        bool isTerminalForLOD = node.isLeaf == 1 || 
+                               node.isUniform == 1 || 
+                               float(node.size * voxelSize) < (minVoxelSize * lodLevel);
+        
+        // For solid leaf, uniform solid, or LOD-terminal nodes
         bool isSolid = false;
         
         // Uniform node => treat as leaf
@@ -419,8 +463,22 @@ void intersectOctreeForVolume(vec3 rayOrigin, vec3 rayDir,
                 isSolid = true;
             }
         }
-        else {
-            // For non-leaf non-uniform, push children
+        else if (isTerminalForLOD && node.isSolid == 1) {
+            // Node is terminal due to LOD and is solid
+            float tHit = max(0.0, tNear);
+            if (tHit < bestT && tHit <= tFar) {
+                bestT = tHit;
+                hitFound = true;
+                vec3 center = 0.5 * (nodeMin + nodeMax);
+                vec3 p = rayOrigin + rayDir * tHit;
+                bestNormal = calculateFaceNormal(p, nodeMin, nodeMax);
+            }
+            
+            // And for volume calculation
+            isSolid = true;
+        }
+        else if (!isTerminalForLOD) {
+            // For non-leaf, non-terminal nodes, push children
             for (int c = 0; c < 8; c++) {
                 int childIdx = node.child[c];
                 if (childIdx >= 0) {

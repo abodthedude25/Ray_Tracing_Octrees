@@ -55,18 +55,12 @@ public:
 	float getMeasuredVolume() const { return m_measuredVolume; }
 	void resetVolumeMeasurement();
 
-	// LOD control
-	float m_lodFactor;           // Controls LOD aggressiveness (higher = more aggressive)
-	float m_minVoxelSize;        // Minimum voxel size for closest objects
-	float m_maxLodDistance;      // Distance at which maximum LOD is applied
+	// New methods for LOD control
+	void setHighQualityModeEnabled(bool enabled) { m_highQualityMode = enabled; }
+	bool isHighQualityModeEnabled() const { return m_highQualityMode; }
 
-	// Methods to control LOD
-	void setLodFactor(float factor) { m_lodFactor = factor; }
-	float getLodFactor() const { return m_lodFactor; }
-	void setMinVoxelSize(float size) { m_minVoxelSize = size; }
-	float getMinVoxelSize() const { return m_minVoxelSize; }
-	void setMaxLodDistance(float dist) { m_maxLodDistance = dist; }
-	float getMaxLodDistance() const { return m_maxLodDistance; }
+	float getZoomFactor() const { return m_zoomFactor; }
+	float getCameraDistance() const { return m_lastCameraDistance; }
 
 	// Enum for render modes
 	enum RenderMode {
@@ -74,7 +68,6 @@ public:
 		X_RAY = 1,
 		SEE_THROUGH = 2
 	};
-
 	RenderMode m_renderMode = NORMAL;
 
 	// Function to set the render mode
@@ -82,6 +75,18 @@ public:
 
 	// Get the current render mode
 	RenderMode getRenderMode() const { return m_renderMode; }
+
+	// LOD control methods
+	void enableLOD(bool enable) { m_enableLOD = enable; }
+	void setLODParameters(float baseDist, float factor, float minVoxelSize) {
+		m_lodBaseDist = baseDist;
+		m_lodFactor = factor;
+		m_minVoxelSize = minVoxelSize;
+	}
+	bool isLODEnabled() const { return m_enableLOD; }
+	float getLODBaseDist() const { return m_lodBaseDist; }
+	float getLODFactor() const { return m_lodFactor; }
+	float getMinVoxelSize() const { return m_minVoxelSize; }
 
 private:
 	// Scene data
@@ -113,4 +118,15 @@ private:
 	bool   m_enableVolumeMeasurement;
 	float  m_measuredVolume;  // Stores the total measured volume from the GPU
 	GLuint m_volumeSSBO;      // The GPU buffer used for accumulation
+
+	// LOD-related variables
+	float  m_zoomFactor;      // Current zoom factor (higher = more zoomed in)
+	bool   m_highQualityMode; // Flag for high-quality rendering mode
+	float  m_lastCameraDistance; // Track camera distance for LOD switching
+
+	// LOD rendering parameters
+	bool m_enableLOD;
+	float m_lodBaseDist;
+	float m_lodFactor;
+	float m_minVoxelSize;
 };
