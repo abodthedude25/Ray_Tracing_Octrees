@@ -321,6 +321,29 @@ void intersectOctreeMultiHit(vec3 rayOrigin, vec3 rayDir, float maxDistance, out
     }
 }
 
+vec3 calculateFaceNormal(vec3 hitPoint, vec3 nodeMin, vec3 nodeMax) {
+    vec3 center = 0.5 * (nodeMin + nodeMax);
+    vec3 toHit = hitPoint - center;
+    
+    // Find which component (x, y, or z) has the largest absolute value
+    // This tells us which face we're closest to
+    vec3 absToHit = abs(toHit);
+    float maxComponent = max(max(absToHit.x, absToHit.y), absToHit.z);
+    
+    // Create a face normal based on which component is largest
+    vec3 normal = vec3(0.0);
+    
+    if (absToHit.x == maxComponent) {
+        normal.x = sign(toHit.x);
+    } else if (absToHit.y == maxComponent) {
+        normal.y = sign(toHit.y);
+    } else {
+        normal.z = sign(toHit.z);
+    }
+    
+    return normal;
+}
+
 // Original single hit intersection function for normal mode and volume computation
 void intersectOctreeForVolume(vec3 rayOrigin, vec3 rayDir, 
                             out float closestT, 
@@ -372,7 +395,7 @@ void intersectOctreeForVolume(vec3 rayOrigin, vec3 rayDir,
                     hitFound = true;
                     vec3 center = 0.5 * (nodeMin + nodeMax);
                     vec3 p = rayOrigin + rayDir * tHit;
-                    bestNormal = normalize(p - center);
+                    bestNormal = calculateFaceNormal(p, nodeMin, nodeMax);
                 }
                 
                 // And for volume calculation
@@ -389,7 +412,7 @@ void intersectOctreeForVolume(vec3 rayOrigin, vec3 rayDir,
                     hitFound = true;
                     vec3 center = 0.5 * (nodeMin + nodeMax);
                     vec3 p = rayOrigin + rayDir * tHit;
-                    bestNormal = normalize(p - center);
+                    bestNormal = calculateFaceNormal(p, nodeMin, nodeMax);
                 }
                 
                 // And for volume calculation

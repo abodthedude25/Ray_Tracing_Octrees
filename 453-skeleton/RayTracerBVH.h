@@ -55,12 +55,18 @@ public:
 	float getMeasuredVolume() const { return m_measuredVolume; }
 	void resetVolumeMeasurement();
 
-	// New methods for LOD control
-	void setHighQualityModeEnabled(bool enabled) { m_highQualityMode = enabled; }
-	bool isHighQualityModeEnabled() const { return m_highQualityMode; }
+	// LOD control
+	float m_lodFactor;           // Controls LOD aggressiveness (higher = more aggressive)
+	float m_minVoxelSize;        // Minimum voxel size for closest objects
+	float m_maxLodDistance;      // Distance at which maximum LOD is applied
 
-	float getZoomFactor() const { return m_zoomFactor; }
-	float getCameraDistance() const { return m_lastCameraDistance; }
+	// Methods to control LOD
+	void setLodFactor(float factor) { m_lodFactor = factor; }
+	float getLodFactor() const { return m_lodFactor; }
+	void setMinVoxelSize(float size) { m_minVoxelSize = size; }
+	float getMinVoxelSize() const { return m_minVoxelSize; }
+	void setMaxLodDistance(float dist) { m_maxLodDistance = dist; }
+	float getMaxLodDistance() const { return m_maxLodDistance; }
 
 	// Enum for render modes
 	enum RenderMode {
@@ -68,6 +74,7 @@ public:
 		X_RAY = 1,
 		SEE_THROUGH = 2
 	};
+
 	RenderMode m_renderMode = NORMAL;
 
 	// Function to set the render mode
@@ -106,9 +113,4 @@ private:
 	bool   m_enableVolumeMeasurement;
 	float  m_measuredVolume;  // Stores the total measured volume from the GPU
 	GLuint m_volumeSSBO;      // The GPU buffer used for accumulation
-
-	// LOD-related variables
-	float  m_zoomFactor;      // Current zoom factor (higher = more zoomed in)
-	bool   m_highQualityMode; // Flag for high-quality rendering mode
-	float  m_lastCameraDistance; // Track camera distance for LOD switching
 };
