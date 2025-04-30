@@ -29,7 +29,7 @@ uniform bool  enableVolumeMeasurement;
 uniform int   renderMode = 0;  // 0: normal, 1: x-ray, 2: see-through
 uniform bool  enableLOD = true;          // Whether to enable LOD rendering
 uniform float lodBaseDist = 100.0;       // Base distance for LOD calculations
-uniform float lodFactor = 1.2;           // LOD scaling factor
+uniform float lodFactor = 1.1;           // LOD scaling factor
 uniform float minVoxelSize = 1.0;        // Minimum voxel size (won't go smaller)
 
 // Add this function to calculate LOD level based on distance
