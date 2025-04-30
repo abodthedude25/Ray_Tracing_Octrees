@@ -379,19 +379,19 @@ void RayTracerBVH::renderSceneComputeWithCulling(
 	float fovDeg,
 	bool updateFrustum)
 {
-	// 1) Bail out if compute pipeline is not ready
+	// Bail out if compute pipeline is not ready
 	if (!m_computeInited || m_computeProg == 0 || m_fsqProg == 0) {
 		std::cerr << "[RayTracerBVH] Compute pipeline not initialized or failed.\n";
 		return;
 	}
 
-	// 2) If no nodes, skip
+	// If no nodes, skip
 	if (m_numNodes <= 0) {
 		std::cout << "[RayTracerBVH] No octree nodes to render.\n";
 		return;
 	}
 
-	// 3) Optionally perform frustum culling
+	// Optionally perform frustum culling
 	if (updateFrustum) {
 		std::cout << "Applying frustum update with camera at position: ("
 			<< camera.getPos().x << ", "
@@ -406,7 +406,7 @@ void RayTracerBVH::renderSceneComputeWithCulling(
 		// Clear the visible‐nodes list
 		m_visibleNodes.clear();
 
-		// 3.1) Mark which nodes pass frustum test
+		// Mark which nodes pass frustum test
 		std::vector<bool> isVisible(m_flatNodes.size(), false);
 		int visibleCount = 0;
 
@@ -426,7 +426,7 @@ void RayTracerBVH::renderSceneComputeWithCulling(
 			}
 		}
 
-		// 3.2) Remap old indices -> new indices
+		// Remap old indices -> new indices
 		std::vector<int> oldToNew(m_flatNodes.size(), -1);
 		int newIndex = 0;
 		for (size_t i = 0; i < m_flatNodes.size(); i++) {
@@ -435,7 +435,7 @@ void RayTracerBVH::renderSceneComputeWithCulling(
 			}
 		}
 
-		// 3.3) Build m_visibleNodes
+		// Build m_visibleNodes
 		m_visibleNodes.resize(visibleCount);
 		newIndex = 0;
 		for (size_t i = 0; i < m_flatNodes.size(); i++) {
@@ -460,7 +460,7 @@ void RayTracerBVH::renderSceneComputeWithCulling(
 		std::cout << "[RayTracerBVH] Frustum culling: " << m_numNodes << " -> "
 			<< visibleCount << " nodes\n";
 
-		// 3.4) Update GPU buffer with just the visible nodes
+		// Update GPU buffer with just the visible nodes
 		glBindBuffer(GL_SHADER_STORAGE_BUFFER, m_nodeSSBO);
 		glBufferData(GL_SHADER_STORAGE_BUFFER,
 			m_visibleNodes.size() * sizeof(GPUNodes),
@@ -469,7 +469,7 @@ void RayTracerBVH::renderSceneComputeWithCulling(
 		glBindBuffer(GL_SHADER_STORAGE_BUFFER, 0);
 	}
 
-	// 4) Prepare output image
+	// Prepare output image
 	if (!m_outputTex) {
 		glGenTextures(1, &m_outputTex);
 	}
@@ -486,7 +486,7 @@ void RayTracerBVH::renderSceneComputeWithCulling(
 	glBindBufferBase(GL_SHADER_STORAGE_BUFFER, 1, m_nodeSSBO);
 
 	if (m_enableVolumeMeasurement && m_volumeSSBO) {
-		// 1) Zero out the SSBO each frame
+		// Zero out the SSBO each frame
 		glBindBuffer(GL_SHADER_STORAGE_BUFFER, m_volumeSSBO);
 
 		// Write int zero (since 'accumulatedVolume' is an int in the shader)
@@ -499,14 +499,13 @@ void RayTracerBVH::renderSceneComputeWithCulling(
 		glBindBuffer(GL_SHADER_STORAGE_BUFFER, 0);
 	}
 
-	// 6) Use the compute shader
+	// Use the compute shader
 	glUseProgram(m_computeProg);
 
 	// Bind image for output
 	glBindImageTexture(0, m_outputTex, 0, GL_FALSE, 0, GL_WRITE_ONLY, GL_RGBA32F);
 
-	// 7) Set uniforms
-	//    — NB: set "enableVolumeMeasurement" uniform if your shader uses it
+	// Set uniforms
 	GLint locNumNodes = glGetUniformLocation(m_computeProg, "numNodes");
 	GLint locGridMin = glGetUniformLocation(m_computeProg, "gridMin");
 	GLint locVoxel = glGetUniformLocation(m_computeProg, "voxelSize");
