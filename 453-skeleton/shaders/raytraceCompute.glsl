@@ -32,7 +32,7 @@ uniform float lodBaseDist = 100.0;       // Base distance for LOD calculations
 uniform float lodFactor = 1.1;           // LOD scaling factor
 uniform float minVoxelSize = 1.0;        // Minimum voxel size (won't go smaller)
 
-// Add this function to calculate LOD level based on distance
+// function to calculate LOD level based on distance
 float calculateLODLevel(float distance) {
     if (!enableLOD) return 1.0;
     
